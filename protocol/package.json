@@ -1,0 +1,9 @@
+{
+	"name": "@ownsync/protocol",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "node --test",
+		"vectors": "UPDATE_VECTORS=1 node --test"
+	}
+}

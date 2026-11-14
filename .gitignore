@@ -1,0 +1,6 @@
+node_modules/
+plugin/main.js
+server/.wrangler/
+server/worker-configuration.d.ts
+.claude/
+server/.dev.vars
