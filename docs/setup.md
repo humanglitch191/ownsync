@@ -14,17 +14,21 @@ Press the button and sign in to Cloudflare, or create a free account. Cloudflare
 
 ## 2. Sign in and add a passkey
 
-Open the address **within 10 minutes**. Under **First time here?**, enter the setup key, then create a passkey: your fingerprint, face or device PIN. From then on you sign in with the passkey, and the setup key stops working.
+Open the address **within 10 minutes**. Press **First time? Use setup key**, enter it, then create a passkey: your fingerprint, face or device PIN. From then on you sign in with the passkey, and the setup key stops working.
 
 <img src="images/sign-in.png" width="560" alt="First visit: sign in with a passkey, or enter the setup key">
 
 ## 3. Connect a vault
 
+Setup carries on in steps on the left, while your dashboard fills in on the right as each device connects.
+
+<img src="images/setup.png" width="720" alt="Setup: the steps on the left, your dashboard filling in on the right">
+
 In Obsidian, open Settings → Community plugins, turn them on, choose **Browse**, search for **Ownsync**, then **Install** and **Enable**. A welcome screen opens.
 
 <img src="images/obsidian-welcome.png" width="520" alt="Ownsync's welcome screen in Obsidian">
 
-On your dashboard, under **Connect a vault**, press **Open in Obsidian**. Obsidian shows which server it's about to connect to. Press **Connect**.
+In the setup steps, press **Open in Obsidian**. Obsidian shows which server it's about to connect to, and asks whether this device should **sync attachments too** (images, PDFs and other files) or notes only. Press **Connect**.
 
 <img src="images/obsidian-connect.png" width="520" alt="Connect this vault, with the server shown">
 
@@ -32,7 +36,7 @@ Ownsync then offers a **recovery kit**: your server address, vault ID and a reco
 
 <img src="images/obsidian-done.png" width="520" alt="You're all set">
 
-Another vault? Open it in Obsidian and press **Open in Obsidian** on the dashboard again. Each vault gets its own key.
+Another vault? Open it in Obsidian and press **Connect another vault** on the dashboard. Each vault gets its own key.
 
 ## 4. Add your phone and other devices
 
@@ -44,7 +48,7 @@ Each code works once, for 2 minutes, and a fresh one appears while the screen is
 
 ## Your dashboard
 
-Your server's address is your dashboard. It shows each vault's devices by their random ID (the same one Obsidian shows), when each was last online, which version it runs, how many notes have conflict copies, and how much of Cloudflare's free plan you use. From Obsidian: Settings → Ownsync → **Open dashboard**.
+Your server's address is your dashboard. It opens with a one-line summary, then how much of Cloudflare's free plan you use over the last two weeks, and each vault's devices by their random ID (the same one Obsidian shows) or a name you give them (click the name to rename it): phone or computer, notes only or not, when each was last online, which version it runs, and any conflict copies. From Obsidian: Settings → Ownsync → **Open dashboard**.
 
 <p>
 <picture>
@@ -65,7 +69,7 @@ Settings → Ownsync lists your vault's devices by their short ID.
 
 ## Good to know
 
-- Attachments sync too, up to 20 MB each (Settings → Ownsync → Largest attachment). The free plan holds about 1 GB in all.
+- Attachments sync too, up to 20 MB each (Settings → Ownsync → Largest attachment). Each device can sync notes only instead (Settings → Ownsync → Sync attachments): handy on a phone. A notes-only device leaves attachments on your other devices alone.
 - When the same note or file changes on two devices while one is offline, both changes are kept. Text merges; anything that can't merge gets a `(conflict …)` copy.
 - If Obsidian closes before its last save can be matched, that save is kept as `Note (recovered …).md`.
 - Without a recovery kit, losing every device loses the vault: nothing on the server can be opened.

@@ -11,7 +11,9 @@ Note text, attachment content, file names, folders, or the vault key. Your vault
 - How many notes and attachments a vault has, as meaningless IDs, and when and by how much each changes.
 - Attachments as encrypted pieces of up to 1 MB: how many, their sizes, and when two files hold the same content.
 - When a note is open in an editor and its cursor moves (not where, and not your device's name).
-- When each device is online, its IP address, its random device ID, its Ownsync version, and how many conflict copies a vault has.
+- When each device is online, its IP address, its random device ID, its Ownsync version, whether it's a phone or a computer, whether it syncs notes only, and how many conflict copies a vault has.
+
+Names you type on the dashboard, for vaults and devices, are stored on your server as you typed them: the dashboard has no key to encrypt them with. Devices never send their names; the name next to your cursor in Obsidian travels encrypted.
 
 It can hold back or replay old edits, but it can't forge or change one: every edit is authenticated with the vault key.
 
