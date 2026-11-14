@@ -41,7 +41,8 @@ export class VaultDisk implements Disk {
 	async write(path: string, content: string): Promise<DiskFile> {
 		this.check(path, true);
 		const existing = this.file(path);
-		if (existing) await this.app.vault.modify(existing, content);
+		// process, not modify: Obsidian's atomic write, so a save it makes at the same moment can't slip in between.
+		if (existing) await this.app.vault.process(existing, () => content);
 		else {
 			await this.folderFor(path);
 			await this.app.vault.create(path, content);

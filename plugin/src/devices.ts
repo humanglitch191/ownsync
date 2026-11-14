@@ -55,7 +55,6 @@ function showRecoveryKit(app: App, why: string, host: string, vaultId: string, c
 		text.value = kit;
 		text.readOnly = true;
 		text.rows = 7;
-		text.style.width = "100%";
 		new Setting(modal.contentEl).setName("I have saved this kit somewhere safe").addToggle((t) => t.onChange((v) => { saved = v; done.disabled = !v; }));
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Copy" }).addEventListener("click", () => {

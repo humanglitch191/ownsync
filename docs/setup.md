@@ -79,3 +79,4 @@ Settings → Ownsync lists your vault's devices by their short ID.
 - Without a recovery kit, losing every device loses the vault: nothing on the server can be opened.
 - Obsidian's settings folder doesn't sync.
 - To stop syncing a device: Settings → Ownsync → **Leave this vault**. Your notes stay as ordinary files.
+- **Linux: "Encryption not available"?** That's Obsidian saying it can't find your system keyring, so it keeps secrets (like Ownsync's vault key) unencrypted in its settings folder. Your notes sit unencrypted in the vault folder anyway, so it changes little. On desktops Obsidian doesn't recognise (Hyprland, Sway and others), add the line `--password-store=gnome-libsecret` to `~/.config/obsidian/user-flags.conf` and restart Obsidian. Best done before connecting a vault: after the switch, Obsidian can't read what it saved before, so a vault connected earlier would need adding again.
