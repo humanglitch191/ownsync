@@ -1,0 +1,48 @@
+name: Fuzz
+
+# Large batches of the engine fuzz test, split by seed range. Every run covers new seeds.
+# A failure prints its seed; replay it locally with FUZZ_SEED=<seed> (see plugin/test/engine.fuzz.test.ts).
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Runs per shard
+        default: "20000"
+      steps:
+        description: Steps per run
+        default: "250"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      FUZZ_RUNS: ${{ inputs.runs || '20000' }}
+      FUZZ_STEPS: ${{ inputs.steps || '250' }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # no token on disk while dependency install scripts run
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - name: Install
+        working-directory: plugin
+        run: npm ci
+      - name: Fuzz one seed range
+        working-directory: plugin
+        run: |
+          export FUZZ_FIRST=$(( (GITHUB_RUN_NUMBER * 8 + SHARD) * FUZZ_RUNS + 1 ))
+          echo "seeds $FUZZ_FIRST to $(( FUZZ_FIRST + FUZZ_RUNS - 1 )), $FUZZ_STEPS steps each"
+          node --import jiti/register --test test/engine.fuzz.test.ts
