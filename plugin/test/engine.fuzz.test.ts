@@ -27,6 +27,11 @@ async function run(seed: number, steps: number): Promise<void> {
 	const pick = <T>(items: T[]): T | undefined => items[Math.floor(random() * items.length)];
 	const server = new Server();
 	const devs = [0, 1, 2].map((i) => new Device(`d${i}`, server, random));
+	// Every third run, one device syncs notes only: its attachments stay its own, and it must not cost the
+	// others any of theirs.
+	const notesOnly = new Set(seed % 3 === 0 ? [devs[2]!] : []);
+	for (const d of notesOnly) d.overrides = { ...d.overrides, attachments: false };
+	const synced = (d: Device, path: string) => isNote(path) || !notesOnly.has(d);
 	const fate = new Map<string, "must" | "may">(); // token → must still exist at the end, or may be gone
 	const log: string[] = [];
 	const seenFiles = new Map<Device, string>();
@@ -40,7 +45,11 @@ async function run(seed: number, steps: number): Promise<void> {
 	const tokensIn = (content: Content) => latin1(content).match(/<[^>]+>/g) ?? [];
 	// Bytes that are no token's, with runs of zeros, so equal chunks turn up across files.
 	const noise = () => String.fromCharCode(...Array.from({ length: Math.floor(random() * 7) }, () => pick([0, 0, 0, 0, 1, 10, 61, 128, 255])!));
-	const create = (d: Device, path: string): Content => (isNote(path) ? token(d) : bytes(noise() + token(d) + noise()));
+	const create = (d: Device, path: string): Content => {
+		const content = isNote(path) ? token(d) : bytes(noise() + token(d) + noise());
+		if (!synced(d, path)) for (const t of tokensIn(content)) fate.set(t, "may"); // never leaves this device
+		return content;
+	};
 	// An attachment can't be edited, only replaced: what it held was the user's to throw away.
 	const edit = (d: Device, path: string): Content => {
 		const old = d.files.get(path)!.content;
@@ -138,7 +147,14 @@ async function run(seed: number, steps: number): Promise<void> {
 	if (process.env.FUZZ_LOG) (await import("node:fs")).writeFileSync(process.env.FUZZ_LOG, log.join("\n") + "\n");
 	const fail = (message: string) => assert.fail(`${message}\nseed ${seed}, last steps:\n  ${log.slice(-40).join("\n  ")}`);
 	// Byte for byte: an attachment's bytes as one character each, and marked, so a note never equals one.
-	const disks = devs.map((d) => JSON.stringify([...d.files].map(([p, f]) => [p, typeof f.content === "string" ? f.content : `bytes:${latin1(f.content)}`]).sort()));
+	// What each device syncs: a notes-only device is compared on its notes alone.
+	const disks = devs.map((d) => JSON.stringify([...d.files].filter(([p]) => isNote(p) || !notesOnly.size).map(([p, f]) => [p, typeof f.content === "string" ? f.content : `bytes:${latin1(f.content)}`]).sort()));
+	const full = devs.filter((d) => !notesOnly.has(d)).map((d) => JSON.stringify([...d.files].map(([p, f]) => [p, typeof f.content === "string" ? f.content : `bytes:${latin1(f.content)}`]).sort()));
+	for (const d of notesOnly) for (const [p] of d.files) if (!isNote(p) && devs.some((x) => x !== d && !notesOnly.has(x) && x.files.get(p) && latin1(x.files.get(p)!.content) === latin1(d.files.get(p)!.content))) {
+		// The same bytes on a syncing device would mean an attachment travelled to or from the notes-only one.
+		const own = tokensIn(d.files.get(p)!.content).every((t) => t.startsWith(`<${d.name}.`));
+		if (!own) fail(`${d.name} syncs notes only, but has ${p} from another device`);
+	}
 	for (const d of devs) if (d.problems.length) fail(`errors on ${d.name}:\n${d.problems.join("\n")}`);
 	const sync = devs.map((d) => `${d.name}: cursor ${(d.data.get("meta") as { cursor: number } | undefined)?.cursor}, unsent ${[...d.data.keys()].filter((k) => k.startsWith("out:")).join(",") || "none"}, online ${d.online}`).join("; ");
 	const indexOf = (d: Device) => { const doc = new Y.Doc(); const state = d.data.get("index") as Uint8Array | undefined; if (state) Y.applyUpdate(doc, state); return new Map([...doc.getMap<{ p: string; d?: string }>("notes")].map(([id, v]) => [id.slice(0, 6), `${v.p}${v.d === undefined ? "" : " (deleted)"}`])); };
@@ -147,6 +163,7 @@ async function run(seed: number, steps: number): Promise<void> {
 	if (process.env.FUZZ_LOG) log.push(`index waiting for missing updates: ${devs.map((d) => { const doc = new Y.Doc(); const st = d.data.get("index") as Uint8Array | undefined; if (st) Y.applyUpdate(doc, st); const p = (doc.store as unknown as { pendingStructs: { missing: Map<number, number> } | null }).pendingStructs; return `${d.name}: ${p ? JSON.stringify([...p.missing]) : "no"}`; }).join("; ")}`);
 	if (process.env.FUZZ_LOG) log.push(`index differences: ${indexDiff.join("; ") || "none"}`, `server rows: ${server.rows.map((r) => `${r.seq}:${r.entry.doc.slice(0, 6)}${r.entry.kind === "snapshot" ? "S" : ""}`).join(" ")}`);
 	if (process.env.FUZZ_LOG) (await import("node:fs")).writeFileSync(process.env.FUZZ_LOG, log.join("\n") + "\n");
+	if (new Set(full).size > 1) fail(`devices that sync attachments ended with different vaults:\n${full.join("\n")}`);
 	if (new Set(disks).size !== 1) fail(`devices ended with different vaults (server head ${server.head}; ${sync}):\n${devs.map((d, i) => `${d.name}: ${disks[i]}`).join("\n")}`);
 	for (const d of devs) {
 		const left = [...d.data.keys()].filter((k) => k.startsWith("out:") || k.startsWith("base:") || k.startsWith("up:"));

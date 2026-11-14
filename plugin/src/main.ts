@@ -40,7 +40,7 @@ export default class OwnsyncPlugin extends Plugin {
 	// createdHere: the vault this device created. Only then does it send the Worker's owner code: pairing joins a
 	// vault and must never create one, or a pairing link could make it upload notes under someone else's key.
 	// welcomed: the setup screen opened by itself once, on the first start.
-	settings = { host: "", vaultId: "", deviceName: "", createdHere: "", maxFileMB: 20, welcomed: false };
+	settings = { host: "", vaultId: "", deviceName: "", createdHere: "", maxFileMB: 20, attachments: true, welcomed: false };
 	session: Session | null = null;
 	status: State = "not set up";
 	problems: string[] = []; // the most recent, newest last
@@ -69,7 +69,7 @@ export default class OwnsyncPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		const data = ((await this.loadData()) ?? {}) as Partial<typeof this.settings>;
-		this.settings = { host: data.host ?? "", vaultId: data.vaultId ?? "", deviceName: data.deviceName ?? "", createdHere: data.createdHere ?? "", maxFileMB: data.maxFileMB ?? 20, welcomed: data.welcomed ?? !!data.host };
+		this.settings = { host: data.host ?? "", vaultId: data.vaultId ?? "", deviceName: data.deviceName ?? "", createdHere: data.createdHere ?? "", maxFileMB: data.maxFileMB ?? 20, attachments: data.attachments ?? true, welcomed: data.welcomed ?? !!data.host };
 		// Earlier versions kept the key (of epoch 0: there were no rotations) in local storage.
 		const legacy = this.app.loadLocalStorage("ownsync-vault-key") as string | null;
 		if (legacy) {
@@ -104,6 +104,18 @@ export default class OwnsyncPlugin extends Plugin {
 				this.openSetup();
 			}
 		});
+	}
+
+	get attachments(): boolean {
+		return this.settings.attachments;
+	}
+
+	/** Attachments on or off for this device; a running sync restarts with the new choice. */
+	async setAttachments(on: boolean): Promise<void> {
+		if (this.settings.attachments === on) return;
+		this.settings.attachments = on;
+		await this.saveData(this.settings);
+		if (this.session) await this.restart();
 	}
 
 	openSetup(code = ""): void {
@@ -152,6 +164,7 @@ export default class OwnsyncPlugin extends Plugin {
 			chunkName: (data): Promise<string> => transport.chunkName(data),
 			newId: () => hex(randomBytes(8)),
 			maxFileSize: this.settings.maxFileMB * 2 ** 20,
+			attachments: this.settings.attachments,
 			pace: 3000,
 			onProblem: problem,
 			onClosed: () => editors.refresh(),
@@ -353,7 +366,12 @@ class OwnsyncSettingTab extends PluginSettingTab {
 
 	private advanced(containerEl: HTMLElement): void {
 		const { plugin } = this;
+		new Setting(containerEl)
+			.setName("Sync attachments")
+			.setDesc("Images, PDFs and other files. Off: this device syncs notes only, and leaves attachments on your other devices alone.")
+			.addToggle((t) => t.setValue(plugin.attachments).onChange(async (on) => { await plugin.setAttachments(on); this.display(); }));
 		new Setting(containerEl).setName("Advanced").setHeading();
+		if (!plugin.attachments) return this.vaultFacts(containerEl);
 		let mb = String(plugin.settings.maxFileMB);
 		new Setting(containerEl)
 			.setName("Largest attachment (MB)")
@@ -367,6 +385,11 @@ class OwnsyncSettingTab extends PluginSettingTab {
 				await plugin.restart();
 				this.display();
 			}));
+		this.vaultFacts(containerEl);
+	}
+
+	private vaultFacts(containerEl: HTMLElement): void {
+		const { plugin } = this;
 		if (!plugin.hasKey()) return;
 		// The server, and its dashboard, know the vault by a hash of its ID; the short form is what the user types to delete it.
 		const keys = plugin.session?.keys, short = keys ? shortId(keys.vaultId) : "";

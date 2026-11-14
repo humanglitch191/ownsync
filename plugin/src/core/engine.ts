@@ -62,6 +62,11 @@ export interface EngineOptions {
 	chunkSize?: number;
 	/** Larger attachments are reported and left alone. Default 20 MB. */
 	maxFileSize?: number;
+	/**
+	 * False: this device syncs notes only. It neither uploads, downloads nor deletes attachments, and forgets
+	 * the ones it knew, so turning attachments back on later finds them by content and downloads the rest.
+	 */
+	attachments?: boolean;
 	/** Entries applied to one document before this device offers the server a snapshot of it. */
 	snapshotAfter?: number;
 	/** Least time in ms between storing edits on the server; edits made meanwhile go together. Default 0. */
@@ -199,6 +204,7 @@ export class Engine {
 				this.metas.set(key.slice(5), m);
 				if (m.diskPath) this.byPath.set(m.diskPath, key.slice(5));
 			}
+			if (this.notesOnly) for (const [id, m] of this.metas) if (m.diskPath && !isNote(m.diskPath)) this.forget(id);
 			this.outbox = (await this.store.list<Entry>("out:")).map(([key, entry]) => ({ id: Number(key.slice(4)), entry })).sort((a, b) => a.id - b.id);
 			for (const [key] of await this.store.list("up:")) this.ups.add(key.slice(3));
 			// Before the first catch-up, local files can't be told apart from the vault's notes yet.
@@ -212,6 +218,7 @@ export class Engine {
 	 * not trusted (`dirty`), and anything that needs it waits for those events.
 	 */
 	diskChanged(path: string): void {
+		if (this.notesOnly && !isNote(path)) return;
 		this.mark(path, 1);
 		this.later(() => void this.run(`disk ${path}`, async () => {
 			this.mark(path, -1);
@@ -228,6 +235,7 @@ export class Engine {
 	/** The file at `from` is now at `to`. Whatever was at `to` before is no longer there. */
 	diskRenamed(from: string, to: string): void {
 		if (this.ownRenames.get(to) === from) return void this.ownRenames.delete(to); // the engine's own move, already recorded
+		if (this.notesOnly && !isNote(from) && !isNote(to)) return;
 		// A note renamed to an attachment, or back: one file gone, an unrelated one new.
 		if (isNote(from) !== isNote(to)) return void (this.diskChanged(from), this.diskChanged(to));
 		this.mark(from, 1);
@@ -653,7 +661,7 @@ export class Engine {
 	 * unrelated new note, and an edit made to it on another device meanwhile would bring back a second copy.
 	 */
 	private async scan(): Promise<void> {
-		const files = await this.disk.list();
+		const files = (await this.disk.list()).filter((f) => !this.notesOnly || isNote(f.path));
 		const onDisk = new Map(files.map((f) => [f.path, f]));
 		const atStart = async (id: string) => {
 			// A note still marked open was in an editor when the app stopped: its file is that editor's last save.
@@ -802,7 +810,7 @@ export class Engine {
 	private async takeUnknown(path: string): Promise<string | undefined> {
 		// Stat first: if the file changes while it's being read, the older timestamp makes the next look catch it.
 		const file = (await this.disk.stat(path))!;
-		if (!isNote(path)) return this.takeAttachment(file);
+		if (!isNote(path)) return this.notesOnly ? undefined : this.takeAttachment(file);
 		const text = await this.disk.read(path);
 		const hash = await this.opts.hash(text);
 		const owner = this.ownerOf(path);
@@ -864,7 +872,7 @@ export class Engine {
 	 * Bring one note's file and document into agreement, and put the file where the index says.
 	 */
 	private async settle(id: string): Promise<void> {
-		if (this.settling.has(id)) return;
+		if (this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
 		this.settling.add(id);
 		this.deferred.delete(id);
 		try {
@@ -1080,6 +1088,10 @@ export class Engine {
 	}
 
 	// --- attachments ---
+
+	private get notesOnly(): boolean {
+		return this.opts.attachments === false;
+	}
 
 	private isAttachment(id: string): boolean {
 		const v = this.notes.get(id);

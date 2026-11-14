@@ -348,3 +348,33 @@ test("an attachment over the size limit is reported and left alone, on both side
 	assert.match(a!.problems.join("\n"), /small\.bin.*larger than/);
 	assert.deepEqual(b!.problems, []);
 });
+
+test("a device that syncs notes only leaves attachments alone, then catches up when they're turned back on", async () => {
+	const { devs: [a, b] } = world();
+	await quiesce([a!, b!]);
+	a!.write("Note.md", "hello");
+	a!.write("img/Photo.png", bytes(PIC));
+	await quiesce([a!, b!]);
+	// B (a phone, say) switches to notes only: its copy stays on its disk but no longer syncs either way.
+	b!.crash();
+	b!.overrides = { ...b!.overrides, attachments: false };
+	b!.boot();
+	b!.connect();
+	b!.remove("img/Photo.png"); // deleting it here costs A nothing
+	b!.write("Local.png", bytes(PIC2)); // nor does anything new here reach A
+	a!.write("img/Photo.png", bytes(PIC2)); // and A's change doesn't come down
+	a!.write("Other.png", bytes(PIC));
+	a!.write("Note.md", "hello again");
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), { "Note.md": "hello again", "Other.png": PIC, "img/Photo.png": PIC2 });
+	assert.deepEqual(disk(b!), { "Local.png": PIC2, "Note.md": "hello again" });
+	// Attachments back on: B finds its own file, uploads it, and downloads what it was missing.
+	b!.crash();
+	b!.overrides = { ...b!.overrides, attachments: true };
+	b!.boot();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "Local.png": PIC2, "Note.md": "hello again", "Other.png": PIC, "img/Photo.png": PIC2 });
+	assert.deepEqual(disk(a!), disk(b!));
+	noProblems([a!, b!]);
+});

@@ -6,7 +6,7 @@ import { Modal, Notice, requestUrl } from "obsidian";
 import { hex } from "../../protocol/ownsync";
 import { RecoverModal, type DevicesHost } from "./devices";
 import { paramsOfPairLink, parseVaultCode, trimHost } from "./links";
-import { type PairingHost, handlePairLink, showPairingCode } from "./pairing";
+import { type PairingHost, attachmentsToggle, handlePairLink, showPairingCode } from "./pairing";
 
 export type SetupHost = PairingHost & DevicesHost & { status: string; leave(): Promise<void> };
 
@@ -69,6 +69,8 @@ export class SetupModal extends Modal {
 			const input = field(el, "Vault code", "The notes already in this vault are uploaded to your server, encrypted.");
 			input.placeholder = "https://…#…";
 			input.value = this.code;
+			let attachments = this.plugin.attachments;
+			attachmentsToggle(el, attachments, (on) => (attachments = on));
 			const server = el.createEl("p", { cls: "ownsync-server" });
 			const showServer = () => {
 				const code = parseVaultCode(input.value);
@@ -91,6 +93,7 @@ export class SetupModal extends Modal {
 				if (!code) return this.fail(error, "That isn't a vault code. Copy it again from your server's dashboard.");
 				busy(true);
 				try {
+					await this.plugin.setAttachments(attachments);
 					await this.plugin.createVault(code.host, code.owner);
 					if (!this.plugin.hasKey()) return busy(false); // the recovery kit was closed: nothing was created
 					// The server says whether the code still works only once the vault connects.
@@ -115,6 +118,7 @@ export class SetupModal extends Modal {
 			steps.createEl("li", { text: "On a computer: copy the link it shows, and paste it here." });
 			const pasted = field(el, "Pairing link", "");
 			pasted.placeholder = "obsidian://ownsync-pair?…";
+			attachmentsToggle(el, this.plugin.attachments, (on) => void this.plugin.setAttachments(on));
 			const buttons = el.createDiv({ cls: "modal-button-container" });
 			buttons.createEl("button", { text: "Back" }).addEventListener("click", () => this.go("choose"));
 			buttons.createEl("button", { text: "Pair", cls: "mod-cta" }).addEventListener("click", async () => {

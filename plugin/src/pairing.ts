@@ -4,7 +4,7 @@
 // most), a fresh code replaces each one as it runs out. The link never contains the vault key; the Worker never
 // sees the code. The new device then adds itself to the membership log (keys.ts).
 
-import { type App, Modal, Notice, requestUrl } from "obsidian";
+import { type App, Modal, Notice, Setting, requestUrl } from "obsidian";
 import * as QRCode from "qrcode";
 import { hex, openFromPairing, pairingRoom, randomBytes, sealForPairing, unhex, unpackPairing } from "../../protocol/ownsync";
 import type { VaultKeys } from "./keys";
@@ -18,6 +18,9 @@ export interface PairingHost {
 	hasKey(): boolean;
 	setUp(host: string, vaultId: string, ring: Map<number, Uint8Array>, init?: (keys: VaultKeys) => Promise<void>, pin?: VaultKeys["state"]["pin"]): Promise<void>;
 	createVault(host: string, ownerCode: string): Promise<void>;
+	/** Whether this device syncs attachments too, or notes only. */
+	attachments: boolean;
+	setAttachments(on: boolean): Promise<void>;
 }
 
 // A phone's camera opens web links, not obsidian:// ones, so the QR code goes through the server's own
@@ -67,7 +70,8 @@ export async function handlePairLink(host: PairingHost, params: Record<string, s
 		new Notice("This device already syncs a vault, so the pairing link was ignored. To pair it again, use Settings → Ownsync → Leave this vault first.", 12000);
 		return false;
 	}
-	const ok = await confirm(host.app, "Pair this device?", `Server: ${server}. The notes in this Obsidian vault will be encrypted and synced with the vault on that server. Only continue if you just scanned or copied this code from your own device.`);
+	let attachments = host.attachments;
+	const ok = await confirm(host.app, "Pair this device?", `Server: ${server}. The notes in this Obsidian vault will be encrypted and synced with the vault on that server. Only continue if you just scanned or copied this code from your own device.`, "Pair", (el) => attachmentsToggle(el, attachments, (on) => (attachments = on)));
 	if (!ok) {
 		new Notice("Pairing cancelled. Nothing changed.", 6000);
 		return false;
@@ -90,18 +94,28 @@ export async function handlePairLink(host: PairingHost, params: Record<string, s
 		new Notice("Pairing failed: the server returned something this code can't open. Both devices need the same Ownsync version.", 8000);
 		return false;
 	}
+	await host.setAttachments(attachments);
 	await host.setUp(server, vaultId, new Map([[p.epoch, p.vmk]]), undefined, { number: p.number, hash: p.hash, pairedBy: p.pairerId });
 	const me = host.session?.keys.me.id;
 	new Notice(`Paired, and syncing.${me ? ` This device is ${shortId(me)}: your other device should show the same.` : ""}`, 15000);
 	return true;
 }
 
-function confirm(app: App, title: string, message: string, action = "Pair"): Promise<boolean> {
+/** "Sync attachments too": asked whenever a device starts syncing a vault, and changeable in Settings later. */
+export function attachmentsToggle(el: HTMLElement, on: boolean, set: (on: boolean) => void): void {
+	new Setting(el)
+		.setName("Sync attachments too")
+		.setDesc("Images, PDFs and other files, up to 20 MB each. Off: this device syncs notes only, and leaves attachments on your other devices alone.")
+		.addToggle((t) => t.setValue(on).onChange(set));
+}
+
+function confirm(app: App, title: string, message: string, action = "Pair", extra?: (el: HTMLElement) => void): Promise<boolean> {
 	return new Promise((resolve) => {
 		const modal = new Modal(app);
 		let answer = false;
 		modal.titleEl.setText(title);
 		modal.contentEl.createEl("p", { text: message });
+		extra?.(modal.contentEl);
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
 		buttons.createEl("button", { text: action, cls: "mod-warning" }).addEventListener("click", () => { answer = true; modal.close(); });
