@@ -16,7 +16,7 @@ const doc = (n: number) => new Uint8Array(16).fill(n);
 const name = (n: number) => new Uint8Array(32).fill(n);
 const token = () => crypto.getRandomValues(new Uint8Array(32));
 
-// Set by the first test: a fresh owner code ("Set up another vault" from its vault) for each vault a test creates.
+// Set by the first test: a fresh owner code from the dashboard for each vault a test creates.
 let OWNER: (() => Promise<Uint8Array>) | undefined;
 
 async function connect(vaultHex: string, tok?: Uint8Array, owner?: Uint8Array) {
@@ -86,16 +86,10 @@ test("only a current owner code creates a vault, each code once; then devices of
 	await device.catchUp(0);
 	assert.equal(await (await connect(v, token(), code)).closed, CLOSE.unauthorized);
 	for (const x of [created, device]) x.ws.close();
-	// "Set up another vault": a device of a vault gets a new owner code with its token, and nobody else does.
-	const mint = (vaultHex: string, body: Uint8Array) => fetch(`${home}vault/${vaultHex}/mint`, { method: "POST", body }).then(async (r) => ({ status: r.status, ...((await r.json()) as { owner?: string }) }));
-	for (const [vh, t] of [[v, token()], [vault(), tok], [v, new Uint8Array(0)], [v, new Uint8Array([...tok, 0])]] as const) assert.equal((await mint(vh, t)).status, 401);
-	const minted = (await mint(v, tok)).owner;
-	assert.match(minted!, /^[0-9a-f]{64}$/);
-	const another = await connect(vault(), token(), hexToBytes(minted!));
-	assert.deepEqual(await another.catchUp(0), { got: [], head: 0, pages: 1 });
-	another.ws.close();
-	assert.equal(await (await connect(vault(), token(), hexToBytes(minted!))).closed, CLOSE.notOwner); // each code makes one vault
-	OWNER = async () => hexToBytes((await mint(v, tok)).owner!);
+	// Each code makes one vault; codes come only from the dashboard (a device of a vault can't make one).
+	assert.equal(await (await connect(vault(), token(), code)).closed, CLOSE.notOwner);
+	assert.equal((await fetch(`${home}vault/${v}/mint`, { method: "POST", body: tok })).status, 404);
+	OWNER = async () => hexToBytes(await claim(`http://localhost:${PORT}`));
 });
 
 test("every frame survives encoding and decoding", () => {
@@ -362,6 +356,6 @@ test("deleting a vault takes its token; then its devices are told 4004, it can't
 	bare.send({ t: "hello", token: tok });
 	assert.equal(await bare.closed, CLOSE.deleted);
 	assert.equal(await post("delete", tok), 410);
-	assert.equal(await post("mint", tok), 410);
+	assert.equal(await post("names", new Uint8Array([...tok, ...bytes("{}")])), 410);
 	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: true, devices: [] });
 });

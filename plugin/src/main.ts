@@ -8,7 +8,7 @@ import { IdbStore } from "./idbStore";
 import { type KeyPorts, type KeyState, VaultKeys, shortId } from "./keys";
 import { parseSetupLink, trimHost } from "./links";
 import { handlePairLink, showPairingCode } from "./pairing";
-import { SetupModal, openDashboard, showVaultCode } from "./setup";
+import { SetupModal, openDashboard } from "./setup";
 import { type Status, Transport } from "./transport";
 import { VaultDisk } from "./vaultDisk";
 
@@ -89,7 +89,6 @@ export default class OwnsyncPlugin extends Plugin {
 		this.addCommand({ id: "set-up", name: "Set up", checkCallback: (checking) => !this.hasKey() && (checking || this.openSetup(), true) });
 		this.addCommand({ id: "pair-device", name: "Add a device", checkCallback: (checking) => this.hasKey() && (checking || void showPairingCode(this), true) });
 		this.addCommand({ id: "open-dashboard", name: "Open dashboard", checkCallback: (checking) => this.hasKey() && (checking || openDashboard(this), true) });
-		this.addCommand({ id: "another-vault", name: "Set up another vault", checkCallback: (checking) => this.hasKey() && (checking || void showVaultCode(this), true) });
 		// Phones have no status bar, so the status is also a command.
 		this.addCommand({ id: "show-status", name: "Show sync status", callback: () => new Notice(this.describe(), 10000) });
 		// Phones suspend the app and drop its connection without telling it: reconnect when it comes back.
@@ -354,9 +353,9 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			.setDesc("See your devices, when each last synced, conflicts, and how much of Cloudflare's free plan you use. Opens your server's page in the browser; sign in with your passkey.")
 			.addButton((b) => b.setButtonText("Open dashboard").onClick(() => openDashboard(plugin)));
 		new Setting(containerEl)
-			.setName("Set up another vault")
-			.setDesc("Sync a different Obsidian vault through the same server: gives you a code to paste into its setup screen.")
-			.addButton((b) => b.setButtonText("Get a code").onClick(() => void showVaultCode(plugin)));
+			.setName("Add another vault")
+			.setDesc("Sync a different Obsidian vault through the same server. Your dashboard walks you through it.")
+			.addButton((b) => b.setButtonText("Open dashboard").onClick(() => openDashboard(plugin, "connect")));
 		new Setting(containerEl)
 			.setName("Device name")
 			.setDesc("Shown next to this device's cursor on your other devices, and on your server's dashboard.")

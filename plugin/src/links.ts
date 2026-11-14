@@ -42,7 +42,7 @@ export function paramsOfPairLink(text: string): Record<string, string> | null {
 	}
 }
 
-/** A code from "Set up another vault": `<server address>#<owner code>`, or null. */
+/** A code from the dashboard's Connect a vault: `<server address>#<owner code>`, or null. */
 export function parseVaultCode(text: string): { host: string; owner: string } | null {
 	const m = text.trim().match(/^(\S+)#([0-9a-fA-F]{64})$/);
 	const host = m ? trimHost(m[1]!) : "";

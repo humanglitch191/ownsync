@@ -128,7 +128,7 @@ function welcome(message) {
 	const signIn = action([svg(KEY), "Sign in with passkey"], async () => {
 		const options = await api("/api/login/options", {});
 		await api("/api/login/verify", { response: await usePasskey(options) });
-		await dashboard();
+		await home();
 	}, "btn primary");
 	show(h("main", { class: "welcome" },
 		brand(),
@@ -146,9 +146,13 @@ function stepItem(state, title, detail) {
 	return h("li", { class: state }, h("span", { class: "c" }, state === "done" ? svg(CHECK, 11, 3) : null), h("div", {}, h("b", {}, title), h("small", {}, detail)));
 }
 
-function setup(token) {
-	const STEPS = ["Passkey", "Connect", "Phone", "Done"];
+// First run (`token` from the setup key): passkey, connect, phone, done. Another vault (`token` null): the same
+// steps from connect on, waiting for a vault that wasn't there before.
+async function setup(token) {
+	const another = !token;
+	const STEPS = another ? ["Connect", "Phone", "Done"] : ["Passkey", "Connect", "Phone", "Done"];
 	let at = 0, known = -1, stop = false, overview = null, first = null; // first: the device that connected the vault
+	const before = new Set(another ? (await api("/api/overview")).vaults.map((v) => v.id) : []);
 	const dots = h("div", { class: "dots" }, STEPS.map(() => h("i")));
 	const label = h("span", { class: "label" });
 	const pane = h("div", { class: "step" });
@@ -157,19 +161,23 @@ function setup(token) {
 		h("div", { class: "form" }, h("div", { class: "stepper" }, mark(), h("div", { class: "row" }, dots, label)), pane),
 		h("div", { class: "preview", "aria-hidden": "true" }, h("div", { class: "window" }, h("div", { class: "bar" }, h("i"), h("i"), h("i"), h("span", {}, location.host)), live)))));
 
+	const step = (name) => STEPS.indexOf(name);
 	const go = (i) => {
 		at = i;
 		[...dots.children].forEach((d, j) => (d.className = j < at ? "done" : j === at ? "now" : ""));
 		label.textContent = `${STEPS[at]} · ${at + 1}/${STEPS.length}`;
-		pane.replaceChildren(...screens[at]());
+		pane.replaceChildren(...screens[STEPS[at]]());
 		preview();
 	};
+	const leave = () => { stop = true; void dashboard(); };
+	// The vault this setup is about: the first one connected since it began.
+	const target = () => (overview?.vaults ?? []).find((v) => !before.has(v.id) && v.devices.length);
 	// The right side: what the dashboard shows right now.
 	const preview = () => {
-		const vault = (overview?.vaults ?? []).find((v) => v.devices.length);
+		const vault = target();
 		if (!vault) {
-			if (at === 0) live.replaceChildren(h("div", { class: "skel title" }), ...[1, 2, 3].map(() => h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" }), h("div", { class: "skel short" })), h("span"))));
-			else live.replaceChildren(h("h3", { class: "appear" }, "Your sync server"), h("div", { class: "card appear" }, h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" })), h("span", { class: "label" }, "Waiting"))));
+			if (STEPS[at] === "Passkey") live.replaceChildren(h("div", { class: "skel title" }), ...[1, 2, 3].map(() => h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" }), h("div", { class: "skel short" })), h("span"))));
+			else live.replaceChildren(h("h3", { class: "appear" }, another ? "Another vault" : "Your sync server"), h("div", { class: "card appear" }, h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" })), h("span", { class: "label" }, "Waiting"))));
 			return;
 		}
 		live.replaceChildren(h("h3", {}, vaultName(vault)), h("div", { class: "card" },
@@ -181,18 +189,18 @@ function setup(token) {
 		while (!stop) {
 			try { overview = await api("/api/overview"); } catch { /* signed out: the next step says so */ }
 			if (!app.contains(pane)) return;
-			const devices = overview?.vaults.reduce((n, v) => n + v.devices.length, 0) ?? 0;
+			const devices = target()?.devices.length ?? 0;
 			if (devices !== known) { known = devices; go(at); }
 			await sleep(2000);
 		}
 	};
 
-	const screens = [
-		() => {
+	const screens = {
+		Passkey: () => {
 			const create = action("Create passkey", async () => {
 				const options = await api("/api/enrol/options", { token });
 				await api("/api/enrol/verify", { token, response: await createPasskey(options) });
-				at = 1;
+				at = step("Connect");
 				void poll();
 			}, "btn primary");
 			return [h("h2", {}, "Add a passkey"),
@@ -201,8 +209,8 @@ function setup(token) {
 				note(INFO, "Your phone, laptop or password manager keeps it. Lost them all? A new setup key gets you back in."),
 				h("div", { class: "row actions" }, create.button), create.error];
 		},
-		() => {
-			const connected = (overview?.vaults ?? []).find((v) => v.devices.length);
+		Connect: () => {
+			const connected = target();
 			first ??= connected?.devices[0]?.id ?? null;
 			const box = h("div");
 			const open = action("Open in Obsidian", async () => {
@@ -210,33 +218,34 @@ function setup(token) {
 				location.href = link;
 				box.replaceChildren(h("div", { class: "code" }, h("span", {}, code), h("button", { class: "btn small", onclick: () => navigator.clipboard.writeText(code) }, "Copy code")));
 			}, connected ? "btn" : "btn primary");
-			return [h("h2", {}, "Connect your first vault"),
-				h("p", { class: "sub" }, "Its notes upload encrypted. A few thousand notes take about a minute."),
+			return [h("h2", {}, another ? "Connect another vault" : "Connect your first vault"),
+				h("p", { class: "sub" }, another ? "Each vault gets its own key. Its notes upload encrypted." : "Its notes upload encrypted. A few thousand notes take about a minute."),
 				h("ol", { class: "checks" },
-					stepItem(connected ? "done" : "now", "Install Ownsync in Obsidian", "Settings → Community plugins → Browse, search for Ownsync"),
-					stepItem(connected ? "done" : "now", "Open the vault you want to sync", "A new, empty vault is fine too"),
+					stepItem(connected ? "done" : "now", "Install Ownsync in Obsidian", another ? "Already there? Skip ahead" : "Settings → Community plugins → Browse, search for Ownsync"),
+					stepItem(connected ? "done" : "now", another ? "Open the other vault in Obsidian" : "Open the vault you want to sync", "A new, empty vault is fine too"),
 					stepItem(connected ? "done" : "later", "Press Open in Obsidian, then Connect", "Obsidian shows this server before anything happens")),
 				box,
 				connected
 					? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${vaultName(connected)} is syncing from ${first}`))
 					: h("div", { class: "waiting" }, h("span", { class: "pulse" }), "Waiting for Obsidian…"),
 				h("div", { class: "grow" }),
-				h("div", { class: "row actions" }, connected ? h("button", { class: "btn primary", onclick: () => go(2) }, "Continue") : null, open.button), open.error];
+				h("div", { class: "row actions" }, connected ? h("button", { class: "btn primary", onclick: () => go(step("Phone")) }, "Continue") : null, open.button,
+					another && !connected ? h("button", { class: "btn ghost", onclick: leave }, "Back to dashboard") : null), open.error];
 		},
-		() => {
-			const vault = (overview?.vaults ?? []).find((v) => v.devices.length), two = vault && vault.devices.length > 1;
+		Phone: () => {
+			const vault = target(), two = vault && vault.devices.length > 1;
 			const joined = vault?.devices.find((d) => d.id !== first);
-			return [h("h2", {}, "Add your phone"),
-				h("p", { class: "sub" }, "In Obsidian on your computer: Settings → Ownsync → Add a device. Scan the code with your phone's camera."),
+			return [h("h2", {}, another ? "Add your phone to it" : "Add your phone"),
+				h("p", { class: "sub" }, "In Obsidian on your computer, in this vault: Settings → Ownsync → Add a device. Scan the code with your phone's camera."),
 				h("ol", { class: "checks" },
 					stepItem("done", `${vault ? vaultName(vault) : "Your vault"} is syncing`, first ? `From ${first}` : ""),
 					stepItem(two ? "done" : "now", "Scan the code on your phone", "It hands over the key; this server never sees it"),
 					stepItem(two ? "done" : "later", "Check both show the same ID", "So you know it's yours")),
-				two ? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${joined?.id} joined`)) : h("div", { class: "waiting" }, h("span", { class: "pulse" }), "Waiting for your phone…"),
+				two ? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${joined?.name || joined?.id} joined`)) : h("div", { class: "waiting" }, h("span", { class: "pulse" }), "Waiting for your phone…"),
 				h("div", { class: "grow" }),
-				h("div", { class: "row actions" }, h("button", { class: two ? "btn primary" : "btn", onclick: () => go(3) }, two ? `Continue with ${plural(vault.devices.length, "device")}` : "Skip for now"))];
+				h("div", { class: "row actions" }, h("button", { class: two ? "btn primary" : "btn", onclick: () => go(step("Done")) }, two ? `Continue with ${plural(vault.devices.length, "device")}` : "Skip for now"))];
 		},
-		() => [
+		Done: () => [
 			h("div", { class: "badge" }, svg(CHECK, 20, 2.5)),
 			h("h2", {}, "Nothing slips through now."),
 			h("p", { class: "sub" }, "Your vault syncs between your devices, end to end encrypted."),
@@ -245,10 +254,11 @@ function setup(token) {
 				h("div", {}, h("span", {}, "Keep your recovery kit safe"), h("span", { class: "quiet" }, "Obsidian showed it")),
 				h("div", {}, h("span", {}, "Another vault, like Work"), h("span", { class: "quiet" }, "From the dashboard"))),
 			h("div", { class: "grow" }),
-			h("div", { class: "row actions" }, h("button", { class: "btn primary", onclick: () => { stop = true; void dashboard(); } }, "Open dashboard")),
+			h("div", { class: "row actions" }, h("button", { class: "btn primary", onclick: leave }, "Open dashboard")),
 		],
-	];
+	};
 	go(0);
+	if (another) void poll();
 }
 
 // --- dashboard ---
@@ -321,14 +331,6 @@ function days(history, key) {
 }
 
 function connectPanel() {
-	const box = h("div");
-	const open = action("Connect another vault", async () => {
-		const { code, link } = await api("/api/vault-code", {});
-		location.href = link;
-		const area = h("textarea", { rows: 3, readonly: true, "aria-label": "Vault code" });
-		area.value = code;
-		box.replaceChildren(h("p", { class: "quiet" }, "Obsidian didn't open? Open the vault, and in Ownsync's setup screen choose Start syncing this vault and paste:"), area);
-	}, "btn wide");
 	return h("div", { class: "side" },
 		h("div", { class: "card panel" },
 			h("h4", {}, "Add a device"),
@@ -336,7 +338,7 @@ function connectPanel() {
 				stepItem("now", "Install Ownsync on it", "Settings → Community plugins → Browse"),
 				stepItem("later", "Show a code on a synced device", "Settings → Ownsync → Add a device"),
 				stepItem("later", "Scan it and compare IDs", "Both show the new device's ID")),
-			open.button, open.error, box),
+			h("button", { class: "btn wide", onclick: () => void setup(null) }, "Connect another vault")),
 		note(LOCK, "This page sees when devices connect and how much is stored. Never a note, a file name or a key."));
 }
 
@@ -372,7 +374,7 @@ async function dashboard() {
 			meterTile("Requests today", usage.requestsToday, limits.requestsPerDay, count, "Resets at midnight UTC.", days(usage.history ?? [], "requests")),
 			meterTile("Rows written today", usage.rowsWrittenToday, limits.rowsWrittenPerDay, count, "Roughly one per saved edit.", days(usage.history ?? [], "rows"))),
 		h("div", { class: "twocol" },
-			h("div", {}, o.vaults.length ? o.vaults.map(vaultSection) : h("div", { class: "card empty" }, h("p", { class: "quiet" }, "Install Ownsync in Obsidian, open the vault you want to sync, then press Connect another vault."))),
+			h("div", {}, o.vaults.length ? o.vaults.map(vaultSection) : h("div", { class: "card empty" }, h("p", { class: "quiet" }, "No vaults yet. Press Connect another vault to connect your first."))),
 			connectPanel()),
 		h("footer", { class: "foot" }, h("span", {}, `Ownsync ${o.version} · your server`), h("span", {}, "Workers Free plan · ", h("a", { href: "https://github.com/humanglitch191/ownsync/blob/main/docs/cost-and-limits.md" }, "what Paid adds")))));
 }
@@ -400,5 +402,15 @@ async function passkeys() {
 			h("p", { class: "quiet" }, "Lost every passkey? Set a new SETUP_KEY in your Cloudflare dashboard and use it here: that replaces all passkeys."))));
 }
 
+// Obsidian's "Add another vault" opens /#connect: straight into the steps, once signed in.
+let pending = location.hash === "#connect" ? "connect" : null;
+if (location.hash) history.replaceState(null, "", location.pathname);
+async function home() {
+	if (pending !== "connect") return dashboard();
+	try { await api("/api/overview"); } catch (err) { return err.status === 401 ? welcome() : show(h("p", { class: "error" }, failure(err))); }
+	pending = null;
+	return setup(null);
+}
+
 if (!window.PublicKeyCredential) show(h("main", { class: "welcome" }, brand(), h("p", { class: "error" }, "This browser doesn't support passkeys. Open this page in a current Safari, Chrome, Edge or Firefox.")));
-else void dashboard();
+else void home();

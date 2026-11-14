@@ -1,9 +1,8 @@
 // The welcome screen: everything a first-time user does, in one place. A new vault connects with a one-time code
-// from the server's dashboard (or "Set up another vault" on a device that syncs), which also says which server;
-// any other device is paired from one that already syncs. The setup key is only ever typed on the dashboard.
+// from the server's dashboard, which also says which server; any other device is paired from one that already
+// syncs. The setup key is only ever typed on the dashboard.
 
-import { Modal, Notice, requestUrl } from "obsidian";
-import { hex } from "../../protocol/ownsync";
+import { Modal, Notice } from "obsidian";
 import { RecoverModal, type DevicesHost } from "./devices";
 import { paramsOfPairLink, parseVaultCode, trimHost } from "./links";
 import { type PairingHost, attachmentsToggle, handlePairLink, showPairingCode } from "./pairing";
@@ -158,41 +157,7 @@ export class SetupModal extends Modal {
 	}
 }
 
-/**
- * "Set up another vault": once a vault exists the setup key claims nothing, so a device that syncs asks the Worker
- * for a fresh owner code (proving itself with its vault's token) and shows it, with the server address, to paste
- * into the other vault's setup screen.
- */
-export async function showVaultCode(plugin: SetupHost): Promise<void> {
-	const keys = plugin.session?.keys, server = trimHost(plugin.settings.host);
-	if (!keys) return;
-	const token = await keys.token();
-	const res = await requestUrl({ url: `${server}/vault/${hex(keys.vaultId)}/mint`, method: "POST", body: token.buffer.slice(token.byteOffset, token.byteOffset + token.byteLength) as ArrayBuffer, throw: false }).catch(() => null);
-	const owner = (() => { try { return (res?.json as { owner?: string } | undefined)?.owner; } catch { return undefined; } })();
-	if (!owner || !/^[0-9a-f]{64}$/.test(owner)) return void new Notice("Couldn't get a code from your server. Wait until Ownsync shows synced, then try again.", 8000);
-	const code = `${server}#${owner}`;
-	const modal = new Modal(plugin.app);
-	modal.modalEl.addClass("ownsync-setup");
-	modal.titleEl.setText("Set up another vault");
-	const el = modal.contentEl;
-	el.createEl("p", { cls: "ownsync-lead", text: "Sync another Obsidian vault through the same server, with its own encryption key." });
-	const steps = el.createEl("ol", { cls: "ownsync-steps" });
-	steps.createEl("li", { text: "Open the other vault in Obsidian, on this or any device, and install Ownsync there." });
-	steps.createEl("li", { text: "In Ownsync's setup screen, choose “Start syncing this vault” and paste this code as the setup key." });
-	const box = el.createEl("textarea", { cls: "ownsync-code" });
-	box.value = code;
-	box.readOnly = true;
-	box.rows = 3;
-	el.createEl("p", { cls: "ownsync-quiet", text: "The code sets up one vault, within 24 hours. It opens none of your vaults, but keep it to yourself." });
-	const buttons = el.createDiv({ cls: "modal-button-container" });
-	buttons.createEl("button", { text: "Close" }).addEventListener("click", () => modal.close());
-	buttons.createEl("button", { text: "Copy code", cls: "mod-cta" }).addEventListener("click", () => {
-		void navigator.clipboard.writeText(code).then(() => new Notice("Code copied."), () => new Notice("Failed to copy the code.", 6000));
-	});
-	modal.open();
-}
-
-/** "Open dashboard": the server's front page, where the owner signs in with a passkey. */
-export function openDashboard(plugin: SetupHost): void {
-	window.open(`${trimHost(plugin.settings.host)}/`);
+/** "Open dashboard": the server's front page, where the owner signs in with a passkey; "connect" starts adding a vault. */
+export function openDashboard(plugin: SetupHost, start?: "connect"): void {
+	window.open(`${trimHost(plugin.settings.host)}/${start ? `#${start}` : ""}`);
 }

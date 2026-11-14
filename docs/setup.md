@@ -38,7 +38,7 @@ Ownsync then offers a **recovery kit**: your server address, vault ID and a reco
 
 <img src="images/obsidian-done.png" width="520" alt="You're all set">
 
-Another vault? Open it in Obsidian and press **Connect another vault** on the dashboard. Each vault gets its own key.
+Another vault? Press **Connect another vault** on your dashboard, or **Add another vault** in Settings → Ownsync, which opens it. The same steps walk you through it, and each vault gets its own key.
 
 ## 4. Add your phone and other devices
 

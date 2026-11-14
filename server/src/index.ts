@@ -57,7 +57,7 @@ export default {
 		}
 		// The owner dashboard's API; its pages are static assets.
 		if (path.startsWith("/api/")) return owner(env).fetch(req);
-		const vault = path.match(/^\/vault\/([0-9a-f]{32})(\/mint|\/delete|\/names)?$/);
+		const vault = path.match(/^\/vault\/([0-9a-f]{32})(\/delete|\/names)?$/);
 		if (vault) return env.VAULT.get(env.VAULT.idFromName(vault[1]!)).fetch(req);
 		// The room is a hash of the pairing code, so the server can't open what it holds.
 		const pair = path.match(/^\/pair\/([0-9a-f]{32})$/);
@@ -107,10 +107,9 @@ export class Vault extends DurableObject<Env> {
 		const path = new URL(req.url).pathname;
 		this.name ??= path.split("/")[2] ?? null;
 		this.count(1);
-		const action = path.endsWith("/mint") ? "mint" : path.endsWith("/delete") ? "delete" : path.endsWith("/names") ? "names" : null;
-		// A device of this vault asks for an owner code to set up another vault on this Worker ("Set up another
-		// vault", the same as the dashboard gives). Or it deletes the vault, from Obsidian, where the user typed its
-		// short ID. Or it says what it and the vault are called in Obsidian, for the dashboard.
+		const action = path.endsWith("/delete") ? "delete" : path.endsWith("/names") ? "names" : null;
+		// A device of this vault deletes it, from Obsidian, where the user typed its short ID. Or it says what it and
+		// the vault are called in Obsidian, for the dashboard.
 		if (action) {
 			if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
 			if (this.deleted) return Response.json({ error: "deleted" }, { status: 410 });
@@ -120,7 +119,6 @@ export class Vault extends DurableObject<Env> {
 			const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", token));
 			const stored = this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0]?.token_hash;
 			if (!stored || token.length !== 32 || !crypto.subtle.timingSafeEqual(hash, stored)) return Response.json({ error: "unauthorized" }, { status: 401 });
-			if (action === "mint") return Response.json({ owner: await owner(this.env).mint() });
 			if (action === "names") {
 				if (body.length > 32 + 1024) return Response.json({ error: "too large" }, { status: 413 });
 				let n: { device?: unknown; name?: unknown; vault?: unknown };
@@ -351,8 +349,8 @@ export class Vault extends DurableObject<Env> {
 
 const owner = (env: Env) => env.OWNER.get(env.OWNER.idFromName("owner"));
 const today = () => Math.floor(Date.now() / DAY_MS); // days since the epoch, so a new one starts at 00:00 UTC
-// How long an owner code works: one a device gets, and one the dashboard gets (shown on a screen, so shorter).
-const CODE_MS = 24 * 60 * 60 * 1000, DASHBOARD_CODE_MS = 60 * 60 * 1000, MAX_CODES = 20;
+// How long an owner code from the dashboard works (it's shown on a screen), and how many unused ones are kept.
+const DASHBOARD_CODE_MS = 60 * 60 * 1000, MAX_CODES = 20;
 
 /** Whose tries these are: an IPv4 address, or an IPv6 /64 (one machine often has a whole /64, or more). */
 export function network(ip: string | null): string {
@@ -396,8 +394,8 @@ export class Owner extends DurableObject<Env> {
 		return this.dashboard.setup(given, expected, setupKey, who, deployed, origin);
 	}
 
-	/** A new owner code: for a device that syncs a vault here (the Vault checked its token), or the dashboard. */
-	async mint(ttl = CODE_MS): Promise<string> {
+	/** A new owner code, for the dashboard's Connect a vault. */
+	async mint(ttl = DASHBOARD_CODE_MS): Promise<string> {
 		const code = crypto.getRandomValues(new Uint8Array(32)), now = Date.now();
 		this.sql.exec("INSERT INTO codes (code_hash, expires) VALUES (?, ?)", await digest(code), now + ttl);
 		this.sql.exec("DELETE FROM codes WHERE expires < ? OR code_hash NOT IN (SELECT code_hash FROM codes ORDER BY expires DESC LIMIT ?)", now, MAX_CODES);
