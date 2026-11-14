@@ -1,0 +1,26 @@
+{
+	"name": "ownsync-server",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"test": "node --test --test-concurrency=1 test/*.test.ts",
+		"typecheck": "wrangler types && tsc -p ."
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^5.20261113.1",
+		"typescript": "5.8",
+		"wrangler": "^4.161.0"
+	},
+	"cloudflare": {
+		"bindings": {
+			"SETUP_KEY": {
+				"description": "Choose a **setup key**: a passphrase of at least 12 characters that isn't easy to guess (a few random words work well). Open your Worker's address within 10 minutes of deploying and enter it to add your passkey; after that it does nothing."
+			}
+		}
+	},
+	"dependencies": {
+		"@simplewebauthn/server": "^14.1.0"
+	}
+}

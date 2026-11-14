@@ -1,0 +1,36 @@
+name = "ownsync"
+main = "src/index.ts"
+compatibility_date = "2026-03-02"
+
+[[durable_objects.bindings]]
+name = "VAULT"
+class_name = "Vault"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Vault"]
+
+[[durable_objects.bindings]]
+name = "PAIRING"
+class_name = "Pairing"
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Pairing"]
+
+[[durable_objects.bindings]]
+name = "OWNER"
+class_name = "Owner"
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["Owner"]
+
+# The dashboard's pages and the font (Geist, SIL Open Font License: public/geist-LICENSE.txt). Anything not
+# found here goes to the Worker.
+[assets]
+directory = "./public"
+
+# When this version was deployed: the setup key works only for a few minutes after (a new SETUP_KEY is a new version).
+[version_metadata]
+binding = "CF_VERSION_METADATA"

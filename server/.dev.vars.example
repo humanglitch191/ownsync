@@ -1,0 +1,4 @@
+# Choose a setup key: a passphrase of at least 12 characters that isn't easy to guess (a few random words work
+# well). Enter it on your Worker's page within 10 minutes of deploying, to add your passkey; after that it does
+# nothing. A new SETUP_KEY opens it again for 10 minutes and replaces every passkey.
+SETUP_KEY=
