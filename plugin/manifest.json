@@ -1,0 +1,10 @@
+{
+	"id": "ownsync",
+	"name": "Ownsync",
+	"version": "0.1.0",
+	"minAppVersion": "1.11.4",
+	"description": "End-to-end encrypted, real-time sync between your own devices through your own Cloudflare Worker.",
+	"author": "humanglitch191",
+	"authorUrl": "https://github.com/humanglitch191",
+	"isDesktopOnly": false
+}
