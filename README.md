@@ -36,6 +36,6 @@ To add your phone, scan the QR code under Settings → Ownsync → Add a device.
 - Your server sees when your devices connect and how much is stored, never what you wrote. [What it can and can't see](docs/security.md).
 - I built Ownsync with AI. The calls on what it should be, and how it keeps notes safe, were mine. [How it was built](docs/how-it-was-built.md).
 
-[Setup guide](docs/setup.md) · [Security](docs/security.md) · [Cost and limits](docs/cost-and-limits.md) · [Stress test results](docs/stress-test-results.md) · [How it was built](docs/how-it-was-built.md) · [Design notes](docs/DESIGN.md) · [Protocol](docs/PROTOCOL.md) · [Development](docs/development.md)
+[Setup guide](docs/setup.md) · [Security](docs/security.md) · [Cost and limits](docs/cost-and-limits.md) · [Updating](docs/updating.md) · [Stress test results](docs/stress-test-results.md) · [How it was built](docs/how-it-was-built.md) · [Design notes](docs/DESIGN.md) · [Protocol](docs/PROTOCOL.md) · [Development](docs/development.md)
 
 MIT © humanglitch191

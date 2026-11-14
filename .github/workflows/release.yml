@@ -23,9 +23,10 @@ jobs:
         with:
           node-version: 26
 
-      - name: Tag matches the plugin version; manifest.json and versions.json are up to date
+      - name: Tag matches the plugin and server versions; manifest.json and versions.json are up to date
         run: |
           test "$GITHUB_REF_NAME" = "$(node -p 'require("./plugin/manifest.json").version')"
+          grep -q "export const VERSION = \"$GITHUB_REF_NAME\";" server/src/dashboard.ts
           node scripts/sync-manifest.mjs && git diff --exit-code manifest.json versions.json
 
       - name: Build

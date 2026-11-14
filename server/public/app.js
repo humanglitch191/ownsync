@@ -353,7 +353,11 @@ async function dashboard() {
 		? h("h1", { class: "headline" }, h("b", {}, plural(o.vaults.length, "vault")), " across ", h("b", {}, plural(devices, "device")), ". ",
 			o.lastSync ? ["Last sync ", h("b", {}, ago(o.lastSync)), "."] : "No device has synced yet.")
 		: h("h1", { class: "headline" }, "No vaults yet. ", h("b", {}, "Connect your first one"), " on the right.");
-	const notice = localStorage.getItem(NOTICE) ? null : h("div", { class: "card notice" }, h("span", { class: "label" }, "New"),
+	// A newer Ownsync comes first; otherwise what's new in this one, until dismissed.
+	const notice = o.update ? h("div", { class: "card notice" }, h("span", { class: "label" }, "Update"),
+		h("p", {}, `Ownsync ${o.update} is out. On GitHub, open your Ownsync repository → Actions → Update Ownsync → Run workflow. Cloudflare redeploys your server.`),
+		h("a", { href: "https://github.com/humanglitch191/ownsync/blob/main/docs/updating.md" }, "How"))
+		: localStorage.getItem(NOTICE) ? null : h("div", { class: "card notice" }, h("span", { class: "label" }, "New"),
 		h("p", {}, "Phones can sync notes only now, and skip attachments: Settings → Ownsync → Sync attachments."),
 		h("button", { "aria-label": "Dismiss", onclick: (e) => { localStorage.setItem(NOTICE, "1"); e.target.closest(".notice").remove(); } }, "×"));
 	const { usage, limits } = o;

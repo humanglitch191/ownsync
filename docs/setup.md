@@ -12,6 +12,8 @@ Your devices encrypt every edit and hold the key. Your Worker, on your own Cloud
 
 Press the button and sign in to Cloudflare, or create a free account. Cloudflare asks for a name and a **setup key**: a passphrase of at least 12 characters that isn't easy to guess. A few random words work well. When the deploy finishes, Cloudflare shows your server's address, like `https://ownsync.yourname.workers.dev`.
 
+**Your own domain** (optional), like `sync.yourdomain.com`, instead of the `workers.dev` address: do it now, before signing in, because your passkey belongs to the address you create it on. In your Cloudflare dashboard, open **Workers & Pages → ownsync → Settings → Domains & Routes → Add → Custom domain** (the domain's DNS has to be on Cloudflare; it's free). Then set a new `SETUP_KEY` under **Settings → Variables and Secrets**, which restarts the 10 minutes, and open your own domain for the next step.
+
 ## 2. Sign in and add a passkey
 
 Open the address **within 10 minutes**. Press **First time? Use setup key**, enter it, then create a passkey: your fingerprint, face or device PIN. From then on you sign in with the passkey, and the setup key stops working.
@@ -56,6 +58,8 @@ Your server's address is your dashboard. It opens with a one-line summary, then 
 <img src="images/dashboard.png" width="560" alt="The dashboard">
 </picture>
 </p>
+
+**Moved to your own domain later?** Add the domain as above, set a new `SETUP_KEY`, and set up again at the new address. Your vaults and devices carry on; devices you already connected keep using the `workers.dev` address, which keeps working.
 
 **Missed the 10 minutes, or lost every passkey?** In your Cloudflare dashboard, open Workers → your Worker → Settings → Variables and Secrets, and set a new `SETUP_KEY`. It works for 10 minutes, and the passkey you add with it replaces all the old ones.
 

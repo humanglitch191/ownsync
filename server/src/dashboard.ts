@@ -36,9 +36,12 @@ export const DASHBOARD_TABLES = `
 	CREATE TABLE IF NOT EXISTS enrolments (hash BLOB PRIMARY KEY, setup_key BLOB NOT NULL, origin TEXT NOT NULL, expires INTEGER NOT NULL);
 	CREATE TABLE IF NOT EXISTS used_challenges (nonce BLOB PRIMARY KEY, expires INTEGER NOT NULL);
 	CREATE TABLE IF NOT EXISTS tries (at INTEGER NOT NULL, key BLOB NOT NULL, who BLOB NOT NULL);
+	CREATE TABLE IF NOT EXISTS latest (id INTEGER PRIMARY KEY CHECK (id = 0), version TEXT NOT NULL, checked INTEGER NOT NULL);
 	CREATE TABLE IF NOT EXISTS device_labels (vault TEXT NOT NULL, device TEXT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (vault, device));
 `;
 
+// How often the dashboard asks GitHub for the newest release.
+const LATEST_MS = 12 * 60 * 60 * 1000;
 const SESSION_MS = 12 * 60 * 60 * 1000, CHALLENGE_MS = 5 * 60 * 1000, ENROL_MS = 10 * 60 * 1000, MAX_ENROLMENTS = 5;
 // The setup key works this long after a deploy; then only a new SETUP_KEY (a new deploy) opens it again.
 export const SETUP_WINDOW_MS = 10 * 60 * 1000;
@@ -198,6 +201,16 @@ export class Dashboard {
 			return json({ ok: true });
 		}
 		return fail(404, "not found");
+	}
+
+	/** The newest Ownsync release, asked of GitHub at most twice a day; null if it can't be told. */
+	private async latest(): Promise<string | null> {
+		const row = this.sql.exec<{ version: string; checked: number }>("SELECT version, checked FROM latest").toArray()[0];
+		if (row && Date.now() - row.checked < LATEST_MS) return row.version || null;
+		const version = await fetch("https://api.github.com/repos/humanglitch191/ownsync/releases/latest", { headers: { "user-agent": "ownsync-server", accept: "application/vnd.github+json" }, signal: AbortSignal.timeout(3000) })
+			.then(async (r) => (r.ok ? String(((await r.json()) as { tag_name?: string }).tag_name ?? "") : ""), () => "");
+		this.sql.exec("INSERT OR REPLACE INTO latest (id, version, checked) VALUES (0, ?, ?)", /^\d+\.\d+\.\d+$/.test(version) ? version : (row?.version ?? ""), Date.now());
+		return (/^\d+\.\d+\.\d+$/.test(version) ? version : row?.version) || null;
 	}
 
 	private site(): Site | undefined {
@@ -362,10 +375,13 @@ export class Dashboard {
 			days.set(d.day, { day: d.day, requests: t.requests + d.requests, rows: t.rows + d.rows });
 		}
 		const devices = live.flatMap((v) => v.stats!.devices);
+		const latest = await this.latest();
 		const labels = new Map(this.sql.exec<{ vault: string; device: string; label: string }>("SELECT vault, device, label FROM device_labels").toArray().map((l) => [`${l.vault}/${l.device}`, l.label]));
 		return {
 			origin: site.origin,
 			version: VERSION,
+			// Newer than this server: the dashboard says how to update.
+			update: latest && latest.localeCompare(VERSION, undefined, { numeric: true }) > 0 ? latest : null,
 			limits: LIMITS,
 			lastSync: devices.some((d) => d.online) ? now : Math.max(0, ...devices.map((d) => d.lastOnline)) || null,
 			usage: { bytes: sum((s) => s.bytes), requestsToday: sum((s) => s.requestsToday), rowsWrittenToday: sum((s) => s.rowsWrittenToday), history: [...days.values()].sort((a, b) => a.day - b.day) },
