@@ -295,8 +295,14 @@ test("devices report a status: one short ID per connection, last online from the
 	a.send(status(2, 9, "9.9.9")); // another ID on the same connection: ignored
 	a.send(status(1, 3));
 	let s = await statsUntil(v, (s) => s.devices[0]?.conflicts === 3);
-	assert.deepEqual(s.devices.map(({ id, online, version, conflicts }) => ({ id, online, version, conflicts })), [{ id: "ABCD0001", online: true, version: "0.1.0", conflicts: 3 }]);
+	assert.deepEqual(s.devices.map(({ id, online, version, conflicts, mobile, notesOnly }) => ({ id, online, version, conflicts, mobile, notesOnly })), [{ id: "ABCD0001", online: true, version: "0.1.0", conflicts: 3, mobile: false, notesOnly: false }]);
 	const reported = s.devices[0]!.lastOnline;
+	// A phone that syncs notes only says so after its version (an older server just shows it as part of it).
+	const phone = await connect(v, tok);
+	phone.send(status(99, 0, "0.1.1 mobile notes-only"));
+	const p = (await statsUntil(v, (s) => s.devices.some((d) => d.id === "ABCD0063"))).devices.find((d) => d.id === "ABCD0063")!;
+	assert.deepEqual([p.version, p.mobile, p.notesOnly], ["0.1.1", true, true]);
+	phone.ws.close();
 	await new Promise((r) => setTimeout(r, 20));
 	a.ws.close();
 	s = await statsUntil(v, (s) => !s.devices[0]?.online);
@@ -325,6 +331,7 @@ test("the dashboard's stats count today's requests and rows written, the storage
 	assert.ok(s.rowsWrittenToday >= 3, `${s.rowsWrittenToday} rows written`); // the token, two entries
 	assert.ok(s.bytes > 0);
 	assert.ok(s.lastActivity! >= before);
+	assert.deepEqual(s.history.at(-1), { day: Math.floor(Date.now() / 86_400_000), requests: s.requestsToday, rows: s.rowsWrittenToday }); // today, in the 14-day history
 	assert.equal(s.deleted, false);
 	a.ws.close();
 });
@@ -349,5 +356,5 @@ test("deleting a vault takes its token; then its devices are told 4004, it can't
 	assert.equal(await bare.closed, CLOSE.deleted);
 	assert.equal(await post("delete", tok), 410);
 	assert.equal(await post("mint", tok), 410);
-	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, lastActivity: null, deleted: true, devices: [] });
+	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, deleted: true, devices: [] });
 });

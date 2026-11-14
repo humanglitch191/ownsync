@@ -97,6 +97,17 @@ test("the setup key adds the first passkey: right key, in the window, once; stra
 	const seen = (await call("/api/overview", undefined, { cookie: session.cookie! })).body;
 	assert.deepEqual(seen.vaults.map((v: { id: string }) => v.id), [vault.id]);
 	assert.ok(seen.usage.requestsToday > 0);
+	// A device goes by its random ID until the owner names it here; an empty name brings the ID back.
+	vault.ws.send(encodeClient({ t: "status", id: Uint8Array.of(0x3f, 0xa9, 0xc2, 0xe1), conflicts: 0, version: "0.1.1 mobile" }));
+	const named = async () => { for (let i = 0; i < 50; i++) { const d = (await call("/api/overview", undefined, { cookie: session.cookie! })).body.vaults[0]?.devices[0]; if (d) return d; await new Promise((r) => setTimeout(r, 50)); } };
+	assert.deepEqual([(await named()).id, (await named()).label, (await named()).mobile], ["3FA9C2E1", "", true]);
+	const rename = (label: string, opts = { cookie: session.cookie! }) => call(`/api/vaults/${vault.id}/devices/3FA9C2E1/label`, { label }, opts);
+	assert.equal((await rename("My phone", { cookie: "" })).status, 401);
+	assert.equal((await rename("My phone")).status, 200);
+	assert.equal((await named()).label, "My phone");
+	assert.equal((await call(`/api/vaults/${"0".repeat(32)}/devices/3FA9C2E1/label`, { label: "x" }, { cookie: session.cookie! })).status, 404);
+	await rename("  ");
+	assert.equal((await named()).label, "");
 	vault.ws.close();
 	assert.equal((await call("/api/logout", {}, { cookie: session.cookie! })).status, 200);
 	assert.equal((await call("/api/overview", undefined, { cookie: session.cookie! })).status, 401);

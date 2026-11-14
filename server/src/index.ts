@@ -31,6 +31,8 @@ const PAGE_BYTES = 4 * 1024 * 1024;
 const MAX_DEVICES = 64;
 const FLUSH_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+// How many days of usage the dashboard shows.
+const HISTORY_DAYS = 14;
 
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
@@ -87,6 +89,7 @@ export class Vault extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS chunks (name BLOB PRIMARY KEY, envelope BLOB NOT NULL);
 			CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, last_online INTEGER NOT NULL, version TEXT NOT NULL, conflicts INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY CHECK (id = 0), day INTEGER NOT NULL, requests INTEGER NOT NULL, rows INTEGER NOT NULL, last_activity INTEGER);
+			CREATE TABLE IF NOT EXISTS usage_days (day INTEGER PRIMARY KEY, requests REAL NOT NULL, rows INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS tombstone (id INTEGER PRIMARY KEY CHECK (id = 0), at INTEGER NOT NULL);
 		`);
 		this.head = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM entries").one().seq;
@@ -246,24 +249,32 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	/** What the owner's dashboard shows of this vault: nothing a key would be needed for. */
-	async stats(): Promise<{ bytes: number; requestsToday: number; rowsWrittenToday: number; lastActivity: number | null; deleted: boolean; devices: { id: string; lastOnline: number; online: boolean; version: string; conflicts: number }[] }> {
+	async stats(): Promise<VaultStats> {
 		const online = new Set(this.ctx.getWebSockets().map((ws) => (ws.deserializeAttachment() as Session).device));
 		const fresh = this.usage.day === today();
 		const devices = this.sql.exec<{ id: string; last_online: number; version: string; conflicts: number }>("SELECT id, last_online, version, conflicts FROM devices ORDER BY last_online DESC").toArray();
+		// Earlier days as written; today as it stands in memory.
+		const days = new Map(this.sql.exec<{ day: number; requests: number; rows: number }>("SELECT day, requests, rows FROM usage_days WHERE day > ?", today() - HISTORY_DAYS).toArray().map((d) => [d.day, d]));
+		if (fresh && !this.deleted) days.set(this.usage.day, { day: this.usage.day, requests: this.usage.requests, rows: this.usage.rows });
 		return {
 			bytes: this.sql.databaseSize,
 			requestsToday: fresh ? this.usage.requests : 0,
 			rowsWrittenToday: fresh ? this.usage.rows : 0,
+			history: [...days.values()].sort((a, b) => a.day - b.day),
 			lastActivity: this.usage.lastActivity,
 			deleted: this.deleted,
-			devices: devices.map((d) => ({ id: d.id, lastOnline: d.last_online, online: online.has(d.id), version: d.version, conflicts: d.conflicts })),
+			devices: devices.map((d) => {
+				// A device reports "<version> mobile notes-only": its plugin version, then what kind of device it is.
+				const [version = "", ...flags] = d.version.split(" ");
+				return { id: d.id, lastOnline: d.last_online, online: online.has(d.id), version, conflicts: d.conflicts, mobile: flags.includes("mobile"), notesOnly: flags.includes("notes-only") };
+			}),
 		};
 	}
 
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async delete(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "devices", "usage"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "devices", "usage", "usage_days"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;
@@ -291,8 +302,11 @@ export class Vault extends DurableObject<Env> {
 	private flush(): void {
 		this.flushedAt = Date.now();
 		const u = this.usage;
-		u.rows++; // this write
+		u.rows += 2; // these writes
 		this.sql.exec("INSERT OR REPLACE INTO usage (id, day, requests, rows, last_activity) VALUES (0, ?, ?, ?, ?)", u.day, u.requests, u.rows, u.lastActivity);
+		// The last two weeks, day by day, for the dashboard's activity bars.
+		this.sql.exec("INSERT OR REPLACE INTO usage_days (day, requests, rows) VALUES (?, ?, ?)", u.day, u.requests, u.rows);
+		this.sql.exec("DELETE FROM usage_days WHERE day <= ?", u.day - HISTORY_DAYS);
 	}
 
 	private sendRecords(ws: WebSocket, from: number): void {
@@ -385,6 +399,7 @@ export class Owner extends DurableObject<Env> {
 	/** A vault was deleted from Obsidian: it leaves the dashboard. */
 	vaultDeleted(vault: string): void {
 		this.sql.exec("DELETE FROM vaults WHERE id = ?", vault);
+		this.sql.exec("DELETE FROM device_labels WHERE vault = ?", vault);
 	}
 
 	/** Whether `code` is a current owner code; if so a vault is being created with it. Each makes one vault. */

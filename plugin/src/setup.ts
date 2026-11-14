@@ -69,9 +69,9 @@ export class SetupModal extends Modal {
 			const input = field(el, "Vault code", "The notes already in this vault are uploaded to your server, encrypted.");
 			input.placeholder = "https://…#…";
 			input.value = this.code;
+			const server = el.createEl("p", { cls: "ownsync-server" });
 			let attachments = this.plugin.attachments;
 			attachmentsToggle(el, attachments, (on) => (attachments = on));
-			const server = el.createEl("p", { cls: "ownsync-server" });
 			const showServer = () => {
 				const code = parseVaultCode(input.value);
 				server.setText(code ? `Server: ${code.host}` : "");

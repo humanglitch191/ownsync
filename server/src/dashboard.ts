@@ -16,10 +16,15 @@ export interface VaultStats {
 	bytes: number;
 	requestsToday: number;
 	rowsWrittenToday: number;
+	/** Up to 14 days, oldest first; `day` is days since the epoch (UTC). */
+	history: { day: number; requests: number; rows: number }[];
 	lastActivity: number | null;
 	deleted: boolean;
-	devices: { id: string; lastOnline: number; online: boolean; version: string; conflicts: number }[];
+	devices: { id: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
 }
+
+/** The server's version, shown on the dashboard. */
+export const VERSION = "0.1.1";
 
 // Workers Free plan, from Cloudflare's pricing and limits pages (2026-11-13).
 export const LIMITS = { storageBytes: 5e9, vaultBytes: 1e9, requestsPerDay: 100_000, rowsWrittenPerDay: 100_000 };
@@ -31,6 +36,7 @@ export const DASHBOARD_TABLES = `
 	CREATE TABLE IF NOT EXISTS enrolments (hash BLOB PRIMARY KEY, setup_key BLOB NOT NULL, origin TEXT NOT NULL, expires INTEGER NOT NULL);
 	CREATE TABLE IF NOT EXISTS used_challenges (nonce BLOB PRIMARY KEY, expires INTEGER NOT NULL);
 	CREATE TABLE IF NOT EXISTS tries (at INTEGER NOT NULL, key BLOB NOT NULL, who BLOB NOT NULL);
+	CREATE TABLE IF NOT EXISTS device_labels (vault TEXT NOT NULL, device TEXT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (vault, device));
 `;
 
 const SESSION_MS = 12 * 60 * 60 * 1000, CHALLENGE_MS = 5 * 60 * 1000, ENROL_MS = 10 * 60 * 1000, MAX_ENROLMENTS = 5;
@@ -159,6 +165,16 @@ export class Dashboard {
 		if (label) {
 			if (!this.vaults().some((v) => v.id === label[1])) return fail(404, "no such vault");
 			this.sql.exec("UPDATE vaults SET label = ? WHERE id = ?", String(body.label ?? "").trim().slice(0, 40), label[1]!);
+			return json({ ok: true });
+		}
+		// A name the owner gives a device here (the random ID stays its name otherwise). Typed on this page, so
+		// stored readable, like a vault's label: devices never send their names to the server.
+		const device = path.match(/^\/api\/vaults\/([0-9a-f]{32})\/devices\/([0-9A-F]{8})\/label$/);
+		if (device) {
+			if (!this.vaults().some((v) => v.id === device[1])) return fail(404, "no such vault");
+			const name = String(body.label ?? "").trim().slice(0, 40);
+			if (name) this.sql.exec("INSERT OR REPLACE INTO device_labels (vault, device, label) VALUES (?, ?, ?)", device[1]!, device[2]!, name);
+			else this.sql.exec("DELETE FROM device_labels WHERE vault = ? AND device = ?", device[1]!, device[2]!);
 			return json({ ok: true });
 		}
 		if (path === "/api/vault-code") {
@@ -339,10 +355,20 @@ export class Dashboard {
 		// Behind the newest version any device of this Worker runs: the closest thing to "an update is out".
 		const versions = live.flatMap((v) => v.stats!.devices.map((d) => d.version)).filter(Boolean);
 		const newest = versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).pop() ?? "";
+		// The whole Worker's usage, day by day: what Cloudflare's daily limits count.
+		const days = new Map<number, { day: number; requests: number; rows: number }>();
+		for (const v of live) for (const d of v.stats!.history ?? []) {
+			const t = days.get(d.day) ?? { day: d.day, requests: 0, rows: 0 };
+			days.set(d.day, { day: d.day, requests: t.requests + d.requests, rows: t.rows + d.rows });
+		}
+		const devices = live.flatMap((v) => v.stats!.devices);
+		const labels = new Map(this.sql.exec<{ vault: string; device: string; label: string }>("SELECT vault, device, label FROM device_labels").toArray().map((l) => [`${l.vault}/${l.device}`, l.label]));
 		return {
 			origin: site.origin,
+			version: VERSION,
 			limits: LIMITS,
-			usage: { bytes: sum((s) => s.bytes), requestsToday: sum((s) => s.requestsToday), rowsWrittenToday: sum((s) => s.rowsWrittenToday) },
+			lastSync: devices.some((d) => d.online) ? now : Math.max(0, ...devices.map((d) => d.lastOnline)) || null,
+			usage: { bytes: sum((s) => s.bytes), requestsToday: sum((s) => s.requestsToday), rowsWrittenToday: sum((s) => s.rowsWrittenToday), history: [...days.values()].sort((a, b) => a.day - b.day) },
 			vaults: live.map((v) => ({
 				id: v.id,
 				label: v.label,
@@ -350,7 +376,7 @@ export class Dashboard {
 				bytes: v.stats!.bytes,
 				lastActivity: v.stats!.lastActivity,
 				conflicts: Math.max(0, ...v.stats!.devices.map((d) => d.conflicts)),
-				devices: v.stats!.devices.map((d) => ({ ...d, behind: !!newest && d.version !== newest && d.version.localeCompare(newest, undefined, { numeric: true }) < 0, lost: !d.online && now - d.lastOnline > LOST_AFTER_MS })),
+				devices: v.stats!.devices.map((d) => ({ ...d, label: labels.get(`${v.id}/${d.id}`) ?? "", behind: !!newest && d.version !== newest && d.version.localeCompare(newest, undefined, { numeric: true }) < 0, lost: !d.online && now - d.lastOnline > LOST_AFTER_MS })),
 			})),
 			passkeys: this.sql.exec<{ id: string; created: number }>("SELECT id, created FROM passkeys ORDER BY created").toArray().map((p) => ({ ...p, current: p.id === session.passkey })),
 		};

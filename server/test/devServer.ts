@@ -41,7 +41,7 @@ export async function ownerCodes(host: string): Promise<() => Promise<string>> {
 }
 
 /** What a Vault's `stats()` gives the owner's dashboard, read through the test-only route. */
-export type Stats = { bytes: number; requestsToday: number; rowsWrittenToday: number; lastActivity: number | null; deleted: boolean; devices: { id: string; lastOnline: number; online: boolean; version: string; conflicts: number }[] };
+export type Stats = { bytes: number; requestsToday: number; rowsWrittenToday: number; history: { day: number; requests: number; rows: number }[]; lastActivity: number | null; deleted: boolean; devices: { id: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[] };
 export const stats = async (host: string, vault: string): Promise<Stats> => (await fetch(`${host}/test-stats/${vault}`)).json() as Promise<Stats>;
 
 export async function startDev() {

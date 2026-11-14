@@ -181,7 +181,8 @@ export default class OwnsyncPlugin extends Plugin {
 			},
 			onProblem: problem,
 			onPresence: (note, update) => editors.receivePresence(note, update),
-			version: this.manifest.version,
+			// The dashboard shows a phone as a phone, and a notes-only device as one. Older servers show it as part of the version.
+			version: `${this.manifest.version}${Platform.isMobile ? " mobile" : ""}${this.settings.attachments ? "" : " notes-only"}`,
 			conflicts: () => vault.getFiles().filter((f) => disk.synced(f) && (f.path.includes(" (conflict ") || f.path.includes(" (recovered "))).length,
 		});
 		const refresh = debounce(() => { editors.refresh(); report(); }, 50, true);
