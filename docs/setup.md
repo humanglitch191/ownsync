@@ -1,0 +1,73 @@
+# Setup guide
+
+About five minutes, from your browser and Obsidian.
+
+<img src="images/how-it-works.svg" width="720" alt="How Ownsync works">
+
+Your devices encrypt every edit and hold the key. Your Worker, on your own Cloudflare account, only ever relays scrambled data. A one-time QR code carries the key from one device to the next.
+
+## 1. Deploy your server
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/humanglitch191/ownsync/tree/main/server)
+
+Press the button and sign in to Cloudflare, or create a free account. Cloudflare asks for a name and a **setup key**: a passphrase of at least 12 characters that isn't easy to guess. A few random words work well. When the deploy finishes, Cloudflare shows your server's address, like `https://ownsync.yourname.workers.dev`.
+
+## 2. Sign in and add a passkey
+
+Open the address **within 10 minutes**. Under **First time here?**, enter the setup key, then create a passkey: your fingerprint, face or device PIN. From then on you sign in with the passkey, and the setup key stops working.
+
+<img src="images/sign-in.png" width="560" alt="First visit: sign in with a passkey, or enter the setup key">
+
+## 3. Connect a vault
+
+In Obsidian, open Settings → Community plugins, turn them on, choose **Browse**, search for **Ownsync**, then **Install** and **Enable**. A welcome screen opens.
+
+<img src="images/obsidian-welcome.png" width="520" alt="Ownsync's welcome screen in Obsidian">
+
+On your dashboard, under **Connect a vault**, press **Open in Obsidian**. Obsidian shows which server it's about to connect to. Press **Connect**.
+
+<img src="images/obsidian-connect.png" width="520" alt="Connect this vault, with the server shown">
+
+Ownsync then offers a **recovery kit**: your server address, vault ID and a recovery code. Save it somewhere safe, printed or in a password manager. It's the only way back in if you lose every device. Your notes start syncing, encrypted.
+
+<img src="images/obsidian-done.png" width="520" alt="You're all set">
+
+Another vault? Open it in Obsidian and press **Open in Obsidian** on the dashboard again. Each vault gets its own key.
+
+## 4. Add your phone and other devices
+
+On a device that already syncs, open Settings → Ownsync → **Add a device**. Scan the QR code with your phone's camera and tap **Open in Obsidian**. On a computer, press **Copy link** and paste it into the new device's welcome screen, under **Join a vault from another device**. Both devices show the new device's ID: check they match.
+
+<img src="images/add-device-phone.png" width="260" alt="The page your phone opens">
+
+Each code works once, for 2 minutes, and a fresh one appears while the screen is open. Anyone who scans a code first gets your vault's key, so don't share or screenshot it.
+
+## Your dashboard
+
+Your server's address is your dashboard. It shows each vault's devices by their random ID (the same one Obsidian shows), when each was last online, which version it runs, how many notes have conflict copies, and how much of Cloudflare's free plan you use. From Obsidian: Settings → Ownsync → **Open dashboard**.
+
+<p>
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="images/dashboard-dark.png">
+<img src="images/dashboard.png" width="560" alt="The dashboard">
+</picture>
+</p>
+
+**Missed the 10 minutes, or lost every passkey?** In your Cloudflare dashboard, open Workers → your Worker → Settings → Variables and Secrets, and set a new `SETUP_KEY`. It works for 10 minutes, and the passkey you add with it replaces all the old ones.
+
+## Devices and the recovery key
+
+Settings → Ownsync lists your vault's devices by their short ID.
+
+- **Remove** a device that's lost, stolen or retired. The vault gets a new key the removed device doesn't have. It keeps what it already had, but gets nothing new and can't write. If it was lost or stolen, you also get a new recovery kit.
+- **Replace** the recovery key if someone may have seen the code.
+- **Recover a vault** on a new device with your recovery kit. Every other device is removed; pair them again afterwards.
+
+## Good to know
+
+- Attachments sync too, up to 20 MB each (Settings → Ownsync → Largest attachment). The free plan holds about 1 GB in all.
+- When the same note or file changes on two devices while one is offline, both changes are kept. Text merges; anything that can't merge gets a `(conflict …)` copy.
+- If Obsidian closes before its last save can be matched, that save is kept as `Note (recovered …).md`.
+- Without a recovery kit, losing every device loses the vault: nothing on the server can be opened.
+- Obsidian's settings folder doesn't sync.
+- To stop syncing a device: Settings → Ownsync → **Leave this vault**. Your notes stay as ordinary files.

@@ -1,0 +1,40 @@
+name: Release
+
+# Push a tag equal to the plugin version (e.g. 0.2.0) to publish main.js and manifest.json as a GitHub release,
+# which is where Obsidian downloads the plugin from. Bump the version first with
+# `node scripts/sync-manifest.mjs 0.2.0` and commit.
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # no token on disk while dependency install scripts run
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - name: Tag matches the plugin version; manifest.json and versions.json are up to date
+        run: |
+          test "$GITHUB_REF_NAME" = "$(node -p 'require("./plugin/manifest.json").version')"
+          node scripts/sync-manifest.mjs && git diff --exit-code manifest.json versions.json
+
+      - name: Build
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" plugin/main.js manifest.json plugin/styles.css --title "$GITHUB_REF_NAME" --generate-notes
