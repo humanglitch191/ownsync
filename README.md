@@ -32,7 +32,7 @@ To add your phone, scan the QR code under Settings → Ownsync → Add a device.
 ## Good to know
 
 - It needs a free Cloudflare account, and the free plan is plenty for one person's notes. For more, Workers Paid is $5 a month. [Cost and limits](docs/cost-and-limits.md).
-- The plugin only talks to your server. No telemetry, no ads.
+- The plugin only talks to your server. It reads every file in your vault to sync it, and uses the clipboard only when you press Copy. No telemetry, no ads.
 - Your server sees when your devices connect and how much is stored, never what you wrote. [What it can and can't see](docs/security.md).
 - I built Ownsync with AI. The calls on what it should be, and how it keeps notes safe, were mine. [How it was built](docs/how-it-was-built.md).
 

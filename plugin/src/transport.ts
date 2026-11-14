@@ -54,7 +54,7 @@ export class Transport {
 	private ws: WebSocket | null = null;
 	private wanted = false;
 	private attempts = 0;
-	private retry: ReturnType<typeof setTimeout> | null = null;
+	private retry: number | null = null;
 	private tags = new Map<string, Promise<Uint8Array>>(); // "<epoch>:<document>" → tag
 	private authed = false; // this socket has said hello
 	private batch: Stored[] = []; // records arriving, until the end marker
@@ -63,7 +63,7 @@ export class Transport {
 	private receiving: Promise<void> = Promise.resolve(); // open and deliver strictly in order
 	private presenceOut = new Map<string, Uint8Array>(); // note → newest presence not yet sent
 	private held: ClientMsg[] = []; // waiting for this device's own key change (see send)
-	private presenceTimer: ReturnType<typeof setTimeout> | null = null;
+	private presenceTimer: number | null = null;
 	private reported = -1; // the conflict count last reported on this socket
 
 	constructor(private readonly host: string, private readonly keys: VaultKeys, private readonly engine: Engine, private readonly opts: TransportOptions = {}) {}
@@ -93,7 +93,7 @@ export class Transport {
 
 	disconnect(): void {
 		this.wanted = false;
-		if (this.retry) clearTimeout(this.retry);
+		if (this.retry) window.clearTimeout(this.retry);
 		const ws = this.ws;
 		if (!ws) return;
 		ws.close();
@@ -103,7 +103,7 @@ export class Transport {
 	/** Relay this device's presence in a note to the others. At most one batch per PRESENCE_MS; only the newest per note goes. */
 	presence(note: string, update: Uint8Array): void {
 		this.presenceOut.set(note, update);
-		this.presenceTimer ??= setTimeout(() => {
+		this.presenceTimer ??= window.setTimeout(() => {
 			this.presenceTimer = null;
 			const ws = this.ws;
 			if (ws && this.authed) for (const [note, data] of this.presenceOut) this.send(ws, { t: "presence", note, data });
@@ -144,7 +144,7 @@ export class Transport {
 		}
 		if (code === CLOSE.rekeyed) this.attempts = 0; // another device rotated: come back at once for the new key
 		this.set("offline");
-		if (this.wanted) this.retry = setTimeout(() => void this.connect().catch(() => {}), Math.min(100 * 2 ** this.attempts++, MAX_BACKOFF_MS));
+		if (this.wanted) this.retry = window.setTimeout(() => void this.connect().catch(() => {}), Math.min(100 * 2 ** this.attempts++, MAX_BACKOFF_MS));
 	}
 
 	/**

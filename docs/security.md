@@ -36,6 +36,8 @@ The vault key lives in Obsidian's secret storage (Obsidian 1.11.4 or later), nev
 
 - **Account:** a Cloudflare account (the free plan is enough) runs your server. Nobody else runs or sees it, including me.
 - **Network:** the plugin connects only to your server.
+- **Your vault:** to sync it, the plugin lists and reads every file in it (except Obsidian's settings folder), and writes what arrives from your other devices.
+- **Clipboard:** written only when you press a Copy button (a pairing link, a code); never read.
 - **No telemetry, no ads, no payments.** Open source, MIT.
 
 The full threat model and every trade-off are in the [design notes](DESIGN.md).

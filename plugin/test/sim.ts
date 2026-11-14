@@ -3,6 +3,9 @@
 // of any operation; whatever it hadn't committed is gone, and its disk is as it was at that instant.
 
 import { createHash } from "node:crypto";
+
+// The plugin uses window's timers (they work in Obsidian's pop-out windows); in Node, the global ones are those.
+(globalThis as { window?: unknown }).window ??= globalThis;
 import * as Y from "yjs";
 import { Engine, type EngineOptions } from "../src/core/engine";
 import type { ClientMsg, Disk, DiskFile, Entry, ServerMsg, Store } from "../src/core/ports";

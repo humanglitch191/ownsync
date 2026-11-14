@@ -123,13 +123,14 @@ export class Vault extends DurableObject<Env> {
 				if (body.length > 32 + 1024) return Response.json({ error: "too large" }, { status: 413 });
 				let n: { device?: unknown; name?: unknown; vault?: unknown };
 				try { n = JSON.parse(new TextDecoder().decode(body.slice(32))); } catch { return Response.json({ error: "bad names" }, { status: 400 }); }
-				const clean = (x: unknown) => (typeof x === "string" ? x.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 40) : "");
+				// No control characters: kept to printable text.
+				const clean = (x: unknown) => (typeof x === "string" ? Array.from(x).filter((c) => c >= " " && c !== "\u007f").join("").trim().slice(0, 40) : "");
 				const device = typeof n.device === "string" && /^[0-9A-F]{8}$/.test(n.device) ? n.device : null;
 				if (device) this.write("INSERT INTO devices (id, last_online, version, conflicts, name) VALUES (?, ?, '', 0, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name", device, Date.now(), clean(n.name));
 				if (typeof n.vault === "string") this.write("INSERT OR REPLACE INTO vault_name (id, name) VALUES (0, ?)", clean(n.vault));
 				return Response.json({ ok: true });
 			}
-			await this.delete();
+			await this.erase();
 			return Response.json({ deleted: true });
 		}
 		if (req.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
@@ -288,7 +289,7 @@ export class Vault extends DurableObject<Env> {
 
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
-	private async delete(): Promise<void> {
+	private async erase(): Promise<void> {
 		for (const table of ["entries", "auth", "records", "recovery", "chunks", "devices", "usage", "usage_days", "vault_name"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;

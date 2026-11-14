@@ -127,7 +127,7 @@ export class Engine {
 	private outbox: { id: number; entry: Entry }[] = [];
 	private liveOut: Entry[] = []; // this input's edits, to relay to other devices right away
 	private lastPublish = 0;
-	private paceTimer: ReturnType<typeof setTimeout> | null = null;
+	private paceTimer: number | null = null;
 	private indexOut: Uint8Array[] = []; // this input's index changes, sent as one entry
 	private indexDirty = false;
 	/** Where every live note's file belongs, worked out from the index alone, so every device agrees. */
@@ -310,7 +310,7 @@ export class Engine {
 
 	/** Stop timers. The engine must not be used afterwards. */
 	stop(): void {
-		if (this.paceTimer) clearTimeout(this.paceTimer);
+		if (this.paceTimer) window.clearTimeout(this.paceTimer);
 	}
 
 	receive(msg: ServerMsg): Promise<void> {
@@ -466,7 +466,7 @@ export class Engine {
 		this.sendChunks();
 		const wait = this.lastPublish + (this.opts.pace ?? 0) - Date.now();
 		if (wait > 0) {
-			this.paceTimer ??= setTimeout(() => {
+			this.paceTimer ??= window.setTimeout(() => {
 				this.paceTimer = null;
 				void this.run("publish", async () => {});
 			}, wait);
