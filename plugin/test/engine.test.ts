@@ -1,0 +1,350 @@
+// Directed scenarios for the sync engine: each one is a rule from engine.ts's header, shown working.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { Device, Server, bytes, latin1, quiesce, rng } from "./sim";
+
+function world(n = 2, seed = 1) {
+	const server = new Server(), random = rng(seed);
+	const devs = Array.from({ length: n }, (_, i) => new Device(`d${i}`, server, random));
+	for (const d of devs) { d.boot(); d.connect(); }
+	return { server, devs };
+}
+const disk = (d: Device) => Object.fromEntries([...d.files].map(([p, f]): [string, string] => [p, latin1(f.content)]).sort());
+const noProblems = (devs: Device[]) => assert.deepEqual(devs.flatMap((d) => d.problems), []);
+
+test("a note created, edited, renamed and deleted on one device follows on the other", async () => {
+	const { devs: [a, b] } = world();
+	await quiesce([a!, b!]);
+	a!.write("Plan.md", "first");
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "Plan.md": "first" });
+	a!.write("Plan.md", "first second");
+	a!.rename("Plan.md", "Work/Plan.md");
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "Work/Plan.md": "first second" });
+	b!.remove("Work/Plan.md");
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), {});
+	noProblems([a!, b!]);
+});
+
+test("edits to the same note while offline merge, with no conflict file", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "one two three");
+	await quiesce([a!, b!]);
+	a!.disconnect();
+	b!.disconnect();
+	a!.write("Note.md", "ONE one two three");
+	b!.write("Note.md", "one two three FOUR");
+	await quiesce([a!, b!]);
+	a!.connect();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), { "Note.md": "ONE one two three FOUR" });
+	assert.deepEqual(disk(b!), disk(a!));
+	noProblems([a!, b!]);
+});
+
+test("a file edited while a remote edit was waiting to be written is merged, not overwritten", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "one two three");
+	await quiesce([a!, b!]);
+	a!.write("Note.md", "one two three FOUR");
+	while (a!.events.length) a!.events.shift()!();
+	await a!.idle();
+	while (a!.pumpUp()) { /* A's edit reaches the server */ }
+	// B's user saves an edit at the very moment the engine is reading the file to apply A's.
+	b!.onRead = () => { b!.onRead = null; b!.write("Note.md", "ZERO one two three"); };
+	await quiesce([a!, b!]);
+	assert.equal(b!.onRead, null, "the race must actually have happened");
+	assert.deepEqual(disk(a!), { "Note.md": "ZERO one two three FOUR" });
+	assert.deepEqual(disk(b!), disk(a!));
+	noProblems([a!, b!]);
+});
+
+test("the same new file name on two devices keeps both notes", async () => {
+	const { devs: [a, b] } = world();
+	await quiesce([a!, b!]);
+	a!.disconnect();
+	b!.disconnect();
+	a!.write("Daily.md", "from A");
+	b!.write("Daily.md", "from B");
+	await quiesce([a!, b!]);
+	a!.connect();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), disk(b!));
+	assert.deepEqual(Object.values(disk(a!)).sort(), ["from A", "from B"]);
+	assert.ok("Daily.md" in disk(a!));
+	noProblems([a!, b!]);
+});
+
+test("deleting a note doesn't destroy an edit the deleter never saw", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "one");
+	await quiesce([a!, b!]);
+	b!.disconnect();
+	b!.write("Note.md", "one two");
+	await quiesce([b!]);
+	a!.remove("Note.md");
+	await quiesce([a!]);
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), { "Note.md": "one two" });
+	assert.deepEqual(disk(b!), disk(a!));
+	noProblems([a!, b!]);
+});
+
+test("typing in an editor reaches the other device's editor and file", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "one");
+	await quiesce([a!, b!]);
+	const ea = (await a!.engine!.open(a!.engine!.noteAt("Note.md")!))!, eb = (await b!.engine!.open(b!.engine!.noteAt("Note.md")!))!;
+	ea.getText("t").insert(3, " two");
+	await quiesce([a!, b!]);
+	assert.equal(eb.getText("t").toString(), "one two");
+	await b!.engine!.close(b!.engine!.noteAt("Note.md")!);
+	await quiesce([a!, b!]);
+	assert.equal(disk(b!)["Note.md"], "one two");
+	noProblems([a!, b!]);
+});
+
+test("a device that joins with its own copy of the vault adopts identical notes and keeps different ones", async () => {
+	const { server, devs: [a] } = world(1);
+	a!.write("Same.md", "same text");
+	a!.write("Differs.md", "A's version");
+	await quiesce([a!]);
+	const c = new Device("c", server, rng(7));
+	c.files.set("Same.md", { content: "same text", mtime: 1 });
+	c.files.set("Differs.md", { content: "C's version", mtime: 2 });
+	c.files.set("OnlyC.md", { content: "only on C", mtime: 3 });
+	c.boot();
+	c.connect();
+	await quiesce([a!, c]);
+	assert.deepEqual(disk(a!), disk(c));
+	assert.deepEqual(Object.values(disk(c)).sort(), ["A's version", "C's version", "only on C", "same text"]);
+	noProblems([a!, c]);
+});
+
+test("a crash between recording a remote edit and writing the file is finished at the next start", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "one");
+	await quiesce([a!, b!]);
+	a!.write("Note.md", "one two");
+	while (a!.events.length) a!.events.shift()!();
+	await a!.idle();
+	while (a!.pumpUp()) { /* to the server */ }
+	// B dies somewhere inside handling it, at every possible point in turn.
+	let crashedMidway = 0;
+	for (let fuse = 1; fuse < 30; fuse++) {
+		const snapshotFiles = structuredClone([...b!.files]), snapshotData = structuredClone([...b!.data]);
+		const pending = [...b!.server.conns.get(b!)!.down];
+		b!.crash(fuse);
+		while (b!.pumpDown()) { /* deliver */ }
+		await b!.idle();
+		if (b!.alive) b!.crash();
+		else crashedMidway++;
+		b!.boot();
+		b!.connect();
+		await quiesce([a!, b!]);
+		assert.deepEqual(disk(b!), { "Note.md": "one two" }, `crash after ${fuse} calls`);
+		assert.deepEqual(b!.problems, []);
+		// Rewind B to before the edit arrived, and try the next crash point.
+		b!.crash();
+		b!.files = new Map(snapshotFiles);
+		b!.data = new Map(snapshotData);
+		b!.boot();
+		b!.connect();
+		await b!.idle();
+		const conn = b!.server.conns.get(b!)!;
+		while (b!.pumpUp()) { /* subscribe */ }
+		conn.down = [];
+		conn.down.push(...pending);
+		conn.live = true;
+	}
+	assert.ok(crashedMidway >= 5, `only ${crashedMidway} crash points were inside the operation`);
+});
+
+// --- attachments (the simulator splits them into 4-byte chunks) ---
+
+const PIC = "\x89PNG\0\0\0\rIHDR\0\0\xff\xfe pixels";
+const PIC2 = "\x89PNG\0\0\0\rIHDR\0\0\x01\x02 other pixels";
+
+test("an attachment created, replaced, renamed and deleted on one device follows on the other, byte for byte", async () => {
+	const { server, devs: [a, b] } = world();
+	await quiesce([a!, b!]);
+	a!.write("img/Photo.png", bytes(PIC));
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "img/Photo.png": PIC });
+	assert.ok(b!.files.get("img/Photo.png")!.content instanceof Uint8Array);
+	const stored = server.chunks.size;
+	a!.write("img/Copy.png", bytes(PIC)); // the same content again: no chunk stored twice
+	await quiesce([a!, b!]);
+	assert.equal(server.chunks.size, stored);
+	b!.write("img/Photo.png", bytes(PIC2));
+	b!.rename("img/Photo.png", "Photo 2.png");
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), { "Photo 2.png": PIC2, "img/Copy.png": PIC });
+	a!.remove("Photo 2.png");
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "img/Copy.png": PIC });
+	noProblems([a!, b!]);
+});
+
+test("an attachment replaced on two devices at once keeps both versions, one as a conflict copy", async () => {
+	const { devs: [a, b, c] } = world(3);
+	a!.write("p.png", bytes(PIC));
+	await quiesce([a!, b!, c!]);
+	a!.disconnect();
+	b!.disconnect();
+	a!.write("p.png", bytes("from A"));
+	b!.write("p.png", bytes("from B"));
+	await quiesce([a!, b!, c!]);
+	a!.connect();
+	b!.connect();
+	await quiesce([a!, b!, c!]);
+	assert.deepEqual(disk(a!), disk(b!));
+	assert.deepEqual(disk(c!), disk(a!));
+	assert.deepEqual(Object.values(disk(a!)).sort(), ["from A", "from B"]);
+	assert.ok("p.png" in disk(a!));
+	assert.match(Object.keys(disk(a!)).find((p) => p !== "p.png")!, /^p \(conflict [0-9a-f]{6}\)\.png$/);
+	// Online too: each replaces it before the other's version arrives.
+	a!.write("p.png", bytes("A again"));
+	b!.write("p.png", bytes("B again"));
+	await quiesce([a!, b!, c!]);
+	assert.deepEqual(disk(a!), disk(b!));
+	assert.deepEqual(disk(c!), disk(a!));
+	assert.deepEqual(Object.values(disk(a!)).filter((t) => t.includes("again")).sort(), ["A again", "B again"]);
+	noProblems([a!, b!, c!]);
+});
+
+test("the same new attachment name on two devices keeps both, and both stay that kind of file", async () => {
+	const { devs: [a, b] } = world();
+	await quiesce([a!, b!]);
+	a!.disconnect();
+	a!.write("scan.pdf", bytes("A's scan"));
+	b!.write("scan.pdf", bytes("B's scan"));
+	await quiesce([a!, b!]);
+	a!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), disk(b!));
+	assert.deepEqual(Object.values(disk(a!)).sort(), ["A's scan", "B's scan"]);
+	assert.ok(Object.keys(disk(a!)).every((p) => p.endsWith(".pdf")));
+	noProblems([a!, b!]);
+});
+
+test("deleting an attachment doesn't destroy a version the deleter never saw", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("p.png", bytes(PIC));
+	await quiesce([a!, b!]);
+	b!.disconnect();
+	b!.write("p.png", bytes(PIC2));
+	await quiesce([b!]);
+	a!.remove("p.png");
+	await quiesce([a!]);
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), { "p.png": PIC2 });
+	assert.deepEqual(disk(b!), disk(a!));
+	noProblems([a!, b!]);
+});
+
+test("an attachment renamed while the app was closed is found by its content, not deleted and re-added", async () => {
+	const { server, devs: [a, b] } = world();
+	a!.write("p.png", bytes(PIC));
+	await quiesce([a!, b!]);
+	const id = a!.engine!.noteAt("p.png");
+	a!.crash();
+	a!.rename("p.png", "moved/p.png");
+	const stored = server.chunks.size;
+	a!.boot();
+	a!.connect();
+	await quiesce([a!, b!]);
+	assert.equal(a!.engine!.noteAt("moved/p.png"), id);
+	assert.deepEqual(disk(b!), { "moved/p.png": PIC });
+	assert.equal(server.chunks.size, stored);
+	noProblems([a!, b!]);
+});
+
+test("a crash at any point of an upload is recovered: the other device gets the whole file", async () => {
+	let crashedMidway = 0;
+	for (let fuse = 1; fuse < 40; fuse++) {
+		const { server, devs: [a, b] } = world(2, fuse);
+		await quiesce([a!, b!]);
+		a!.crash(fuse);
+		a!.write("p.png", bytes(PIC));
+		await quiesce([a!, b!]);
+		if (a!.alive) a!.crash(1e9);
+		else crashedMidway++;
+		// Whatever B has, it is never part of the file.
+		assert.ok(!b!.files.has("p.png") || latin1(b!.files.get("p.png")!.content) === PIC, `crash after ${fuse} calls`);
+		if (!a!.alive) { a!.boot(); a!.connect(); }
+		await quiesce([a!, b!]);
+		assert.deepEqual(disk(b!), { "p.png": PIC }, `crash after ${fuse} calls`);
+		assert.ok([...server.chunks.values()].every((c) => c.length <= 4));
+		noProblems([a!, b!]);
+	}
+	assert.ok(crashedMidway >= 10, `only ${crashedMidway} crash points were inside the operation`);
+});
+
+test("a crash at any point of a download is recovered, and never leaves part of a file", async () => {
+	let crashedMidway = 0;
+	for (let fuse = 1; fuse < 40; fuse++) {
+		const { devs: [a, b] } = world(2, fuse);
+		a!.write("p.png", bytes(PIC));
+		await quiesce([a!, b!]);
+		a!.write("p.png", bytes(PIC2));
+		b!.crash(fuse);
+		await quiesce([a!, b!]);
+		if (b!.alive) b!.crash(1e9);
+		else crashedMidway++;
+		assert.ok([PIC, PIC2].includes(disk(b!)["p.png"]!), `crash after ${fuse} calls: ${disk(b!)["p.png"]}`);
+		if (!b!.alive) { b!.boot(); b!.connect(); }
+		await quiesce([a!, b!]);
+		assert.deepEqual(disk(b!), { "p.png": PIC2 }, `crash after ${fuse} calls`);
+		noProblems([a!, b!]);
+	}
+	assert.ok(crashedMidway >= 10, `only ${crashedMidway} crash points were inside the operation`);
+});
+
+test("a chunk missing on the server is retried, and the file is never written without it", async () => {
+	const { server, devs: [a, b] } = world();
+	b!.disconnect();
+	a!.write("p.png", bytes(PIC));
+	await quiesce([a!]);
+	const [name, data] = [...server.chunks][1]!;
+	server.chunks.delete(name);
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), {});
+	assert.equal(b!.problems.length, 1);
+	assert.match(b!.problems[0]!, /missing on the server/);
+	b!.problems = [];
+	server.chunks.set(name, data);
+	b!.disconnect();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "p.png": PIC });
+	noProblems([a!, b!]);
+});
+
+test("an attachment over the size limit is reported and left alone, on both sides", async () => {
+	const { devs: [a, b] } = world();
+	for (const d of [a!, b!]) { d.overrides = { maxFileSize: 20 }; d.crash(); d.boot(); d.connect(); }
+	await quiesce([a!, b!]);
+	a!.write("big.bin", bytes("x".repeat(21)));
+	a!.write("small.bin", bytes(PIC.slice(0, 20)));
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "small.bin": PIC.slice(0, 20) });
+	assert.match(a!.problems.join("\n"), /big\.bin.*larger than/);
+	a!.problems = [];
+	// Grown over the limit here and replaced there: neither side's version is overwritten.
+	a!.write("small.bin", bytes("y".repeat(30)));
+	b!.write("small.bin", bytes("z"));
+	await quiesce([a!, b!]);
+	assert.equal(disk(a!)["small.bin"], "y".repeat(30));
+	assert.equal(disk(b!)["small.bin"], "z");
+	assert.match(a!.problems.join("\n"), /small\.bin.*larger than/);
+	assert.deepEqual(b!.problems, []);
+});

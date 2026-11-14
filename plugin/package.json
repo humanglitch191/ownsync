@@ -1,0 +1,28 @@
+{
+	"name": "ownsync-plugin",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "tsc -noEmit && node esbuild.config.mjs",
+		"dev": "node esbuild.config.mjs --watch",
+		"test": "node --import jiti/register --test test/*.test.ts"
+	},
+	"dependencies": {
+		"lib0": "^0.2.120",
+		"qrcode": "^1.5.4",
+		"y-codemirror.next": "^0.3.5",
+		"y-indexeddb": "^9.0.12",
+		"y-protocols": "^1.0.7",
+		"yjs": "^13.6.20"
+	},
+	"devDependencies": {
+		"@codemirror/state": "6.5.0",
+		"@codemirror/view": "6.38.6",
+		"@types/qrcode": "^1.5.5",
+		"esbuild": "0.25.5",
+		"jiti": "2.6.1",
+		"obsidian": "1.13.1",
+		"typescript": "5.8.3"
+	}
+}
