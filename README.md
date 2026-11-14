@@ -1,6 +1,6 @@
 # Ownsync
 
-Real-time sync for Obsidian, end-to-end encrypted, through a server you own.
+Real-time sync for Obsidian, end-to-end encrypted, through a server you own. **[ownsync.dev](https://ownsync.dev)**
 
 <picture>
 <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/humanglitch191/ownsync/main/docs/images/hero-dark.png">
