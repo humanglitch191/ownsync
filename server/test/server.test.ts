@@ -302,6 +302,13 @@ test("devices report a status: one short ID per connection, last online from the
 	phone.send(status(99, 0, "0.1.1 mobile notes-only"));
 	const p = (await statsUntil(v, (s) => s.devices.some((d) => d.id === "ABCD0063"))).devices.find((d) => d.id === "ABCD0063")!;
 	assert.deepEqual([p.version, p.mobile, p.notesOnly], ["0.1.1", true, true]);
+	// Its name and the vault's, as Obsidian has them: with the vault's token only, and kept when it reports again.
+	const names = (t: Uint8Array, json: unknown) => fetch(`http://localhost:${PORT}/vault/${v}/names`, { method: "POST", body: new Uint8Array([...t, ...bytes(JSON.stringify(json))]) });
+	assert.equal((await names(token(), { device: "ABCD0063", name: "Kish's iPhone", vault: "Personal" })).status, 401);
+	assert.equal((await names(tok, { device: "ABCD0063", name: "  Kish's iPhone\u0007 ", vault: "Personal" })).status, 200);
+	phone.send(status(99, 1, "0.1.1 mobile notes-only"));
+	s = await statsUntil(v, (s) => s.devices.find((d) => d.id === "ABCD0063")?.conflicts === 1);
+	assert.deepEqual([s.name, s.devices.find((d) => d.id === "ABCD0063")!.name], ["Personal", "Kish's iPhone"]);
 	phone.ws.close();
 	await new Promise((r) => setTimeout(r, 20));
 	a.ws.close();
@@ -356,5 +363,5 @@ test("deleting a vault takes its token; then its devices are told 4004, it can't
 	assert.equal(await bare.closed, CLOSE.deleted);
 	assert.equal(await post("delete", tok), 410);
 	assert.equal(await post("mint", tok), 410);
-	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, deleted: true, devices: [] });
+	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: true, devices: [] });
 });

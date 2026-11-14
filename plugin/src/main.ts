@@ -118,6 +118,25 @@ export default class OwnsyncPlugin extends Plugin {
 		if (this.session) await this.restart();
 	}
 
+	// What was last told to the server, so it's only told again when something changes.
+	private sentNames = "";
+	readonly namesChanged = debounce(() => void this.reportNames(), 1500, true);
+
+	/**
+	 * This device's name and the vault's, as Obsidian has them, for the owner's dashboard. Unlike the name next to
+	 * the cursor, which travels encrypted, these are stored readable on the server. An older server (no such
+	 * address) just doesn't show them.
+	 */
+	async reportNames(): Promise<void> {
+		const keys = this.session?.keys;
+		if (!keys) return;
+		const json = JSON.stringify({ device: shortId(keys.me.id), name: cleanName(this.settings.deviceName), vault: this.app.vault.getName() });
+		if (json === this.sentNames) return;
+		const body = new Uint8Array([...(await keys.token()), ...new TextEncoder().encode(json)]);
+		const res = await requestUrl({ url: `${this.settings.host}/vault/${hex(keys.vaultId)}/names`, method: "POST", body: body.buffer, throw: false }).catch(() => null);
+		if (res?.status === 200) this.sentNames = json;
+	}
+
 	openSetup(code = ""): void {
 		new SetupModal(this, code).open();
 	}
@@ -176,6 +195,7 @@ export default class OwnsyncPlugin extends Plugin {
 			onStatus: (s) => {
 				// The vault now exists on the Worker: the owner code that created it isn't needed again.
 				if (s === "synced" && this.ownerCode) this.app.saveLocalStorage("ownsync-owner-code", null);
+				if (s === "synced") void this.reportNames();
 				this.setStatus(s);
 				if (s === "frozen") void chooseFork(this);
 			},
@@ -339,11 +359,12 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			.addButton((b) => b.setButtonText("Get a code").onClick(() => void showVaultCode(plugin)));
 		new Setting(containerEl)
 			.setName("Device name")
-			.setDesc("Shown next to this device's cursor on your other devices.")
+			.setDesc("Shown next to this device's cursor on your other devices, and on your server's dashboard.")
 			.addText((t) => t.setPlaceholder(plugin.deviceName).setValue(plugin.settings.deviceName).onChange(async (v) => {
 				plugin.settings.deviceName = v;
 				await plugin.saveData(plugin.settings);
 				plugin.session?.editors.setName(plugin.deviceName);
+				plugin.namesChanged();
 			}));
 		this.devices(containerEl);
 		this.advanced(containerEl);

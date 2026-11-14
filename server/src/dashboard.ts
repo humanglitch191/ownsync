@@ -19,8 +19,10 @@ export interface VaultStats {
 	/** Up to 14 days, oldest first; `day` is days since the epoch (UTC). */
 	history: { day: number; requests: number; rows: number }[];
 	lastActivity: number | null;
+	/** What the vault is called in Obsidian, as a device reported it; empty if none has. */
+	name: string;
 	deleted: boolean;
-	devices: { id: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
+	devices: { id: string; name: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
 }
 
 /** The server's version, shown on the dashboard. */
@@ -388,6 +390,7 @@ export class Dashboard {
 			vaults: live.map((v) => ({
 				id: v.id,
 				label: v.label,
+				name: v.stats!.name ?? "",
 				created: v.created,
 				bytes: v.stats!.bytes,
 				lastActivity: v.stats!.lastActivity,

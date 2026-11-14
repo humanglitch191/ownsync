@@ -172,7 +172,7 @@ function setup(token) {
 			else live.replaceChildren(h("h3", { class: "appear" }, "Your sync server"), h("div", { class: "card appear" }, h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" })), h("span", { class: "label" }, "Waiting"))));
 			return;
 		}
-		live.replaceChildren(h("h3", {}, vault.label || `Vault ${shortId(vault.id)}`), h("div", { class: "card" },
+		live.replaceChildren(h("h3", {}, vaultName(vault)), h("div", { class: "card" },
 			vault.devices.map((d) => deviceRow(d, "appear")),
 			vault.devices.length < 2 ? h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", { class: "meta" }, "Your phone goes here"), h("span", { class: "label" }, "Next")) : null));
 	};
@@ -218,7 +218,7 @@ function setup(token) {
 					stepItem(connected ? "done" : "later", "Press Open in Obsidian, then Connect", "Obsidian shows this server before anything happens")),
 				box,
 				connected
-					? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${connected.label || `Vault ${shortId(connected.id)}`} is syncing from ${first}`))
+					? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${vaultName(connected)} is syncing from ${first}`))
 					: h("div", { class: "waiting" }, h("span", { class: "pulse" }), "Waiting for Obsidian…"),
 				h("div", { class: "grow" }),
 				h("div", { class: "row actions" }, connected ? h("button", { class: "btn primary", onclick: () => go(2) }, "Continue") : null, open.button), open.error];
@@ -229,7 +229,7 @@ function setup(token) {
 			return [h("h2", {}, "Add your phone"),
 				h("p", { class: "sub" }, "In Obsidian on your computer: Settings → Ownsync → Add a device. Scan the code with your phone's camera."),
 				h("ol", { class: "checks" },
-					stepItem("done", `${vault?.label || "Your vault"} is syncing`, first ? `From ${first}` : ""),
+					stepItem("done", `${vault ? vaultName(vault) : "Your vault"} is syncing`, first ? `From ${first}` : ""),
 					stepItem(two ? "done" : "now", "Scan the code on your phone", "It hands over the key; this server never sees it"),
 					stepItem(two ? "done" : "later", "Check both show the same ID", "So you know it's yours")),
 				two ? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${joined?.id} joined`)) : h("div", { class: "waiting" }, h("span", { class: "pulse" }), "Waiting for your phone…"),
@@ -255,9 +255,10 @@ function setup(token) {
 // One device: its name (the random ID unless the owner gave it one here), what it is, and when it was last seen.
 // `vault`: where it can be renamed (the dashboard, not the setup preview).
 function deviceRow(d, extra = "", vault = null) {
-	const kind = [d.label ? d.id : null, d.mobile ? "Phone" : "Computer", d.notesOnly ? "notes only" : null, d.version ? `Ownsync ${d.version}` : null].filter(Boolean).join(" · ");
-	const name = h("div", { class: `name${d.label ? " named" : ""}`, title: vault ? "Click to rename" : null }, d.label || d.id);
-	if (vault) name.addEventListener("click", () => rename(name, d.label, d.id, `/api/vaults/${vault}/devices/${d.id}/label`));
+	const shown = d.label || d.name; // named here first, then as Obsidian has it; else the random ID
+	const kind = [shown ? d.id : null, d.mobile ? "Phone" : "Computer", d.notesOnly ? "notes only" : null, d.version ? `Ownsync ${d.version}` : null].filter(Boolean).join(" · ");
+	const name = h("div", { class: `name${shown ? " named" : ""}`, title: vault ? "Click to rename" : null }, shown || d.id);
+	if (vault) name.addEventListener("click", () => rename(name, d.label, d.name || d.id, `/api/vaults/${vault}/devices/${d.id}/label`));
 	const state = d.online
 		? h("span", { class: "state ok" }, h("span", { class: "dot ok" }), "Online now")
 		: h("span", { class: "state" }, h("span", { class: "dot" }), `Last seen ${ago(d.lastOnline)}`,
@@ -278,9 +279,12 @@ function rename(el, current, placeholder, path) {
 	input.select();
 }
 
+// Named here first, then as Obsidian calls it; else its short ID.
+const vaultName = (v) => v.label || v.name || `Vault ${shortId(v.id)}`;
+
 function vaultSection(v) {
-	const title = h("h3", { title: "Click to rename" }, v.label || `Vault ${shortId(v.id)}`);
-	title.addEventListener("click", () => rename(title, v.label, "e.g. Personal", `/api/vaults/${v.id}/label`));
+	const title = h("h3", { title: "Click to rename" }, vaultName(v));
+	title.addEventListener("click", () => rename(title, v.label, v.name || "e.g. Personal", `/api/vaults/${v.id}/label`));
 	return h("div", { class: "vault" },
 		h("div", { class: "section" }, title, h("span", { class: "label" }, [size(v.bytes), v.lastActivity ? `changed ${ago(v.lastActivity)}` : null].filter(Boolean).join(" · "))),
 		h("div", { class: "card" },

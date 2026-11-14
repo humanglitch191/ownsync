@@ -13,7 +13,7 @@ Note text, attachment content, file names, folders, or the vault key. Your vault
 - When a note is open in an editor and its cursor moves (not where, and not your device's name).
 - When each device is online, its IP address, its random device ID, its Ownsync version, whether it's a phone or a computer, whether it syncs notes only, and how many conflict copies a vault has.
 
-Names you type on the dashboard, for vaults and devices, are stored on your server as you typed them: the dashboard has no key to encrypt them with. Devices never send their names; the name next to your cursor in Obsidian travels encrypted.
+Names are stored on your server as they are: the vault's name and your device names as Obsidian has them (so the dashboard can show them), and any names you type on the dashboard. The dashboard has no key to encrypt them with. Everything else about your notes stays encrypted.
 
 It can hold back or replay old edits, but it can't forge or change one: every edit is authenticated with the vault key.
 

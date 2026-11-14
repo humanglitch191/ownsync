@@ -57,7 +57,7 @@ export default {
 		}
 		// The owner dashboard's API; its pages are static assets.
 		if (path.startsWith("/api/")) return owner(env).fetch(req);
-		const vault = path.match(/^\/vault\/([0-9a-f]{32})(\/mint|\/delete)?$/);
+		const vault = path.match(/^\/vault\/([0-9a-f]{32})(\/mint|\/delete|\/names)?$/);
 		if (vault) return env.VAULT.get(env.VAULT.idFromName(vault[1]!)).fetch(req);
 		// The room is a hash of the pairing code, so the server can't open what it holds.
 		const pair = path.match(/^\/pair\/([0-9a-f]{32})$/);
@@ -91,7 +91,10 @@ export class Vault extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY CHECK (id = 0), day INTEGER NOT NULL, requests INTEGER NOT NULL, rows INTEGER NOT NULL, last_activity INTEGER);
 			CREATE TABLE IF NOT EXISTS usage_days (day INTEGER PRIMARY KEY, requests REAL NOT NULL, rows INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS tombstone (id INTEGER PRIMARY KEY CHECK (id = 0), at INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS vault_name (id INTEGER PRIMARY KEY CHECK (id = 0), name TEXT NOT NULL);
 		`);
+		// Added in 0.1.2: a device's name, as Obsidian has it. Vaults made earlier get the column now.
+		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");
 		this.head = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM entries").one().seq;
 		const auth = this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0];
 		this.token = auth ? toHex(auth.token_hash) : null;
@@ -104,18 +107,30 @@ export class Vault extends DurableObject<Env> {
 		const path = new URL(req.url).pathname;
 		this.name ??= path.split("/")[2] ?? null;
 		this.count(1);
-		const action = path.endsWith("/mint") ? "mint" : path.endsWith("/delete") ? "delete" : null;
+		const action = path.endsWith("/mint") ? "mint" : path.endsWith("/delete") ? "delete" : path.endsWith("/names") ? "names" : null;
 		// A device of this vault asks for an owner code to set up another vault on this Worker ("Set up another
 		// vault", the same as the dashboard gives). Or it deletes the vault, from Obsidian, where the user typed its
-		// short ID.
+		// short ID. Or it says what it and the vault are called in Obsidian, for the dashboard.
 		if (action) {
 			if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
 			if (this.deleted) return Response.json({ error: "deleted" }, { status: 410 });
-			const token = new Uint8Array(await req.arrayBuffer());
+			const body = new Uint8Array(await req.arrayBuffer());
+			// names: the token, then the names as JSON. The others: the token alone.
+			const token = action === "names" ? body.slice(0, 32) : body;
 			const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", token));
 			const stored = this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0]?.token_hash;
 			if (!stored || token.length !== 32 || !crypto.subtle.timingSafeEqual(hash, stored)) return Response.json({ error: "unauthorized" }, { status: 401 });
 			if (action === "mint") return Response.json({ owner: await owner(this.env).mint() });
+			if (action === "names") {
+				if (body.length > 32 + 1024) return Response.json({ error: "too large" }, { status: 413 });
+				let n: { device?: unknown; name?: unknown; vault?: unknown };
+				try { n = JSON.parse(new TextDecoder().decode(body.slice(32))); } catch { return Response.json({ error: "bad names" }, { status: 400 }); }
+				const clean = (x: unknown) => (typeof x === "string" ? x.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 40) : "");
+				const device = typeof n.device === "string" && /^[0-9A-F]{8}$/.test(n.device) ? n.device : null;
+				if (device) this.write("INSERT INTO devices (id, last_online, version, conflicts, name) VALUES (?, ?, '', 0, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name", device, Date.now(), clean(n.name));
+				if (typeof n.vault === "string") this.write("INSERT OR REPLACE INTO vault_name (id, name) VALUES (0, ?)", clean(n.vault));
+				return Response.json({ ok: true });
+			}
 			await this.delete();
 			return Response.json({ deleted: true });
 		}
@@ -244,7 +259,8 @@ export class Vault extends DurableObject<Env> {
 		const id = toHex(f.id).toUpperCase();
 		if (session.device && session.device !== id) return;
 		if (!session.device) ws.serializeAttachment({ ...session, device: id });
-		this.write("INSERT OR REPLACE INTO devices (id, last_online, version, conflicts) VALUES (?, ?, ?, ?)", id, Date.now(), f.version, f.conflicts);
+		// An upsert, not a replace: the device's name (sent separately) stays.
+		this.write("INSERT INTO devices (id, last_online, version, conflicts) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_online = excluded.last_online, version = excluded.version, conflicts = excluded.conflicts", id, Date.now(), f.version, f.conflicts);
 		this.write("DELETE FROM devices WHERE id NOT IN (SELECT id FROM devices ORDER BY last_online DESC LIMIT ?)", MAX_DEVICES);
 	}
 
@@ -252,7 +268,7 @@ export class Vault extends DurableObject<Env> {
 	async stats(): Promise<VaultStats> {
 		const online = new Set(this.ctx.getWebSockets().map((ws) => (ws.deserializeAttachment() as Session).device));
 		const fresh = this.usage.day === today();
-		const devices = this.sql.exec<{ id: string; last_online: number; version: string; conflicts: number }>("SELECT id, last_online, version, conflicts FROM devices ORDER BY last_online DESC").toArray();
+		const devices = this.sql.exec<{ id: string; last_online: number; version: string; conflicts: number; name: string }>("SELECT id, last_online, version, conflicts, name FROM devices ORDER BY last_online DESC").toArray();
 		// Earlier days as written; today as it stands in memory.
 		const days = new Map(this.sql.exec<{ day: number; requests: number; rows: number }>("SELECT day, requests, rows FROM usage_days WHERE day > ?", today() - HISTORY_DAYS).toArray().map((d) => [d.day, d]));
 		if (fresh && !this.deleted) days.set(this.usage.day, { day: this.usage.day, requests: this.usage.requests, rows: this.usage.rows });
@@ -262,11 +278,12 @@ export class Vault extends DurableObject<Env> {
 			rowsWrittenToday: fresh ? this.usage.rows : 0,
 			history: [...days.values()].sort((a, b) => a.day - b.day),
 			lastActivity: this.usage.lastActivity,
+			name: this.sql.exec<{ name: string }>("SELECT name FROM vault_name").toArray()[0]?.name ?? "",
 			deleted: this.deleted,
 			devices: devices.map((d) => {
 				// A device reports "<version> mobile notes-only": its plugin version, then what kind of device it is.
 				const [version = "", ...flags] = d.version.split(" ");
-				return { id: d.id, lastOnline: d.last_online, online: online.has(d.id), version, conflicts: d.conflicts, mobile: flags.includes("mobile"), notesOnly: flags.includes("notes-only") };
+				return { id: d.id, name: d.name, lastOnline: d.last_online, online: online.has(d.id), version, conflicts: d.conflicts, mobile: flags.includes("mobile"), notesOnly: flags.includes("notes-only") };
 			}),
 		};
 	}
@@ -274,7 +291,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async delete(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "devices", "usage", "usage_days"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "devices", "usage", "usage_days", "vault_name"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;

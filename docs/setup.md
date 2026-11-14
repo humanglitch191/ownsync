@@ -50,7 +50,7 @@ Each code works once, for 2 minutes, and a fresh one appears while the screen is
 
 ## Your dashboard
 
-Your server's address is your dashboard. It opens with a one-line summary, then how much of Cloudflare's free plan you use over the last two weeks, and each vault's devices by their random ID (the same one Obsidian shows) or a name you give them (click the name to rename it): phone or computer, notes only or not, when each was last online, which version it runs, and any conflict copies. From Obsidian: Settings → Ownsync → **Open dashboard**.
+Your server's address is your dashboard. It opens with a one-line summary, then how much of Cloudflare's free plan you use over the last two weeks, and each vault's devices by the names you gave them in Obsidian (Settings → Ownsync → Device name), or their random ID until you do; click a name on the dashboard to rename it there: phone or computer, notes only or not, when each was last online, which version it runs, and any conflict copies. From Obsidian: Settings → Ownsync → **Open dashboard**.
 
 <p>
 <picture>
