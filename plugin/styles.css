@@ -1,0 +1,34 @@
+/* Ownsync's setup and pairing screens. Obsidian's own colours and font, so they match any theme: hairline
+   borders, no shadows, one primary button per screen. */
+.ownsync-setup .modal-content { display: flex; flex-direction: column; gap: var(--size-4-3); }
+.ownsync-setup p { margin: 0; }
+.ownsync-lead { color: var(--text-muted); }
+.ownsync-quiet { color: var(--text-faint); font-size: var(--font-ui-smaller); }
+.ownsync-center { text-align: center; font-variant-numeric: tabular-nums; }
+.ownsync-error { color: var(--text-error); font-size: var(--font-ui-small); }
+.ownsync-steps { margin: 0; padding-left: 1.3em; color: var(--text-normal); }
+.ownsync-steps li { margin: var(--size-2-1) 0; }
+.ownsync-setup .setting-item { border-top: none; padding: var(--size-2-2) 0; }
+.ownsync-setup .modal-button-container { margin-top: var(--size-4-2); }
+
+.ownsync-setup button.ownsync-choice {
+	display: block; width: 100%; height: auto; text-align: left; white-space: normal;
+	padding: var(--size-4-3) var(--size-4-4); border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-l); background: var(--background-primary); box-shadow: none; cursor: pointer;
+}
+.ownsync-setup button.ownsync-choice:hover { background: var(--background-modifier-hover); }
+.ownsync-choice-title { font-weight: var(--font-semibold); color: var(--text-normal); }
+.ownsync-choice-desc { color: var(--text-muted); font-size: var(--font-ui-small); margin-top: 2px; }
+
+.ownsync-qr { align-self: center; padding: var(--size-4-2); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-l); background: #fff; line-height: 0; }
+.ownsync-id {
+	align-self: center; font-size: 1.6em; font-weight: var(--font-semibold); letter-spacing: .08em; font-variant-numeric: tabular-nums;
+	padding: var(--size-4-2) var(--size-4-4); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m);
+}
+
+.ownsync-field label { display: flex; flex-direction: column; gap: var(--size-2-2); font-weight: var(--font-medium); }
+.ownsync-field input { width: 100%; font-weight: var(--font-normal); }
+.ownsync-field .ownsync-quiet { margin-top: var(--size-2-2); }
+.ownsync-setup textarea { width: 100%; resize: none; font-variant-numeric: tabular-nums; }
+.ownsync-code { width: 100%; resize: none; word-break: break-all; }
+.ownsync-server { font-weight: var(--font-semibold); color: var(--text-normal); }
