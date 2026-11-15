@@ -150,11 +150,11 @@ To reduce this, pad envelopes to fixed size buckets (for example 256 B, 1 KiB, 4
 ## Build order
 
 1. Sync engine and fuzz test, headless. Done.
-2. Worker mailbox and encrypted transport. Done locally; a test on a real free Cloudflare account is still to do.
-3. Obsidian layer. Done on desktop; stress runs at 10,000 and 50,000 notes and real phones are still to do.
-4. Setup page, pairing helper page, CI and releases. Done; community-catalog submission is still to do.
-5. Recovery key, device removal (section 1), moving the vault key into Obsidian's secret store. Done headless and against `wrangler dev`; not yet tried in Obsidian or on phones.
-6. Attachments. Done headless and through `wrangler dev`; not yet tried in real Obsidian.
+2. Worker mailbox and encrypted transport. Done, and running on real free Cloudflare accounts.
+3. Obsidian layer. Done on desktop and in daily use with an iPhone; a real-Obsidian run at 1,000 notes is in the stress test results. Still to do: real-Obsidian runs at 10,000 and 50,000 notes, and Android.
+4. Setup page, pairing helper page, dashboard, CI and releases. Done. Ownsync is in Obsidian's community plugins since 15 November 2026.
+5. Recovery key, device removal (section 1), moving the vault key into Obsidian's secret store. The key in secret storage and the recovery kit at setup are in use in real Obsidian. Recovering a vault and removing a device are done headless and against `wrangler dev`, not yet tried in Obsidian or on phones.
+6. Attachments. Done headless and through `wrangler dev`; not yet covered by a real-Obsidian test.
 
 ## Open questions
 
