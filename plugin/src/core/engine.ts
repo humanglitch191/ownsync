@@ -677,13 +677,14 @@ export class Engine {
 		const like = (mine: Set<string>[], theirs: Set<string>) => Math.max(...mine.map((m) => alike(m, theirs)));
 		const loose = new Map<string, Set<string>>(); // path → the words of the file's text
 		const home = new Map<string, string>(); // note → its path, when a file is still there
+		const changed = new Map<string, string>(); // attachment → its path, where its file now has other content
 		for (const [path, id] of [...this.byPath]) {
 			const f = onDisk.get(path), m = this.metaOf(id);
 			if (f && m.mtime === f.mtime && m.size === f.size) continue; // untouched
 			// An attachment changed in place is a new version of it. One that's gone is matched by exact content
 			// below; it is alike no file (no units).
 			if (!isNote(path)) {
-				if (f) todo.add(id);
+				if (f) changed.set(id, path);
 				else adrift.set(id, []);
 				continue;
 			}
@@ -698,27 +699,43 @@ export class Engine {
 				const theirs = units(await this.disk.read(path));
 				if (like(mine, theirs) >= ALIKE) { todo.add(id); continue; } // an ordinary edit, or an editor's save
 				loose.set(path, theirs); // perhaps a different file now sits at the note's path
-				home.set(id, path);
+				// Only a note whose file was here can claim it however much it changed. One that was only about to be
+				// written here (the engine stopped first) has no file yet: a different text here is someone else's.
+				if (m.baseHash !== undefined) home.set(id, path);
 			}
 			adrift.set(id, mine);
 		}
 		for (const f of files) if (isNote(f.path) && !this.byPath.has(f.path)) loose.set(f.path, units(await this.disk.read(f.path)));
+		// An attachment's file with other content is a new version of it, unless that content is exactly another
+		// attachment's whose file isn't where it was: then that one moved here (two swapped places, say), and this
+		// one's own file is looked for like any that is gone.
+		const swapped = new Map<string, string>(); // attachment → the path its file moved to
+		for (const [id, path] of changed) {
+			const h = await this.disk.readBinary(path).then((b) => this.opts.chunkName(b), () => undefined);
+			const other = [...adrift.keys(), ...changed.keys()].find((o) => o !== id && !swapped.has(o) && this.metaOf(o).baseHash === h && !isNote(this.metaOf(o).diskPath ?? ""));
+			if (other === undefined) { todo.add(id); continue; }
+			swapped.set(other, path);
+			adrift.set(id, []);
+		}
+		for (const id of swapped.keys()) if (changed.has(id) && !adrift.has(id)) adrift.set(id, []); // its own path now holds someone else's file
 
 		// Pair them up, best match first.
 		const pairs: [score: number, id: string, path: string][] = [];
 		for (const [id, mine] of adrift) for (const [path, theirs] of loose) {
+			// The note's own recovered copy, written just before the engine stopped and not yet on record, is never the note.
+			if (path.includes(` (recovered ${id.slice(0, 6)}`)) continue;
 			// A recovery copy holds its note's text too: when both match a file, the file is the note's.
 			const score = like(mine, theirs) - (this.metaOf(id).copyOf ? 0.01 : 0);
 			if (score >= ALIKE) pairs.push([score, id, path]);
 		}
 		pairs.sort((x, y) => y[0] - x[0] || (x[1] + x[2] < y[1] + y[2] ? -1 : 1));
-		const moved = new Map<string, string>();
+		const moved = new Map<string, string>(swapped);
 		for (const [, id, path] of pairs) if (!moved.has(id) && ![...moved.values()].includes(path)) moved.set(id, path);
 		// Nothing better claimed the file still at a note's own path: then it is that note, however much it changed.
 		for (const [id, path] of home) if (!moved.has(id) && ![...moved.values()].includes(path)) moved.set(id, path);
 		// An attachment that moved has exactly its agreed content; only files of its size need reading.
 		for (const [id, mine] of adrift) {
-			if (mine.length) continue;
+			if (mine.length || moved.has(id)) continue;
 			const m = this.metaOf(id);
 			for (const f of files) {
 				if (isNote(f.path) || this.byPath.has(f.path) || f.size !== m.size || [...moved.values()].includes(f.path)) continue;
@@ -734,7 +751,7 @@ export class Engine {
 		// A note with no file left was deleted, unless the document has an edit the file never showed.
 		for (const id of adrift.keys()) {
 			if (moved.has(id)) continue;
-			const pending = (await this.read(`base:${id}`)) || this.metaOf(id).writing;
+			const pending = await this.ahead(id);
 			this.forget(id);
 			if (!pending) await this.tombstone(id);
 			todo.add(id);
@@ -794,12 +811,26 @@ export class Engine {
 				this.movedTo(id, moved.path, moved);
 				return;
 			}
-			const pending = (await this.read(`base:${id}`)) || this.metaOf(id).writing;
+			const pending = await this.ahead(id);
 			this.forget(id);
 			if (!pending) await this.tombstone(id);
 		} finally {
 			this.losing.delete(id);
 		}
+	}
+
+	/**
+	 * The document holds something this device's file never showed, so the file's deletion can't hold against it:
+	 * a write still owed, or, for an attachment, a version other than the one the file showed or was made from.
+	 * (An attachment's own new version keeps the file as it is, so a version arriving meanwhile is never written.)
+	 */
+	private async ahead(id: string): Promise<boolean> {
+		if ((await this.read(`base:${id}`)) || this.metaOf(id).writing) return true;
+		if (!this.isAttachment(id)) return false;
+		const up = await this.read<Upload>(`up:${id}`), shown = up ? up.base : this.metaOf(id).baseHash;
+		const doc = this.load(await this.state(id)), versions = doc.getArray<Ref>("v").toArray();
+		doc.destroy();
+		return versions.some((r) => r.h !== shown);
 	}
 
 	/**
@@ -923,6 +954,9 @@ export class Engine {
 		}
 		if (m.diskPath && m.diskPath !== want) {
 			if (want === undefined) {
+				// Only a recorded deletion removes the file. A note missing from the index altogether is one whose index
+				// entry hasn't arrived yet (it waits inside Yjs for an update this device lacks): leave it be until then.
+				if (this.notes.get(id) === undefined) return true;
 				await this.disk.remove(m.diskPath);
 				this.forget(id);
 				if (open) {
@@ -1001,6 +1035,10 @@ export class Engine {
 			this.ownRenames.set(parked, path);
 			await this.disk.rename(path, parked);
 			this.place(other, parked);
+		} else if (other && this.notes.get(other) === undefined) {
+			// That note's index entry hasn't arrived yet, so it stays where it is (see settleOnce): wait for it.
+			this.deferred.add(id);
+			return false;
 		} else if (other) {
 			await this.settle(other);
 			if (this.deferred.has(other)) this.deferred.add(id); // it is waiting for file events, so this note waits too
