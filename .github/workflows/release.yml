@@ -50,3 +50,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" plugin/main.js manifest.json plugin/styles.css --title "$GITHUB_REF_NAME" --generate-notes
+
+      # ownsync.dev builds its changelog from these releases. A release made with this workflow's token starts no
+      # other workflow, so the site is told from here. A failure only leaves the site a release behind.
+      - name: Rebuild ownsync.dev
+        env:
+          HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then echo "SITE_DEPLOY_HOOK isn't set: ownsync.dev not rebuilt."; exit 0; fi
+          curl -fsS -X POST "$HOOK" > /dev/null || echo "::warning::Couldn't start the ownsync.dev rebuild."

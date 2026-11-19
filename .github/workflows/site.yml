@@ -1,0 +1,27 @@
+name: Site
+
+# Rebuild ownsync.dev when what it shows changes: the docs, or release notes edited after publishing.
+# (New releases start the rebuild from the Release workflow.) SITE_DEPLOY_HOOK is a Cloudflare deploy hook.
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**"]
+  release:
+    types: [edited, deleted]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Rebuild ownsync.dev
+        env:
+          HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then echo "SITE_DEPLOY_HOOK isn't set: ownsync.dev not rebuilt."; exit 0; fi
+          curl -fsS -X POST "$HOOK" > /dev/null
+          echo "ownsync.dev is rebuilding; it's live in a minute or two."
