@@ -8,7 +8,7 @@ Ownsync runs on your own Cloudflare account. For one person's notes, the free pl
 |---|---|---|
 | Rows written | 100,000 | Every saved edit is about one row. Typing in a note saves roughly every 3 seconds, so this is about 80 hours of nonstop typing a day. The first upload of a vault is about one row per note. |
 | Requests | 100,000 | 20 messages from your devices count as one request, so about 2 million messages a day. |
-| Active time | 13,000 GB-s | About 29 hours a day of the server actively relaying. It sleeps between edits, so idle devices cost nothing. |
+| Active time | 13,000 GB-s | About 29 hours a day of your Worker actively relaying. It sleeps between edits, so idle devices cost nothing. |
 | Storage | 5 GB in total | Notes are small: 1,000 notes took 15 MB in the stress test. Attachments are what fill it. Keep each vault under about 1 GB. |
 
 The counts reset at midnight UTC. If a vault hits a limit, syncing pauses until then. Nothing is lost: your devices keep your edits and send them after the reset.
@@ -32,6 +32,6 @@ The paid plan swaps the daily limits for much larger monthly ones. Nothing chang
 
 For one person's notes, the $5 covers everything. A vault with 20 GB of attachments would add about $3 a month in storage.
 
-**To switch:** in your Cloudflare dashboard, go to **Workers & Pages → Plans** and choose **Workers Paid**. Your server, vaults and passkeys stay as they are.
+**To switch:** in your Cloudflare dashboard, go to **Workers & Pages → Plans** and choose **Workers Paid**. Your Worker, vaults and passkeys stay as they are.
 
 Sources: Cloudflare's [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/).

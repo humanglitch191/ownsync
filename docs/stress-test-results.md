@@ -32,14 +32,14 @@ Three simulated devices, 2,000 runs of 250 random steps each: edits, renames, mo
 
 **500,000 steps, all passed, in 55 seconds.** A longer batch runs every night on GitHub.
 
-## Live, offline, and the server's view
+## Live, offline, and the Worker's view
 
 Two Obsidian instances, end to end:
 
 - Typing on one shows up in the other's editor within a second.
 - Both edit the same note offline; the edits merge when they reconnect.
-- One restarts while the server is down, then catches up.
-- The server's storage holds no note text, file name or key.
+- One restarts while the Worker is down, then catches up.
+- The Worker's storage holds no note text, file name or key.
 
 The setup itself (welcome screen, connecting with a code, adding a device, a second vault) and the dashboard (setup key, passkey, devices, sign-in) are also driven end to end, in real Obsidian and a real browser.
 
