@@ -162,6 +162,7 @@ export class Device {
 				step();
 				this.trace?.(`${this.name} engine renames ${from} → ${to}`);
 				if (this.files.has(to)) throw new Error(`rename onto existing ${to}`);
+				if (!this.files.has(from)) throw new Error(`rename of missing ${from}`); // as a real disk would
 				this.files.set(to, this.files.get(from)!);
 				this.files.delete(from);
 				engine.diskRenamed(from, to);

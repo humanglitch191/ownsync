@@ -181,14 +181,23 @@ const RUNS = Number(process.env.FUZZ_RUNS ?? 300), STEPS = Number(process.env.FU
 test(`fuzz: ${process.env.FUZZ_SEED ? `seed ${process.env.FUZZ_SEED}` : `${RUNS} random runs`} of ${STEPS} steps converge without losing or duplicating text`, async () => {
 	if (process.env.FUZZ_SEED) return run(Number(process.env.FUZZ_SEED), STEPS);
 	const first = Number(process.env.FUZZ_FIRST ?? 1);
-	for (let seed = first; seed < first + RUNS; seed++) await run(seed, STEPS);});
+	for (let seed = first; seed < first + RUNS; seed++) {
+		try {
+			await run(seed, STEPS);
+		} catch (err) {
+			// A failed check names its seed already; anything else that throws must too, or it can't be replayed.
+			if (err instanceof Error && !/seed \d+, last steps/.test(err.message)) err.message += `\nseed ${seed}`;
+			throw err;
+		}
+	}
+});
 
 // Seeds the nightly batch once failed on (text lost or duplicated), kept so those bugs stay fixed.
 const FIXED = [
 	163124, 180757, 200871, 225880, 241307, 260188, 283658, 303416, 327079, 340276, 361266, 381853, 403231,
 	420062, 451630, 461174, 486793, 507078, 521854, 540252, 565728, 580612, 611597, 622096, 640605, 662128,
 	680463, 703288, 725156, 740581, 765662, 780535, 801185, 820883, 840069, 862289, 887676, 904453, 921530,
-	940943, 5000539, 5003249
+	940943, 1296505, 1379070, 5000539, 5003249
 ];
 test(`fuzz: ${FIXED.length} seeds that once failed`, { skip: !!process.env.FUZZ_SEED || !!process.env.FUZZ_FIRST }, async () => {
 	for (const seed of FIXED) await run(seed, 250);

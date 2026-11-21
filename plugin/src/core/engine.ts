@@ -967,6 +967,7 @@ export class Engine {
 				return true;
 			}
 			if (!(await this.vacate(want, id))) return this.deferred.has(id) || "blocked"; // waiting, or places shifted: look again
+			if (!(await this.disk.stat(m.diskPath))) return false; // gone while its place was made: look again
 			this.ownRenames.set(want, m.diskPath);
 			await this.disk.rename(m.diskPath, want);
 			// The agreed timestamp stays as it was: a move doesn't change the text, and an edit that landed
@@ -996,8 +997,10 @@ export class Engine {
 				return true;
 			}
 			// After a crash, an editor's save newer than the last agreement might hold typing that was never
-			// recorded. It is about to be overwritten: keep it as its own note.
-			if (mode === "recover" && (await this.opts.hash(current)) !== m.baseHash) await this.keepCopy(want, id, current);
+			// recorded. And after an editor closed, the file counts as its last save, but one holding text the
+			// document never had was edited from outside since. Either is about to be overwritten: keep it as its own note.
+			const doc = units(text), outside = mode === "doc" && [...units(current)].some((u) => !doc.has(u));
+			if ((mode === "recover" && (await this.opts.hash(current)) !== m.baseHash) || outside) await this.keepCopy(want, id, current);
 		} else if (m.diskPath !== want) {
 			if (!(await this.vacate(want, id))) return this.deferred.has(id) || "blocked"; // waiting, or places shifted: look again
 			if (m.diskPath === want) return true; // the file there turned out to be this note
@@ -1092,8 +1095,9 @@ export class Engine {
 	private async keepCopy(path: string, id: string, text: string): Promise<void> {
 		const stem = path.replace(/(\.md)?$/i, ` (recovered ${id.slice(0, 6)}`);
 		let copy = `${stem}).md`;
-		// Free on disk, and not a path some note is still recorded at or that has file events waiting.
-		for (let n = 2; (await this.disk.stat(copy)) || this.byPath.has(copy) || this.dirty.has(copy); n++) copy = `${stem} ${n}).md`;
+		// Free on disk, not a path some note is recorded at or the index puts a note at (an earlier copy whose file
+		// was deleted may still be coming back there), and with no file events waiting.
+		for (let n = 2; (await this.disk.stat(copy)) || this.byPath.has(copy) || this.ownerOf(copy) !== undefined || this.dirty.has(copy); n++) copy = `${stem} ${n}).md`;
 		await this.disk.write(copy, text);
 		const kept = (await this.takeUnknown(copy))!; // a note: always taken
 		this.metaOf(kept).copyOf = id;
