@@ -4,7 +4,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!-- The pairing code is in this page's address after "#", which the browser never sends anywhere. This page
      loads nothing from elsewhere and can't send anything: the policy below allows only its own script and font.
-     It comes from your server, though: whoever controls the server could change it (docs/DESIGN.md). -->
+     It comes from your Worker, though: whoever controls the Worker could change it (docs/DESIGN.md). -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; font-src 'self'; img-src 'self'; form-action 'none'; base-uri 'none'">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <meta name="referrer" content="no-referrer">
@@ -47,7 +47,7 @@ footer { color: var(--muted); font-size: 13px; margin-top: 1.5rem; }
 </div>
 <div id="good" hidden>
 <h1>Add this device</h1>
-<p class="lead">Your notes will sync here from your server <code id="server"></code>, end-to-end encrypted.</p>
+<p class="lead">Your notes will sync here from your Worker <code id="server"></code>, end-to-end encrypted.</p>
 <section class="card">
 <h2>Ownsync already on this device?</h2>
 <p>Open the vault you want to sync in Obsidian (a new, empty vault is fine), then:</p>

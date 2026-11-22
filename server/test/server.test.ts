@@ -299,7 +299,12 @@ test("devices report a status: one short ID per connection, last online from the
 	// Its name and the vault's, as Obsidian has them: with the vault's token only, and kept when it reports again.
 	const names = (t: Uint8Array, json: unknown) => fetch(`http://localhost:${PORT}/vault/${v}/names`, { method: "POST", body: new Uint8Array([...t, ...bytes(JSON.stringify(json))]) });
 	assert.equal((await names(token(), { device: "ABCD0063", name: "Kish's iPhone", vault: "Personal" })).status, 401);
-	assert.equal((await names(tok, { device: "ABCD0063", name: "  Kish's iPhone\u0007 ", vault: "Personal" })).status, 200);
+	const named = await names(tok, { device: "ABCD0063", name: "  Kish's iPhone\u0007 ", vault: "Personal" });
+	assert.equal(named.status, 200);
+	// The reply says which Ownsync the Worker runs, and the newest release when it can be looked up (or null), for the plugin's update notice.
+	const reply = (await named.json()) as { worker?: string; latest?: string | null };
+	assert.match(reply.worker ?? "", /^\d+\.\d+\.\d+$/);
+	assert.ok(reply.latest === null || /^\d+\.\d+\.\d+$/.test(reply.latest ?? ""));
 	phone.send(status(99, 1, "0.1.1 mobile notes-only"));
 	s = await statsUntil(v, (s) => s.devices.find((d) => d.id === "ABCD0063")?.conflicts === 1);
 	assert.deepEqual([s.name, s.devices.find((d) => d.id === "ABCD0063")!.name], ["Personal", "Kish's iPhone"]);

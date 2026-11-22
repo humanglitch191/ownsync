@@ -10,6 +10,10 @@ import {
 	verifyAuthenticationResponse,
 	verifyRegistrationResponse,
 } from "@simplewebauthn/server";
+import { COMMIT, REPO } from "./repo.generated";
+
+// The integrator switches this on once automatic updates ship: the dashboard then says so.
+export const AUTO_UPDATE = true;
 
 /** What a Vault reports about itself (Vault.stats). */
 export interface VaultStats {
@@ -26,7 +30,7 @@ export interface VaultStats {
 }
 
 /** The server's version, shown on the dashboard. */
-export const VERSION = "0.1.5";
+export const VERSION = "0.1.6";
 
 // Workers Free plan, from Cloudflare's pricing and limits pages (2026-11-13).
 export const LIMITS = { storageBytes: 5e9, vaultBytes: 1e9, requestsPerDay: 100_000, rowsWrittenPerDay: 100_000 };
@@ -69,6 +73,9 @@ type Passkey = { id: string; public_key: ArrayBuffer; counter: number; created: 
 export type SetupState = { state: "open" | "used" | "expired" | "no key"; until: number };
 
 export class Dashboard {
+	/** When this version was deployed (ms), set by the Owner object from CF_VERSION_METADATA.timestamp. */
+	deployed: number | null = null;
+
 	constructor(
 		private readonly sql: SqlStorage,
 		private readonly stats: (vault: string) => Promise<VaultStats | null>,
@@ -206,7 +213,8 @@ export class Dashboard {
 	}
 
 	/** The newest Ownsync release, asked of GitHub at most twice a day; null if it can't be told. */
-	private async latest(): Promise<string | null> {
+	/** The newest Ownsync release, looked up at most every 12 hours. */
+	async latest(): Promise<string | null> {
 		const row = this.sql.exec<{ version: string; checked: number }>("SELECT version, checked FROM latest").toArray()[0];
 		if (row && Date.now() - row.checked < LATEST_MS) return row.version || null;
 		const version = await fetch("https://api.github.com/repos/humanglitch191/ownsync/releases/latest", { headers: { "user-agent": "ownsync-server", accept: "application/vnd.github+json" }, signal: AbortSignal.timeout(3000) })
@@ -382,6 +390,10 @@ export class Dashboard {
 		return {
 			origin: site.origin,
 			version: VERSION,
+			deployed: this.deployed,
+			repo: REPO,
+			commit: COMMIT,
+			autoUpdate: AUTO_UPDATE,
 			// Newer than this server: the dashboard says how to update.
 			update: latest && latest.localeCompare(VERSION, undefined, { numeric: true }) > 0 ? latest : null,
 			limits: LIMITS,

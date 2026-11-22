@@ -2,6 +2,10 @@ name = "ownsync"
 main = "src/index.ts"
 compatibility_date = "2026-03-02"
 
+# Finds the GitHub repository this was built from (src/repo.generated.ts), for the dashboard's Update button.
+[build]
+command = "node scripts/repo.mjs"
+
 [[durable_objects.bindings]]
 name = "VAULT"
 class_name = "Vault"

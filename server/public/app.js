@@ -83,7 +83,7 @@ async function usePasskey(o) {
 }
 
 const cancelled = (err) => err?.name === "NotAllowedError" || err?.name === "AbortError";
-const failure = (err) => (cancelled(err) ? "The passkey prompt was closed. Try again." : err?.name === "InvalidStateError" ? "This device already has a passkey for this server: sign in with it." : err?.message || String(err));
+const failure = (err) => (cancelled(err) ? "The passkey prompt was closed. Try again." : err?.name === "InvalidStateError" ? "This device already has a passkey for this Worker: sign in with it." : err?.message || String(err));
 
 // A button that runs `fn`, shows it's busy, and shows what went wrong under it.
 function action(label, fn, cls = "btn") {
@@ -107,7 +107,7 @@ const SETUP_ERRORS = {
 	locked: "Too many wrong setup keys from this connection. Try again in an hour, or set a new SETUP_KEY in Cloudflare.",
 	expired: "The setup key works only in the first 10 minutes after you deploy. In your Cloudflare dashboard, open Workers → this Worker → Settings → Variables and Secrets, and set a new SETUP_KEY: that opens it again for 10 minutes.",
 	used: "A passkey was already added with this setup key: sign in with it. Lost it? Set a new SETUP_KEY in Cloudflare, then come back here.",
-	"no setup key": "This server has no setup key. In your Cloudflare dashboard, open Workers → this Worker → Settings → Variables and Secrets, and add a secret named SETUP_KEY.",
+	"no setup key": "This Worker has no setup key. In your Cloudflare dashboard, open Workers → this Worker → Settings → Variables and Secrets, and add a secret named SETUP_KEY.",
 };
 
 // --- first visit: the same page for everyone, set up or not ---
@@ -133,12 +133,12 @@ function welcome(message) {
 	show(h("main", { class: "welcome" },
 		brand(),
 		h("h1", {}, "Your notes, in sync. ", h("span", {}, "Only you can read them.")),
-		h("p", { class: "lead" }, "This is your own sync server. It relays your Obsidian vault between your devices and only ever sees scrambled data."),
+		h("p", { class: "lead" }, "This is your own sync Worker. It relays your Obsidian vault between your devices and only ever sees scrambled data."),
 		h("div", { class: "row" }, signIn.button, h("button", { class: "btn", onclick: () => { keybox.hidden = !keybox.hidden; if (!keybox.hidden) key.focus(); } }, "First time? Use setup key")),
 		signIn.error,
 		message ? h("p", { class: "quiet" }, message) : null,
 		keybox,
-		h("div", { class: "facts label" }, h("span", {}, "Encrypted on your devices"), h("span", {}, "Your own server"), h("span", {}, "No account, nothing collected"))));
+		h("div", { class: "facts label" }, h("span", {}, "Encrypted on your devices"), h("span", {}, "Your own Worker"), h("span", {}, "No account, nothing collected"))));
 }
 
 // --- setup: one task per step on the left; the real dashboard filling in on the right ---
@@ -177,7 +177,7 @@ async function setup(token) {
 		const vault = target();
 		if (!vault) {
 			if (STEPS[at] === "Passkey") live.replaceChildren(h("div", { class: "skel title" }), ...[1, 2, 3].map(() => h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" }), h("div", { class: "skel short" })), h("span"))));
-			else live.replaceChildren(h("h3", { class: "appear" }, another ? "Another vault" : "Your sync server"), h("div", { class: "card appear" }, h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" })), h("span", { class: "label" }, "Waiting"))));
+			else live.replaceChildren(h("h3", { class: "appear" }, another ? "Another vault" : "Your sync Worker"), h("div", { class: "card appear" }, h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", {}, h("div", { class: "skel mid" })), h("span", { class: "label" }, "Waiting"))));
 			return;
 		}
 		live.replaceChildren(h("h3", {}, vaultName(vault)), h("div", { class: "card" },
@@ -223,7 +223,7 @@ async function setup(token) {
 				h("ol", { class: "checks" },
 					stepItem(connected ? "done" : "now", "Install Ownsync in Obsidian", another ? "Already there? Skip ahead" : "Settings → Community plugins → Browse, search for Ownsync"),
 					stepItem(connected ? "done" : "now", another ? "Open the other vault in Obsidian" : "Open the vault you want to sync", "A new, empty vault is fine too"),
-					stepItem(connected ? "done" : "later", "Press Open in Obsidian, then Connect", "Obsidian shows this server before anything happens")),
+					stepItem(connected ? "done" : "later", "Press Open in Obsidian, then Connect", "Obsidian shows this Worker before anything happens")),
 				box,
 				connected
 					? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${vaultName(connected)} is syncing from ${first}`))
@@ -239,7 +239,7 @@ async function setup(token) {
 				h("p", { class: "sub" }, "In Obsidian on your computer, in this vault: Settings → Ownsync → Add a device. Scan the code with your phone's camera."),
 				h("ol", { class: "checks" },
 					stepItem("done", `${vault ? vaultName(vault) : "Your vault"} is syncing`, first ? `From ${first}` : ""),
-					stepItem(two ? "done" : "now", "Scan the code on your phone", "It hands over the key; this server never sees it"),
+					stepItem(two ? "done" : "now", "Scan the code on your phone", "It hands over the key; this Worker never sees it"),
 					stepItem(two ? "done" : "later", "Check both show the same ID", "So you know it's yours")),
 				two ? h("div", { class: "waiting done" }, svg(CHECK, 13, 2.5), h("span", {}, `${joined?.name || joined?.id} joined`)) : h("div", { class: "waiting" }, h("span", { class: "pulse" }), "Waiting for your phone…"),
 				h("div", { class: "grow" }),
@@ -360,8 +360,11 @@ async function dashboard() {
 			o.lastSync ? ["Last sync ", h("b", {}, ago(o.lastSync)), "."] : "No device has synced yet.")
 		: h("h1", { class: "headline" }, "No vaults yet. ", h("b", {}, "Connect your first one"), " on the right.");
 	// A newer Ownsync comes first; otherwise what's new in this one, until dismissed.
+	const flow = o.repo ? `https://github.com/${o.repo}/actions/workflows/update-ownsync.yml` : null;
 	const notice = o.update ? h("div", { class: "card notice" }, h("span", { class: "label" }, "Update"),
-		h("p", {}, `Ownsync ${o.update} is out. On GitHub, open your Ownsync repository → Actions → Update Ownsync → Run workflow. Cloudflare redeploys your server.`),
+		h("p", {}, flow ? `Ownsync ${o.update} is out. Press Update, then Run workflow on GitHub; Cloudflare redeploys your Worker.` : `Ownsync ${o.update} is out. On GitHub, open your Ownsync repository → Actions → Update Ownsync → Run workflow. Cloudflare redeploys your Worker.`,
+			o.autoUpdate ? h("span", { class: "quiet" }, " Updates install on their own after 3 days.") : null),
+		flow ? h("a", { class: "btn primary small", href: flow }, "Update") : null,
 		h("a", { href: "https://github.com/humanglitch191/ownsync/blob/main/docs/updating.md" }, "How"))
 		: localStorage.getItem(NOTICE) ? null : h("div", { class: "card notice" }, h("span", { class: "label" }, "New"),
 		h("p", {}, "Phones can sync notes only now, and skip attachments: Settings → Ownsync → Sync attachments."),
@@ -376,7 +379,8 @@ async function dashboard() {
 		h("div", { class: "twocol" },
 			h("div", {}, o.vaults.length ? o.vaults.map(vaultSection) : h("div", { class: "card empty" }, h("p", { class: "quiet" }, "No vaults yet. Press Connect another vault to connect your first."))),
 			connectPanel()),
-		h("footer", { class: "foot" }, h("span", {}, `Ownsync ${o.version} · your server`), h("span", {}, "Workers Free plan · ", h("a", { href: "https://github.com/humanglitch191/ownsync/blob/main/docs/cost-and-limits.md" }, "what Paid adds")))));
+		h("footer", { class: "foot" }, h("span", {}, `Ownsync ${o.version}${o.deployed ? `, updated ${new Date(o.deployed).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}` : ""} · your Worker`,
+			flow ? [h("br"), h("a", { href: flow }, "Stay on this version"), " (turn off automatic updates: on GitHub, ⋯ → Disable workflow)"] : null), h("span", {}, "Workers Free plan · ", h("a", { href: "https://github.com/humanglitch191/ownsync/blob/main/docs/cost-and-limits.md" }, "what Paid adds")))));
 }
 
 async function passkeys() {

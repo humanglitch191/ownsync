@@ -4,7 +4,7 @@
 // chunks are kept apart, once per name.
 
 import { DurableObject } from "cloudflare:workers";
-import { Dashboard, type VaultStats } from "./dashboard";
+import { Dashboard, VERSION, type VaultStats } from "./dashboard";
 import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, MAX_CHUNK, MAX_ENVELOPE, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
 
 interface Env {
@@ -128,7 +128,9 @@ export class Vault extends DurableObject<Env> {
 				const device = typeof n.device === "string" && /^[0-9A-F]{8}$/.test(n.device) ? n.device : null;
 				if (device) this.write("INSERT INTO devices (id, last_online, version, conflicts, name) VALUES (?, ?, '', 0, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name", device, Date.now(), clean(n.name));
 				if (typeof n.vault === "string") this.write("INSERT OR REPLACE INTO vault_name (id, name) VALUES (0, ?)", clean(n.vault));
-				return Response.json({ ok: true });
+				// And in reply, which Ownsync this Worker runs and the newest release, so the plugin can say when either is behind.
+				const latest = await (owner(this.env) as unknown as { latest(): Promise<string | null> }).latest().catch(() => null);
+				return Response.json({ ok: true, worker: VERSION, latest });
 			}
 			await this.erase();
 			return Response.json({ deleted: true });
@@ -383,12 +385,17 @@ export class Owner extends DurableObject<Env> {
 			() => this.mint(DASHBOARD_CODE_MS),
 			() => this.listVaults(),
 		);
+		this.dashboard.deployed = Date.parse(env.CF_VERSION_METADATA?.timestamp ?? "") || null; // when this version went live
 	}
 
 	private readonly dashboard: Dashboard;
 
 	async fetch(req: Request): Promise<Response> {
 		return this.dashboard.handle(req);
+	}
+
+	latest(): Promise<string | null> {
+		return this.dashboard.latest();
 	}
 
 	setup(given: Uint8Array, expected: Uint8Array, setupKey: Uint8Array, who: Uint8Array, deployed: number, origin: string) {
