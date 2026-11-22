@@ -342,6 +342,81 @@ test("the dashboard's stats count today's requests and rows written, the storage
 	a.ws.close();
 });
 
+test("sealed history is authenticated, listed newest first per document, and can be cleared", async () => {
+	const v = vault(), tok = token(), home = `http://localhost:${PORT}`;
+	const root = `${home}/vault/${v}`;
+	const a = await connect(v, tok);
+	await a.catchUp(0);
+	const post = (path: string, ...parts: Uint8Array[]) => fetch(`${root}/${path}`, { method: "POST", body: Buffer.concat(parts) });
+	const list = async (tag: Uint8Array) => {
+		const response = await post("history/list", tok, tag);
+		assert.equal(response.status, 200);
+		assert.equal(response.headers.get("content-type"), "application/octet-stream");
+		return [...new Uint8Array(await response.arrayBuffer())];
+	};
+	const first = doc(1), other = doc(2);
+	const older = Uint8Array.of(255), newer = Uint8Array.of(0, 42), elsewhere = Uint8Array.of(7);
+	for (const path of ["history", "history/list", "history/clear"]) {
+		assert.equal((await post(path, token(), first)).status, 401);
+		assert.equal((await fetch(`${root}/${path}`)).status, 405);
+	}
+	assert.equal((await post("history", tok, first)).status, 413);
+	assert.equal((await post("history", tok, first, new Uint8Array(1024 * 1024 + 65))).status, 413);
+	const before = await stats(home, v);
+	for (const [tag, envelope] of [[first, older], [first, newer], [other, elsewhere]] as const) {
+		const response = await post("history", tok, tag, envelope);
+		assert.equal(response.status, 200);
+		assert.deepEqual(await response.json(), { ok: true });
+	}
+	const after = await stats(home, v);
+	assert.equal(after.requestsToday - before.requestsToday, 3);
+	assert.ok(after.rowsWrittenToday - before.rowsWrittenToday >= 3);
+	assert.deepEqual(await list(first), [0, 0, 0, 2, 0, 42, 0, 0, 0, 1, 255]);
+	assert.deepEqual(await list(other), [0, 0, 0, 1, 7]);
+	assert.equal((await post("history/list", tok, first, Uint8Array.of(0))).status, 400);
+	assert.equal((await post("history/clear", tok, first, Uint8Array.of(0))).status, 400);
+	const clearDoc = await post("history/clear", tok, first);
+	assert.equal(clearDoc.status, 200);
+	assert.deepEqual(await clearDoc.json(), { ok: true });
+	assert.deepEqual(await list(first), []);
+	assert.deepEqual(await list(other), [0, 0, 0, 1, 7]);
+	const clearAll = await post("history/clear", tok);
+	assert.equal(clearAll.status, 200);
+	assert.deepEqual(await clearAll.json(), { ok: true });
+	assert.deepEqual(await list(other), []);
+	assert.equal((await post("history", tok, first, newer)).status, 200);
+	assert.equal((await post("delete", tok)).status, 200);
+	assert.equal(await a.closed, CLOSE.deleted);
+	assert.equal((await post("history", tok, first, newer)).status, 410);
+	assert.equal((await post("history/list", tok, first)).status, 410);
+	assert.equal((await post("history/clear", tok)).status, 410);
+});
+
+test("history evicts the oldest copy when uploads exceed the vault's 50 MiB limit", async () => {
+	const v = vault(), tok = token();
+	const a = await connect(v, tok);
+	await a.catchUp(0);
+	a.ws.close();
+	const root = `http://localhost:${PORT}/vault/${v}/history`;
+	const upload = async (body: Uint8Array) => {
+		const response = await fetch(root, { method: "POST", body });
+		assert.equal(response.status, 200);
+		assert.deepEqual(await response.json(), { ok: true });
+	};
+	const marker = Buffer.concat([tok, doc(1)]);
+	const listMarker = async () => {
+		const response = await fetch(`${root}/list`, { method: "POST", body: marker });
+		assert.equal(response.status, 200);
+		return (await response.arrayBuffer()).byteLength;
+	};
+	await upload(Buffer.concat([marker, Uint8Array.of(1)]));
+	const copy = Buffer.concat([tok, doc(2), new Uint8Array(1024 * 1024)]);
+	for (let i = 0; i < 49; i++) await upload(copy);
+	assert.equal(await listMarker(), 5);
+	await upload(copy);
+	assert.equal(await listMarker(), 0);
+});
+
 test("deleting a vault takes its token; then its devices are told 4004, it can't be created again, and only a tombstone is left", async () => {
 	const v = vault(), tok = token(), home = `http://localhost:${PORT}`;
 	const a = await connect(v, tok), b = await connect(v, tok);

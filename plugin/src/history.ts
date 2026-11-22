@@ -1,22 +1,71 @@
-// Note history stays in this device's IndexedDB. Only an explicit restore writes to the vault.
+// Local copies live in IndexedDB. Only an explicit restore writes to the vault.
 
-import { type App, type Command, type EventRef, Modal, Notice, TFile, TFolder } from "obsidian";
-import { MAX_BYTES, type Copy, keepCopies, whenLabel } from "./historyRules";
+import { type App, type Command, type EventRef, FileView, Modal, Notice, TFile, TFolder } from "obsidian";
+import { type EditorState, type Extension, StateField, type Text, Transaction } from "@codemirror/state";
+import { type EditorView, ViewPlugin } from "@codemirror/view";
+import { ySyncAnnotation, ySyncFacet } from "y-codemirror.next";
+import { type Doc, type Transaction as YTransaction, UndoManager } from "yjs";
+import type { createHistoryBackup } from "./historyBackup";
+import { MAX_BYTES, type Copy, deletedWhenLabel, keepCopies, mergeCopies, whenLabel } from "./historyRules";
+
+interface DeletedNotesEngine {
+	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number; text: string }[]>;
+	restoreDeleted(id: string, path?: string): Promise<void>;
+}
 
 export interface HistoryHost {
 	app: App;
 	manifest: { id: string };
 	registerEvent(ref: EventRef): void;
+	registerEditorExtension(extension: Extension): void;
 	addCommand(command: Command): unknown;
 	register(callback: () => void): void;
+	engine?(): DeletedNotesEngine | undefined;
 }
+
+type ActiveBackup = () => { client: ReturnType<typeof createHistoryBackup>; connected: boolean } | null;
+
+// The editor event also fires for sync and file reloads. Yjs presents local undo/redo to
+// CodeMirror the same way as remote changes, but exposes the undo manager as the origin.
+const undoing = new WeakSet<Doc>();
+const undoOrigin = ViewPlugin.fromClass(class {
+	private doc?: Doc | null;
+	constructor(view: EditorView) { this.bind(view.state); }
+	update({ state }: { state: EditorState }): void { this.bind(state); }
+	private bind(state: EditorState): void {
+		const doc = state.facet(ySyncFacet)?.ytext.doc;
+		if (doc === this.doc) return;
+		this.destroy();
+		this.doc = doc;
+		doc?.on("beforeObserverCalls", this.before);
+		doc?.on("afterTransaction", this.after);
+	}
+	private before = (tr: YTransaction): void => {
+		if (tr.origin instanceof UndoManager) undoing.add(tr.doc);
+	};
+	private after = (tr: YTransaction): void => { undoing.delete(tr.doc); };
+	destroy(): void {
+		this.doc?.off("beforeObserverCalls", this.before);
+		this.doc?.off("afterTransaction", this.after);
+	}
+});
+const localEdit = StateField.define<boolean>({
+	create: () => false,
+	update: (local, tr) => {
+		if (!tr.docChanged) return local;
+		const synced = tr.annotation(ySyncAnnotation);
+		if (synced) return !!synced.ytext.doc && undoing.has(synced.ytext.doc);
+		return !tr.annotation(Transaction.remote) && tr.annotation(Transaction.userEvent) !== undefined;
+	},
+});
 
 const EVERY = 10 * 60_000;
 const META = "meta", TEXT = "text";
 
 interface Entry extends Copy { id: string; mtime: number }
 interface Sample { path: string; text: string; mtime: number }
-interface Pending { sample: Sample; timer?: number }
+interface LocalEdit { text: Text; consumed?: boolean }
+interface Pending { sample: Sample; edit?: LocalEdit; timer?: number }
 
 function request<T>(req: IDBRequest<T>): Promise<T> {
 	return new Promise((resolve, reject) => {
@@ -28,7 +77,7 @@ function request<T>(req: IDBRequest<T>): Promise<T> {
 interface HistoryEdit {
 	entries: Map<string, Entry>;
 	read(id: string): Promise<string | undefined>;
-	add(sample: Sample, time: number, deleted?: boolean): void;
+	add(sample: Sample, time: number, deleted?: boolean): boolean;
 }
 
 class HistoryDb {
@@ -70,10 +119,11 @@ class HistoryDb {
 				add: ({ path, text, mtime }, time, deleted) => {
 					// Budget UTF-16 text and path plus the metadata for each entry, including empty notes.
 					const size = 2 * (text.length + path.length) + 128;
-					if (size > MAX_BYTES) return;
+					if (size > MAX_BYTES) return false;
 					const id = crypto.randomUUID();
 					entries.set(id, { id, path, time, mtime, size, deleted });
 					additions.set(id, text);
+					return true;
 				},
 			});
 			const kept = keepCopies([...entries.values()], Date.now());
@@ -114,11 +164,12 @@ function newestByPath(entries: Iterable<Entry>, deleted = false): Map<string, En
 class History {
 	private readonly db: HistoryDb;
 	private readonly pending = new Map<string, Pending>();
+	private readonly localEdits = new Map<string, LocalEdit>();
 	private work = Promise.resolve();
 	private reported = false;
 	stopped = false;
 
-	constructor(private readonly app: App, name: string) {
+	constructor(private readonly app: App, name: string, private readonly backup: ActiveBackup) {
 		this.db = new HistoryDb(name, this.problem);
 	}
 
@@ -129,9 +180,10 @@ class History {
 		new Notice("Ownsync couldn't save note history.");
 	};
 
-	private queue(work: () => Promise<void>): Promise<void> {
-		this.work = this.work.then(work).catch(this.problem);
-		return this.work;
+	private queue<T>(work: () => Promise<T>): Promise<T | undefined> {
+		const next = this.work.then(work).catch((err: unknown) => { this.problem(err); return undefined; });
+		this.work = next.then(() => {});
+		return next;
 	}
 
 	private async capture(file: TFile): Promise<Sample | undefined> {
@@ -176,20 +228,40 @@ class History {
 
 	changed(file: TFile): void {
 		if (this.stopped) return;
+		const edited = this.localEdits.get(file.path);
+		const editorText = edited?.text;
 		// Start reading before waiting for the previous event's transaction. A delete may already be next.
 		const read = this.capture(file);
 		void this.queue(async () => {
 			const sample = await read;
-			if (sample) await this.track([sample]);
+			if (sample) {
+				// A timer or an older disk event can still hold text from before the editor saved.
+				const edit = edited && !edited.consumed && editorText?.toString() === sample.text.replace(/\r\n/g, "\n")
+					? edited : undefined;
+				await this.track([sample], edit);
+			}
 		});
 	}
 
-	private async track(samples: Sample[]): Promise<void> {
+	edited(path: string, text: Text, local: boolean): void {
+		if (this.stopped) return;
+		const edit = this.localEdits.get(path);
+		if (local && edit?.text !== text) this.localEdits.set(path, { text });
+		else if (edit) edit.text = text;
+	}
+
+	left(path: string): void {
+		if (!this.stopped) void this.queue(() => this.flush([path], true));
+	}
+
+	private async track(samples: Sample[], edit?: LocalEdit): Promise<void> {
 		const ready: string[] = [];
 		for (const sample of samples) {
 			const existing = this.pending.get(sample.path);
-			if (existing) existing.sample = sample;
-			else this.pending.set(sample.path, { sample });
+			if (existing) {
+				existing.sample = sample;
+				if (edit) existing.edit = edit;
+			} else this.pending.set(sample.path, { sample, edit });
 			if (existing?.timer === undefined) ready.push(sample.path);
 		}
 		await this.flush(ready);
@@ -200,35 +272,46 @@ class History {
 			const pending = this.pending.get(path);
 			if (!pending) return [];
 			this.cancelTimer(pending);
-			return [pending.sample];
+			return [pending];
 		});
 		if (!samples.length) return;
-		const due = await this.db.edit(async ({ entries, read, add }) => {
+		const { due, uploads } = await this.db.edit(async ({ entries, read, add }) => {
 			const newest = newestByPath(entries.values());
 			const now = Date.now();
 			const due = new Map<string, number>();
-			for (const sample of samples) {
+			const uploads: { sample: Sample; takenAt: number }[] = [];
+			for (const { sample, edit } of samples) {
 				const last = newest.get(sample.path);
 				if (last && !force && last.time + EVERY > now) {
 					due.set(sample.path, last.time + EVERY);
 				} else if (last && await read(last.id) === sample.text) {
 					if (last.mtime !== sample.mtime) entries.set(last.id, { ...last, mtime: sample.mtime });
 				} else {
-					add(sample, Math.max(now, (last?.time ?? -Infinity) + 1));
+					const takenAt = Math.max(now, (last?.time ?? -Infinity) + 1);
+					if (add(sample, takenAt) && edit) uploads.push({ sample, takenAt });
 				}
 			}
-			return due;
+			return { due, uploads };
 		});
-		for (const { path } of samples) {
+		for (const { sample: { path }, edit } of samples) {
 			const time = due.get(path);
-			if (time === undefined) this.pending.delete(path);
-			else if (!this.stopped) {
+			if (time === undefined) {
+				this.pending.delete(path);
+				if (edit) {
+					edit.consumed = true;
+					if (edit === this.localEdits.get(path)) this.localEdits.delete(path);
+				}
+			} else if (!this.stopped) {
 				const pending = this.pending.get(path)!;
 				const timer = window.setTimeout(() => void this.queue(async () => {
 					if (this.pending.get(path)?.timer === timer) await this.flush([path]);
 				}), Math.max(0, time - Date.now()));
 				pending.timer = timer;
 			}
+		}
+		for (const { sample: { path, text }, takenAt } of uploads) {
+			const target = this.backupFor(path);
+			if (target?.connected) void target.client.upload(target.noteId, text, takenAt).catch(() => {});
 		}
 	}
 
@@ -247,6 +330,7 @@ class History {
 	removed(path: string, file: TFile | TFolder): void {
 		if (this.stopped) return;
 		const matches = file instanceof TFolder ? (p: string) => p.startsWith(`${path}/`) : (p: string) => p === path;
+		for (const p of this.localEdits.keys()) if (matches(p)) this.localEdits.delete(p);
 		// Obsidian may still have this file's text cached when it emits delete.
 		const lastRead = file instanceof TFile ? this.capture(file) : undefined;
 		void this.queue(async () => {
@@ -281,6 +365,12 @@ class History {
 	renamed(from: string, to: string, folder: boolean): void {
 		if (this.stopped) return;
 		const move = (path: string) => (folder ? path.startsWith(`${from}/`) : path === from) ? to + path.slice(from.length) : undefined;
+		for (const [path, edit] of [...this.localEdits]) {
+			const next = move(path);
+			if (next === undefined) continue;
+			this.localEdits.delete(path);
+			this.localEdits.set(next, edit);
+		}
 		void this.queue(async () => {
 			await this.db.edit(({ entries }) => {
 				for (const e of entries.values()) {
@@ -290,12 +380,12 @@ class History {
 				}
 			});
 			const moved: string[] = [];
-			for (const [path, { sample }] of [...this.pending]) {
+			for (const [path, { sample, edit }] of [...this.pending]) {
 				const next = move(path);
 				if (next === undefined) continue;
 				this.clearPending(path);
 				this.clearPending(next);
-				this.pending.set(next, { sample: { ...sample, path: next } });
+				this.pending.set(next, { sample: { ...sample, path: next }, edit });
 				moved.push(next);
 			}
 			await this.flush(moved);
@@ -316,6 +406,29 @@ class History {
 		await this.db.edit(({ entries }) => { entries.delete(entry.id); }).catch(this.problem);
 	}
 
+	backupFor(path: string) {
+		const backup = this.backup();
+		if (!backup || backup.client.supported() === false) return;
+		const noteId = backup.client.noteIdForPath(path);
+		if (noteId) return { ...backup, noteId };
+	}
+
+	forgetNote(path: string) {
+		const target = this.backupFor(path);
+		const edit = this.localEdits.get(path);
+		if (edit) edit.consumed = true;
+		this.localEdits.delete(path);
+		return this.queue(async () => {
+			await this.db.edit(({ entries }) => {
+				for (const [id, entry] of entries) if (!entry.deleted && entry.path === path) entries.delete(id);
+			});
+			this.clearPending(path);
+			// The client orders this after earlier uploads. Its HTTP request stays off the local queue.
+			const remote = target && (target.connected ? target.client.forget(target.noteId).catch(() => false) : Promise.resolve(false));
+			return { remote };
+		});
+	}
+
 	stop(): void {
 		this.stopped = true;
 		void this.queue(async () => {
@@ -323,6 +436,7 @@ class History {
 				await this.flush([...this.pending.keys()], true);
 			} finally {
 				this.pending.clear();
+				this.localEdits.clear();
 				await this.db.close();
 			}
 		});
@@ -333,123 +447,251 @@ function isNote(file: unknown): file is TFile {
 	return file instanceof TFile && file.extension.toLowerCase() === "md";
 }
 
+interface RestoreAction {
+	prompt: string;
+	apply(): Promise<void>;
+}
+
+interface HistoryRow {
+	label: string;
+	backup?: boolean;
+	read(): Promise<string | undefined>;
+	restore?: RestoreAction;
+}
+
 class HistoryModal extends Modal {
 	private showing = false;
-	private restoring = false;
+	private acting = false;
 	private confirmation?: Modal;
 
-	constructor(app: App, private readonly history: History, private readonly file?: TFile) {
-		super(app);
+	constructor(private readonly plugin: HistoryHost, private readonly history: History, private readonly file?: TFile) {
+		super(plugin.app);
 	}
 
 	async onOpen(): Promise<void> {
 		this.showing = true;
 		this.modalEl.addClass("ownsync-history-modal");
-		this.titleEl.setText(this.file ? "Note history" : "Recently deleted notes");
-		const status = this.contentEl.createEl("p", { text: "Loading note history…", cls: "ownsync-quiet", attr: { role: "status" } });
+		const file = this.file;
+		const engine = file ? undefined : this.plugin.engine?.();
+		this.titleEl.setText(file ? "Note history" : "Recently deleted notes");
+		if (file) return this.showNote(file);
+		if (engine) this.contentEl.createEl("p", { text: "This list is the same on every device.", cls: "ownsync-lead" });
+		const status = this.contentEl.createEl("p", { text: "Loading…", cls: "ownsync-quiet", attr: { role: "status" } });
+		let rows: HistoryRow[] = [];
 		try {
-			const entries = await this.history.list(this.file?.path);
-			if (!this.showing) return;
-			if (!entries.length) {
-				status.setText(this.file ? "No saved copies of this note yet." : "No recently deleted notes.");
-				return;
+			if (engine) {
+				const entries = await engine.deletedNotes();
+				const now = Date.now();
+				rows = [...entries].sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity)).map((entry) => ({
+					label: `${entry.path} (${deletedWhenLabel(entry.deletedAt, now)})`,
+					read: async () => entry.text,
+					restore: {
+						prompt: `Restore ${entry.path} to the vault?`,
+						apply: async () => {
+							if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
+							await engine.restoreDeleted(entry.id);
+							new Notice("Note restored.");
+						},
+					},
+				}));
+			} else {
+				const entries = await this.history.list();
+				const now = Date.now();
+				rows = entries.map((entry) => this.localDeletedRow(entry, now));
 			}
-			status.remove();
-			this.showEntries(entries);
+			if (!this.showing) return;
+			if (rows.length) status.remove();
+			else status.setText("No recently deleted notes.");
 		} catch {
-			if (this.showing) status.setText("Couldn't load note history.");
+			if (!this.showing) return;
+			status.setText("Couldn't load recently deleted notes.");
 		}
+		if (rows.length) this.showEntries()(rows);
 	}
 
-	private showEntries(entries: Entry[]): void {
+	private async showNote(file: TFile): Promise<void> {
+		const path = file.path;
+		const now = Date.now();
+		const target = this.history.backupFor(path);
+		const fetching = target?.connected ? target.client.list(target.noteId).catch(() => []) : undefined;
+		this.contentEl.createEl("p", {
+			text: "This device saves copies up to once every 10 minutes and when you leave the note.",
+			cls: "ownsync-lead",
+		});
+		const status = this.contentEl.createEl("p", { text: "Loading…", cls: "ownsync-quiet", attr: { role: "status" } });
+		const show = this.showEntries();
+		const current: HistoryRow = { label: "Now", read: () => this.app.vault.cachedRead(file) };
+		show([current]);
+		const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
+		const forget = actions.createEl("button", { text: "Forget this note's history" });
+		forget.onclick = () => this.confirm(forget, "Forget this note's history?", "Forget", {
+			prompt: "Delete this device's copies and clear the note's backup?",
+			apply: async () => {
+				const result = await this.history.forgetNote(file.path);
+				if (!result) return;
+				if (await result.remote === false) new Notice("Local history cleared. Couldn't clear the backup.");
+				if (this.showing) this.close();
+			},
+		}, true);
+		const local = await this.history.list(path).then((entries) => Promise.all(entries.map(async (entry) => {
+			const read = () => this.history.text(entry);
+			const text = await read();
+			if (text !== undefined) return { takenAt: entry.time, text, row: this.noteRow(file, entry.time, now, read) };
+		}))).then((copies) => {
+			status.remove();
+			return copies.filter((copy) => copy !== undefined);
+		}, () => {
+			if (this.showing) status.setText("Couldn't load saved copies.");
+			return [];
+		});
+		if (!this.showing) return;
+		show([current, ...mergeCopies(local, []).map(({ row }) => row)]);
+
+		const copies = await fetching;
+		if (!this.showing || !copies?.length) return;
+		const active = this.history.backupFor(file.path);
+		if (!active || active.client !== target?.client || active.noteId !== target.noteId) return;
+		const backedUp = copies.map(({ takenAt, text }) => ({ takenAt, text, row: this.noteRow(file, takenAt, now, async () => text, true) }));
+		show([current, ...mergeCopies(local, backedUp).map(({ row }) => row)]);
+	}
+
+	private noteRow(file: TFile, takenAt: number, now: number, read: HistoryRow["read"], backup = false): HistoryRow {
+		return {
+			label: whenLabel(takenAt, now),
+			backup,
+			read,
+			restore: {
+				prompt: "This replaces the current text of the note.",
+				apply: async () => {
+					const text = await read();
+					if (text === undefined) throw new Error("This copy is no longer available.");
+					const { vault } = this.app;
+					if (!isNote(file) || vault.getFileByPath(file.path) !== file) throw new Error("The note is gone.");
+					await vault.modify(file, text);
+				},
+			},
+		};
+	}
+
+	private localDeletedRow(entry: Entry, now: number): HistoryRow {
+		const read = () => this.history.text(entry);
+		return {
+			label: `${entry.path} (${deletedWhenLabel(entry.time, now)})`,
+			read,
+			restore: {
+				prompt: `Restore ${entry.path} to the vault?`,
+				apply: async () => {
+					const text = await read();
+					if (text === undefined) throw new Error("This copy is no longer available.");
+					await this.restoreLocalDeleted(entry, text);
+				},
+			},
+		};
+	}
+
+	private showEntries(): (entries: HistoryRow[]) => void {
 		const body = this.contentEl.createDiv({ cls: "ownsync-history" });
-		const list = body.createDiv({ cls: "ownsync-history-list", attr: { role: "group", "aria-label": this.file ? "Saved copies" : "Deleted notes" } });
+		const list = body.createDiv({ cls: "ownsync-history-list", attr: { role: "group", "aria-label": this.file ? "Note copies" : "Deleted notes" } });
 		const right = body.createDiv({ cls: "ownsync-history-right" });
 		const preview = right.createEl("pre", { cls: "ownsync-history-preview", attr: { tabindex: "0", "aria-label": "Note preview" } });
 		const restore = right.createEl("button", { text: "Restore", cls: "mod-cta" });
+		const buttons = new Map<HistoryRow, HTMLButtonElement>();
 		let selected: HTMLButtonElement | undefined;
-		const select = async (entry: Entry, button: HTMLButtonElement) => {
+		let selection = 0;
+		const select = async (entry: HistoryRow, button: HTMLButtonElement) => {
+			if (this.acting || this.confirmation) return;
+			const version = ++selection;
 			selected?.removeClass("is-active");
 			selected?.setAttribute("aria-pressed", "false");
 			selected = button;
 			button.addClass("is-active");
 			button.setAttribute("aria-pressed", "true");
+			const action = entry.restore;
+			restore.hidden = !action;
 			restore.disabled = true;
-			preview.setText("Loading copy…");
+			restore.onclick = null;
+			preview.setText("Loading preview…");
 			try {
-				const text = await this.history.text(entry);
-				if (!this.showing || selected !== button) return;
+				const text = await entry.read();
+				if (!this.showing || selection !== version) return;
 				preview.setText(text ?? "This copy is no longer available.");
-				restore.disabled = text === undefined;
-				restore.onclick = () => this.confirm(entry, restore);
+				if (action && text !== undefined) {
+					restore.disabled = false;
+					restore.onclick = () => this.confirm(restore, "Restore this copy?", "Restore", {
+						prompt: action.prompt,
+						apply: () => this.restore(action),
+					}, !!this.file);
+				}
 			} catch {
-				if (this.showing && selected === button) preview.setText("Couldn't load this copy.");
+				if (this.showing && selection === version) preview.setText("Couldn't load the preview.");
 			}
 		};
-		const now = Date.now();
-		for (const entry of entries) {
-			const when = whenLabel(entry.time, now);
-			const button = list.createEl("button", {
-				text: this.file ? when : `${entry.path} (${when})`,
-				cls: "ownsync-history-item",
-				attr: { "aria-pressed": "false" },
+		return (entries) => {
+			// Later backup rows can be inserted without replacing the current selection or preview.
+			entries.forEach((entry, index) => {
+				let button = buttons.get(entry);
+				if (!button) {
+					button = list.createEl("button", {
+						text: entry.label,
+						cls: "ownsync-history-item",
+						attr: { "aria-pressed": "false" },
+					});
+					if (entry.backup) button.createSpan({ text: " (from backup)", cls: "ownsync-quiet" });
+					const rowButton = button;
+					button.onclick = () => void select(entry, rowButton);
+					buttons.set(entry, button);
+				}
+				if (list.children[index] !== button) list.insertBefore(button, list.children[index] ?? null);
+				if (!selected) void select(entry, button);
 			});
-			button.onclick = () => void select(entry, button);
-			if (!selected) void select(entry, button);
-		}
+		};
 	}
 
-	private confirm(entry: Entry, button: HTMLButtonElement): void {
-		if (this.confirmation || this.restoring) return;
+	private confirm(button: HTMLButtonElement, title: string, label: string, action: RestoreAction, warning: boolean): void {
+		if (this.confirmation || this.acting) return;
 		const modal = new Modal(this.app);
 		this.confirmation = modal;
 		modal.onClose = () => { this.confirmation = undefined; };
-		modal.titleEl.setText("Restore this copy?");
-		modal.contentEl.createEl("p", { text: this.file ? "This replaces the current text of the note." : `Restore ${entry.path} to the vault?` });
+		modal.titleEl.setText(title);
+		modal.contentEl.createEl("p", { text: action.prompt });
 		const actions = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		actions.createEl("button", { text: "Cancel" }).onclick = () => modal.close();
-		actions.createEl("button", { text: "Restore", cls: this.file ? "mod-warning" : "mod-cta" }).onclick = () => {
+		actions.createEl("button", { text: label, cls: warning ? "mod-warning" : "mod-cta" }).onclick = () => {
 			modal.close();
 			button.disabled = true;
-			this.restoring = true;
-			void this.restore(entry).finally(() => {
-				this.restoring = false;
+			this.acting = true;
+			void action.apply().finally(() => {
+				this.acting = false;
 				if (this.showing) button.disabled = false;
 			});
 		};
 		modal.open();
 	}
 
-	private async restore(entry: Entry): Promise<void> {
+	private async restore(action: RestoreAction): Promise<void> {
 		try {
-			const text = await this.history.text(entry);
-			if (text === undefined) {
-				new Notice("This copy is no longer available.");
-				return;
-			}
-			const { vault } = this.app;
-			if (this.file) {
-				if (!isNote(this.file) || vault.getFileByPath(this.file.path) !== this.file) throw new Error("The note is gone.");
-				await vault.modify(this.file, text);
-			} else {
-				const folder = entry.path.slice(0, Math.max(0, entry.path.lastIndexOf("/")));
-				if (folder && !vault.getFolderByPath(folder)) {
-					await vault.createFolder(folder).catch((err) => { if (!vault.getFolderByPath(folder)) throw err; });
-				}
-				const base = entry.path.replace(/\.md$/i, "");
-				let path = entry.path, n = 1;
-				while (await vault.adapter.exists(path)) {
-					path = `${base} (restored${n === 1 ? "" : ` ${n}`}).md`;
-					n++;
-				}
-				await vault.create(path, text);
-				await this.history.forget(entry);
-				new Notice(`Restored ${path}.`);
-			}
+			await action.apply();
 			this.close();
 		} catch (err) {
 			new Notice(err instanceof Error ? `Couldn't restore the note. ${err.message}` : "Couldn't restore the note.");
 		}
+	}
+
+	private async restoreLocalDeleted(entry: Entry, text: string): Promise<void> {
+		const { vault } = this.app;
+		const folder = entry.path.slice(0, Math.max(0, entry.path.lastIndexOf("/")));
+		if (folder && !vault.getFolderByPath(folder)) {
+			await vault.createFolder(folder).catch((err) => { if (!vault.getFolderByPath(folder)) throw err; });
+		}
+		const base = entry.path.replace(/\.md$/i, "");
+		let path = entry.path, n = 1;
+		while (await vault.adapter.exists(path)) {
+			path = `${base} (restored${n === 1 ? "" : ` ${n}`}).md`;
+			n++;
+		}
+		await vault.create(path, text);
+		await this.history.forget(entry);
+		new Notice(`Restored ${path}.`);
 	}
 
 	onClose(): void {
@@ -459,13 +701,19 @@ class HistoryModal extends Modal {
 	}
 }
 
-export function installHistory(plugin: HistoryHost): void {
+export function installHistory(plugin: HistoryHost, backup: ActiveBackup): void {
 	const { app } = plugin, { vault, workspace } = app;
 	const key = `${plugin.manifest.id}-history-id`;
 	const existing: unknown = app.loadLocalStorage(key);
 	const id = typeof existing === "string" && existing ? existing : crypto.randomUUID();
 	if (id !== existing) app.saveLocalStorage(key, id);
-	const history = new History(app, `ownsync-history-${id}`);
+	const history = new History(app, `ownsync-history-${id}`, backup);
+	plugin.registerEditorExtension([undoOrigin, localEdit]);
+	plugin.registerEvent(workspace.on("editor-change", (editor, { file }) => {
+		if (!isNote(file)) return;
+		const cm = (editor as unknown as { cm?: EditorView }).cm;
+		if (cm) history.edited(file.path, cm.state.doc, cm.state.field(localEdit, false) === true);
+	}));
 
 	const changed = (file: unknown) => { if (isNote(file)) history.changed(file); };
 	plugin.registerEvent(vault.on("modify", changed));
@@ -482,13 +730,21 @@ export function installHistory(plugin: HistoryHost): void {
 	workspace.onLayoutReady(() => {
 		if (history.stopped) return;
 		plugin.registerEvent(vault.on("create", changed));
+		let active = workspace.getActiveViewOfType(FileView)?.file;
+		const saveOnLeave = () => {
+			const next = workspace.getActiveViewOfType(FileView)?.file;
+			if (active !== next && isNote(active)) history.left(active.path);
+			active = next;
+		};
+		plugin.registerEvent(workspace.on("active-leaf-change", saveOnLeave));
+		plugin.registerEvent(workspace.on("file-open", saveOnLeave));
 		history.seed();
 	});
 
 	let modal: HistoryModal | undefined;
 	const open = (file?: TFile) => {
 		modal?.close();
-		modal = new HistoryModal(app, history, file);
+		modal = new HistoryModal(plugin, history, file);
 		modal.open();
 	};
 	plugin.register(() => { modal?.close(); history.stop(); });

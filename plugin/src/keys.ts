@@ -109,6 +109,8 @@ export class VaultKeys {
 	/** The newest epoch this device holds the key of. */
 	get epoch(): number { return Math.max(...this.ring.keys()); }
 	get vmk(): Uint8Array { return this.ring.get(this.epoch)!; }
+	/** Every epoch's vault key this device holds. */
+	get vmks(): Uint8Array[] { return [...this.ring.values()]; }
 	/**
 	 * Any epoch this device holds. Note updates of an older epoch are refused before this is asked (transport.ts,
 	 * PROTOCOL.md "After a rotation"); attachment chunks keep the epoch they were uploaded in, and need the old key.

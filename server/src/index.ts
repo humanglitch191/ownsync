@@ -5,7 +5,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { Dashboard, VERSION, type VaultStats } from "./dashboard";
-import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, MAX_CHUNK, MAX_ENVELOPE, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
+import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, DOC_TAG_BYTES, MAX_CHUNK, MAX_ENVELOPE, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
 
 interface Env {
 	VAULT: DurableObjectNamespace<Vault>;
@@ -33,6 +33,9 @@ const FLUSH_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 // How many days of usage the dashboard shows.
 const HISTORY_DAYS = 14;
+const MAX_HISTORY_ENVELOPE = 1024 * 1024 + CHUNK_OVERHEAD;
+const MAX_HISTORY_BYTES = 50 * 1024 * 1024;
+const HISTORY_RETENTION_MS = 30 * DAY_MS;
 
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
@@ -57,7 +60,7 @@ export default {
 		}
 		// The owner dashboard's API; its pages are static assets.
 		if (path.startsWith("/api/")) return owner(env).fetch(req);
-		const vault = path.match(/^\/vault\/([0-9a-f]{32})(\/delete|\/names)?$/);
+		const vault = path.match(/^\/vault\/([0-9a-f]{32})(?:\/delete|\/names|\/history(?:\/list|\/clear)?)?$/);
 		if (vault) return env.VAULT.get(env.VAULT.idFromName(vault[1]!)).fetch(req);
 		// The room is a hash of the pairing code, so the server can't open what it holds.
 		const pair = path.match(/^\/pair\/([0-9a-f]{32})$/);
@@ -87,6 +90,8 @@ export class Vault extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS records (number INTEGER PRIMARY KEY, blob BLOB NOT NULL);
 			CREATE TABLE IF NOT EXISTS recovery (id INTEGER PRIMARY KEY CHECK (id = 0), sealed BLOB NOT NULL);
 			CREATE TABLE IF NOT EXISTS chunks (name BLOB PRIMARY KEY, envelope BLOB NOT NULL);
+			CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, doc BLOB NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL, envelope BLOB NOT NULL);
+			CREATE INDEX IF NOT EXISTS history_doc ON history (doc, at);
 			CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, last_online INTEGER NOT NULL, version TEXT NOT NULL, conflicts INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY CHECK (id = 0), day INTEGER NOT NULL, requests INTEGER NOT NULL, rows INTEGER NOT NULL, last_activity INTEGER);
 			CREATE TABLE IF NOT EXISTS usage_days (day INTEGER PRIMARY KEY, requests REAL NOT NULL, rows INTEGER NOT NULL);
@@ -104,21 +109,21 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	async fetch(req: Request): Promise<Response> {
-		const path = new URL(req.url).pathname;
-		this.name ??= path.split("/")[2] ?? null;
+		const [, , id, action, operation] = new URL(req.url).pathname.split("/");
+		this.name ??= id ?? null;
 		this.count(1);
-		const action = path.endsWith("/delete") ? "delete" : path.endsWith("/names") ? "names" : null;
-		// A device of this vault deletes it, from Obsidian, where the user typed its short ID. Or it says what it and
-		// the vault are called in Obsidian, for the dashboard.
 		if (action) {
 			if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
 			if (this.deleted) return Response.json({ error: "deleted" }, { status: 410 });
-			const body = new Uint8Array(await req.arrayBuffer());
-			// names: the token, then the names as JSON. The others: the token alone.
-			const token = action === "names" ? body.slice(0, 32) : body;
-			const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", token));
+			const body = action === "history"
+				? await this.readHistoryBody(req, 32 + DOC_TAG_BYTES + (operation ? 0 : MAX_HISTORY_ENVELOPE))
+				: new Uint8Array(await req.arrayBuffer());
+			const token = action === "delete" ? body : body.subarray(0, 32);
+			const hash = await digest(token);
+			if (this.deleted) return Response.json({ error: "deleted" }, { status: 410 });
 			const stored = this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0]?.token_hash;
 			if (!stored || token.length !== 32 || !crypto.subtle.timingSafeEqual(hash, stored)) return Response.json({ error: "unauthorized" }, { status: 401 });
+			if (action === "history") return this.history(operation, body.subarray(32));
 			if (action === "names") {
 				if (body.length > 32 + 1024) return Response.json({ error: "too large" }, { status: 413 });
 				let n: { device?: unknown; name?: unknown; vault?: unknown };
@@ -142,6 +147,73 @@ export class Vault extends DurableObject<Env> {
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
+	private async readHistoryBody(req: Request, limit: number): Promise<Uint8Array> {
+		const reader = req.body?.getReader();
+		if (!reader) return new Uint8Array(0);
+		// Keep one extra byte so validation can reject an oversized body after checking its token.
+		const parts: Uint8Array[] = [];
+		let length = 0;
+		while (length <= limit) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const part = value.subarray(0, limit + 1 - length);
+			parts.push(part);
+			length += part.length;
+		}
+		const body = new Uint8Array(length);
+		let offset = 0;
+		for (const part of parts) {
+			body.set(part, offset);
+			offset += part.length;
+		}
+		if (length > limit) void reader.cancel().catch(() => {});
+		return body;
+	}
+
+	private history(operation: string | undefined, body: Uint8Array): Response {
+		if (operation && body.length !== DOC_TAG_BYTES && !(operation === "clear" && body.length === 0)) {
+			return Response.json({ error: "bad document tag" }, { status: 400 });
+		}
+		const doc = body.subarray(0, DOC_TAG_BYTES);
+		if (operation === "clear") {
+			if (doc.length) this.write("DELETE FROM history WHERE doc = ?", doc);
+			else this.write("DELETE FROM history");
+			return Response.json({ ok: true });
+		}
+
+		const now = Date.now();
+		if (operation === "list") {
+			this.write("DELETE FROM history WHERE at < ?", now - HISTORY_RETENTION_MS);
+			const rows = this.sql.exec<{ envelope: ArrayBuffer }>("SELECT envelope FROM history WHERE doc = ? ORDER BY at DESC, id DESC LIMIT 200", doc).toArray();
+			return new Response(new ReadableStream<Uint8Array>({
+				pull(controller) {
+					const row = rows.shift();
+					if (!row) { controller.close(); return; }
+					const length = new Uint8Array(4);
+					new DataView(length.buffer).setUint32(0, row.envelope.byteLength);
+					controller.enqueue(length);
+					controller.enqueue(new Uint8Array(row.envelope));
+				},
+			}), { headers: { "content-type": "application/octet-stream" } });
+		}
+
+		const envelope = body.subarray(DOC_TAG_BYTES);
+		if (!envelope.length || envelope.length > MAX_HISTORY_ENVELOPE) return Response.json({ error: "bad envelope size" }, { status: 413 });
+		this.ctx.storage.transactionSync(() => {
+			this.write("INSERT INTO history (doc, at, size, envelope) VALUES (?, ?, ?, ?)", doc, now, envelope.length, envelope);
+			this.write("DELETE FROM history WHERE at < ?", now - HISTORY_RETENTION_MS);
+			const { size } = this.sql.exec<{ size: number }>("SELECT COALESCE(SUM(size), 0) AS size FROM history").one();
+			if (size > MAX_HISTORY_BYTES) {
+				// Keep the newest rows that fit. The ID breaks ties when copies arrive in the same millisecond.
+				this.write(`DELETE FROM history WHERE id IN (
+					SELECT id FROM (SELECT id, SUM(size) OVER (ORDER BY at DESC, id DESC) AS retained FROM history)
+					WHERE retained > ?
+				)`, MAX_HISTORY_BYTES);
+			}
+		});
+		return Response.json({ ok: true });
+	}
+
 	async webSocketMessage(ws: WebSocket, msg: ArrayBuffer | string): Promise<void> {
 		if (typeof msg === "string" || msg.byteLength < 1 || msg.byteLength > MAX_ENVELOPE + 64) return ws.close(CLOSE.badMessage, "bad frame");
 		const session = ws.deserializeAttachment() as Session;
@@ -159,6 +231,8 @@ export class Vault extends DurableObject<Env> {
 				// Held while it awaits the owner object, or the device's next frames would arrive before it is let in.
 				const refused = await this.ctx.blockConcurrencyWhile(() => this.admit(f.token, f.owner));
 				if (refused) return ws.close(refused, refused === CLOSE.notOwner ? "owner code needed" : "unauthorized");
+				// History copies expire after 30 days even in a vault where nobody opens history.
+				this.write("DELETE FROM history WHERE at < ?", Date.now() - HISTORY_RETENTION_MS);
 				return ws.serializeAttachment({ ...session, token: this.token });
 			}
 			if (f.t === "subscribe") return this.subscribe(ws, session, f.after);
@@ -292,7 +366,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async erase(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "devices", "usage", "usage_days", "vault_name"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "devices", "usage", "usage_days", "vault_name"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;

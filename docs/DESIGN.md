@@ -34,7 +34,7 @@ Rule: the server only ever participates in the third plane. Any feature that nee
 
 - **Vault master key (VMK).** A random 256-bit key created on the first device. It never leaves a device except wrapped: to another device during pairing or rotation, or to the recovery public key.
 - **Subkeys via HKDF from the VMK:**
-  - seal key, one per device: seals that device's updates, snapshots, presence and attachment chunks (the kind is bound in the AD, so one key serves all of them)
+  - seal key, one per device: seals that device's updates, snapshots, presence, attachment chunks and history copies (the kind is bound in the AD, so one key serves all of them)
   - name key: HMAC that names attachment chunks
   - auth token: proves to the server that a socket belongs to the vault. The server stores only its SHA-256 and rejects anything else.
 - **No per-device signatures in v1.** Every device holds the VMK and the server doesn't, so AES-GCM already stops the server forging or altering content. Signatures would only tell your own devices apart. Each envelope starts with a version byte and a cipher-suite id, both covered by the AD, and receivers reject unknown versions, so signatures can be added as a trailer later (needed for sharing) without breaking old data. Decided 2026-11-13 after an independent review.
@@ -143,15 +143,22 @@ The owner's rule: only a release I author and sign myself can install. Each Work
 - **Failures install nothing** and fail the run.
 - **Limits.** If my release key is stolen, its holder can ship any Worker code; the 3-day wait is the only window to notice, and every updater trusts that key until its Owner replaces the file by hand (there's no rotation). A tag signs a SHA-1 commit ID. Replacing an older updater, or installing the first one, trusts whatever `main` serves that day. The plugin isn't covered: Obsidian downloads `main.js` from the GitHub release with no signature check, so whoever controls this GitHub repository controls the plugin, attested build or not.
 
+## 8. Encrypted history backup
+
+The plugin can upload copies from its local note history and list them from another device. Each copy is a separate encrypted envelope filed under the note's current-epoch document tag. The plugin pads the encoded copy to a power-of-two KiB bucket and skips copies larger than 1 MiB. When opening history, it checks the current epoch, vault, note tag, note ID and copy time. Copies appear newest first by their sealed timestamp. The reported device ID comes from the envelope and is a claim any vault member can make.
+
+After a key rotation, the plugin lists copies from the new epoch. It can clear copies for a note's current tag or for the whole vault. An older Worker leaves local history available. A restore writes the selected text as an ordinary edit, which the sync engine handles like any other edit.
+
 ## What the server can still see
 
 - the number of documents and log entries, their sizes, and edit times and frequency
 - which device is online when, and roughly from where (IP)
 - when a note is open in an editor and its cursor moves (presence frames), though not where or by whom
 - attachment chunk count and sizes, when chunks are uploaded and which device fetches which; that two files in the vault hold the same content (same chunk names)
+- which note tags get history copies, the padded sizes and upload times, and which device's connection sends them
 - the number and size of membership records, when the epoch changes, whether there is a recovery key, and for each rotation the IDs of the devices it wraps the key to and the rotating device's ID and public key (in clear so a recovering device can open its wrap). Device IDs are also in every envelope header.
 
-To reduce this, pad envelopes to fixed size buckets (for example 256 B, 1 KiB, 4 KiB…) and use only random or HMAC-derived IDs.
+History envelopes already use fixed size buckets. Padding other envelope kinds would also reduce the precision of their visible sizes. Identifiers are random or HMAC-derived.
 
 ## Prior art
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { keepCopies, whenLabel, type Copy } from "../src/historyRules";
+import { deletedWhenLabel, keepCopies, mergeCopies, whenLabel, type Copy } from "../src/historyRules";
 
 const HOUR = 60 * 60_000;
 const now = new Date(2026, 10, 22, 15, 0).getTime();
@@ -36,4 +36,29 @@ test("time labels use the local calendar, including across months and years", ()
 	assert.equal(whenLabel(new Date(2026, 10, 21, 9, 5).getTime(), now), "Yesterday 09:05");
 	assert.equal(whenLabel(new Date(2026, 9, 1, 18, 30).getTime(), now), "2026-10-01 18:30");
 	assert.equal(whenLabel(new Date(2025, 11, 31, 23, 55).getTime(), new Date(2026, 0, 1, 0, 5).getTime()), "Yesterday 23:55");
+});
+
+test("deleted notes show elapsed time or an unknown time", () => {
+	assert.equal(deletedWhenLabel(undefined, now), "Time unknown");
+	assert.equal(deletedWhenLabel(now - 59_999, now), "Just now");
+	assert.equal(deletedWhenLabel(now - 60_000, now), "1 minute ago");
+	assert.equal(deletedWhenLabel(now - 2 * HOUR, now), "2 hours ago");
+	assert.equal(deletedWhenLabel(now - 24 * HOUR, now), "1 day ago");
+});
+
+test("history merges newest first and prefers local copies within one minute", () => {
+	const local = { takenAt: now, text: "A", source: "local" };
+	const duplicate = { takenAt: now + 60_000, text: "A", source: "backup" };
+	const later = { takenAt: now + 60_001, text: "A", source: "backup" };
+	const different = { takenAt: now + 59_000, text: "B", source: "backup" };
+	const older = { takenAt: now - HOUR, text: "A", source: "local" };
+	assert.deepEqual(mergeCopies([older, local], [duplicate, different, later]), [later, different, local, older]);
+});
+
+test("copies within one source also deduplicate, keeping the latest timestamp", () => {
+	const first = { takenAt: now, text: "" };
+	const latest = { takenAt: now + 100, text: "" };
+	const copies = [first, latest];
+	assert.deepEqual(mergeCopies(copies, []), [latest]);
+	assert.deepEqual(mergeCopies([], copies), [latest]);
 });

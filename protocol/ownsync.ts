@@ -6,7 +6,7 @@ const te = new TextEncoder();
 
 export const VERSION = 1;
 export const SUITE = 1; // AES-256-GCM, HKDF-SHA256, HMAC-SHA256, ECDH P-256
-export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5 } as const;
+export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5, history: 6 } as const;
 export const RECOVERY_ID = new Uint8Array(16); // member ID of the recovery key pair
 const ZERO_NONCE = new Uint8Array(12); // only for keys that seal exactly one message
 
@@ -109,7 +109,7 @@ export function parseHeader(envelope: Uint8Array): Header {
 	return { kind: r.u8(), epoch: r.u32(), deviceId: r.bytes(16) };
 }
 
-// docId is the document ID for updates, snapshots and presence, and the chunk name for chunks.
+// docId is the document tag for updates, snapshots, presence and history, and the chunk name for chunks.
 export async function sealEnvelope(a: Header & { vmk: Uint8Array; vaultId: Uint8Array; docId: Uint8Array; plaintext: Uint8Array; nonce?: Uint8Array }) {
 	const header = concat(u8(VERSION), u8(SUITE), u8(a.kind), uint(a.epoch, 4), a.deviceId);
 	const nonce = a.nonce ?? randomBytes(12);
@@ -145,6 +145,40 @@ export function unpackEntry(plaintext: Uint8Array): { docId: string; update: Uin
 	const r = new Reader(plaintext);
 	const docId = new TextDecoder().decode(r.bytes(r.u8()));
 	return { docId, update: plaintext.subarray(r.i) };
+}
+
+// --- history copies: UTF-8 JSON padded to a power-of-two KiB bucket ---
+
+const MIN_HISTORY_PLAINTEXT = 1024;
+const MAX_HISTORY_PLAINTEXT = 1024 * 1024;
+export const MAX_HISTORY_ENVELOPE = MAX_HISTORY_PLAINTEXT + HEADER_LEN + 12 + 16;
+const historyDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+export function packHistory(note: string, t: number, text: string): Uint8Array | undefined {
+	if (text.length > MAX_HISTORY_PLAINTEXT) return;
+	const json = te.encode(JSON.stringify({ v: 1, note, t, text }));
+	if (json.length > MAX_HISTORY_PLAINTEXT) return;
+	let size = MIN_HISTORY_PLAINTEXT;
+	while (size < json.length) size *= 2;
+	const padded = new Uint8Array(size);
+	padded.set(json);
+	return padded;
+}
+
+export function unpackHistory(plaintext: Uint8Array, note: string, now = Date.now()): { takenAt: number; text: string } | undefined {
+	const size = plaintext.length;
+	if (size < MIN_HISTORY_PLAINTEXT || size > MAX_HISTORY_PLAINTEXT || (size & (size - 1)) !== 0) return;
+	let end = size;
+	while (end > 0 && plaintext[end - 1] === 0) end--;
+	try {
+		const copy = JSON.parse(historyDecoder.decode(plaintext.subarray(0, end)));
+		if (copy?.v !== 1 || typeof copy.note !== "string" || copy.note !== note || typeof copy.text !== "string") return;
+		const { t, text } = copy;
+		if (!Number.isSafeInteger(t) || t < 0 || t > now + 5 * 60_000) return;
+		return { takenAt: t, text };
+	} catch {
+		return undefined;
+	}
 }
 
 // --- rotation wraps: es + ss ECDH, so the recipient authenticates the sender ---

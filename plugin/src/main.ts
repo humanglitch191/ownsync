@@ -1,10 +1,11 @@
 import { type App, type EventRef, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, apiVersion, requestUrl, setIcon } from "obsidian";
 import { cleanName } from "./collab";
-import { hex, randomBytes, sha256 } from "../../protocol/ownsync";
+import { docTag, hex, randomBytes, sha256 } from "../../protocol/ownsync";
 import { Engine } from "./core/engine";
 import { RecoverModal, chooseFork, createVault, removeDevice, replaceRecovery } from "./devices";
 import { installConflictNotice } from "./conflicts";
 import { installHistory } from "./history";
+import { createHistoryBackup } from "./historyBackup";
 import { redactProblem } from "./diagnostics";
 import { Editors, editorBinding } from "./editors";
 import { IdbStore } from "./idbStore";
@@ -51,6 +52,7 @@ interface Session {
 	engine: Engine;
 	editors: Editors;
 	transport: Transport;
+	historyBackup: ReturnType<typeof createHistoryBackup>;
 	stop(): Promise<void>;
 }
 
@@ -120,7 +122,10 @@ export default class OwnsyncPlugin extends Plugin {
 		const wake = () => { if (document.visibilityState === "visible" && this.status === "offline") void this.session?.transport.connect().catch(() => {}); };
 		this.registerDomEvent(document, "visibilitychange", wake);
 		this.registerDomEvent(window, "online", wake);
-		installHistory(this);
+		installHistory(this, () => this.session && {
+			client: this.session.historyBackup,
+			connected: this.session.transport.status === "synced",
+		});
 		this.app.workspace.onLayoutReady(async () => {
 			await this.restart();
 			if (!this.hasKey() && !this.settings.welcomed) {
@@ -144,6 +149,8 @@ export default class OwnsyncPlugin extends Plugin {
 	}
 
 	// What was last told to the server, so it's only told again when something changes.
+	/** The running engine, for the history screens (undefined while the vault isn't set up). */
+	engine = () => this.session?.engine;
 	private sentNames = "";
 	readonly namesChanged = debounce(() => void this.reportNames(), 1500, true);
 
@@ -256,6 +263,16 @@ export default class OwnsyncPlugin extends Plugin {
 			version: `${this.manifest.version}${Platform.isMobile ? " mobile" : ""}${this.settings.attachments ? "" : " notes-only"}`,
 			conflicts: () => vault.getFiles().filter((f) => disk.synced(f) && (f.path.includes(" (conflict ") || f.path.includes(" (recovered "))).length,
 		});
+		const historyBackup = createHistoryBackup({
+			host, vaultId: keys.vaultId, keys, token: () => keys.token(),
+			docTag: (id) => docTag(keys.vmk, keys.vaultId, id),
+			allDocTags: (id) => Promise.all(keys.vmks.map((vmk) => docTag(vmk, keys.vaultId, id))),
+			noteIdForPath: (path) => engine.noteAt(path),
+			requestUrl: async (request) => {
+				if (this.session?.transport !== transport || transport.status !== "synced") throw new Error("Ownsync is offline.");
+				return requestUrl(request);
+			},
+		});
 		const refresh = debounce(() => { editors.refresh(); report(); }, 50, true);
 		const report = debounce(() => transport.report(), 5000);
 		const refs: [{ offref(ref: EventRef): void }, EventRef][] = [
@@ -280,8 +297,10 @@ export default class OwnsyncPlugin extends Plugin {
 		void transport.connect().catch((err) => problem("connecting", err));
 		editors.refresh();
 		return {
-			keys, engine, editors, transport,
+			keys, engine, editors, transport, historyBackup,
 			stop: async () => {
+				// Uploads already sent finish first, so a Forget in the next session can't be overtaken by one. At most 5 s.
+				await Promise.race([historyBackup.idle(), new Promise((done) => window.setTimeout(done, 5000))]);
 				for (const [owner, ref] of refs) owner.offref(ref);
 				await editors.stop();
 				transport.disconnect();

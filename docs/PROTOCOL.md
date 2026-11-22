@@ -1,6 +1,6 @@
 # Ownsync protocol v1
 
-Status: draft, 2026-11-14. Covers keys, envelopes, rotation, recovery, the membership log and pairing. Wire messages to the Worker are specified in `server/src/wire.ts`; padding is not specified yet (see "Not yet specified").
+Status: draft, 2026-11-14. Covers keys, envelopes, rotation, recovery, the membership log, pairing and history backup. WebSocket frames are specified in `server/src/wire.ts`.
 
 The reference implementation is `protocol/ownsync.ts`, and `protocol/vectors.json` holds fixed test vectors. `cd protocol && npm test` checks the code against them; `npm run vectors` rewrites the outputs after a deliberate format change. Any other implementation (plugin, headless client) must reproduce every output in `vectors.json`. Design reasoning is in `DESIGN.md` section 1; this file states only the rules.
 
@@ -21,7 +21,7 @@ Every key below comes from the VMK of one epoch, with `salt = vaultId`.
 
 | Key | Derivation | Use |
 |---|---|---|
-| seal key | `HKDF(VMK, vaultId, L("seal") \| deviceId)` | seals that device's envelopes: updates, snapshots, presence, attachment chunks |
+| seal key | `HKDF(VMK, vaultId, L("seal") \| deviceId)` | seals that device's updates, snapshots, presence, attachment chunks and history copies |
 | name key | `HKDF(VMK, vaultId, L("name"))` | with epoch 0's VMK: names attachment chunks; with the current one: document tags |
 | auth token | `HKDF(VMK, vaultId, L("auth"))` | sent in `hello`; the server stores only `SHA-256(auth token)` |
 | member key | `HKDF(VMK, vaultId, L("member"))` | encrypts membership records |
@@ -38,7 +38,7 @@ AD       = header | vaultId | docId
 key      = seal key of (VMK of epoch, deviceId)
 ```
 
-- `kind`: 1 update, 2 snapshot, 3 presence, 4 attachment chunk, 5 update part.
+- `kind`: 1 update, 2 snapshot, 3 presence, 4 attachment chunk, 5 update part, 6 history copy.
 - **Update parts.** A Worker WebSocket frame holds at most 1 MiB, so an update larger than `PART_SIZE` (512 KiB) is split. Each part is its own kind-5 envelope with plaintext `groupId(16) | u16 index | u16 count | bytes`. The server stores parts as ordinary log entries. A receiver applies the update only when every part of the group has arrived. A group that never completes is resent whole by its sender's next catch-up. A snapshot can't be split yet, so a device sends no snapshot larger than `PART_SIZE`.
 - For chunks, `docId` in the AD is the chunk name.
 - `nonce` is 12 random bytes.
@@ -178,6 +178,22 @@ Binary WebSocket frames, `u8 type | fields`, specified in the header of `server/
 
 A connection starts with `fetch` (from the head's number, so the device sees whether the server still holds its head), takes in the records, then sends `hello` with the token of the epoch it is now in, and `append` or `rotate` if it has a record to add. A rotation is sent only once the device is caught up.
 
+## History backup
+
+Kind 6 is used only by these HTTP endpoints. WebSocket entries, live frames and chunk downloads refuse it. The plaintext is UTF-8 JSON with `v` equal to `1`, `note` holding the permanent note ID, `t` holding the copy time in Unix milliseconds and `text` holding the note text. The sender appends zero bytes up to the smallest bucket that fits, from 1 KiB through 1 MiB in powers of two, and skips anything larger. The receiver removes trailing zero bytes before decoding JSON.
+
+Seal with the current epoch's VMK and use that epoch's document tag as `docId` in the envelope's associated data. A receiver skips a copy unless its kind is 6, its epoch is current, AES-GCM verifies for the requested vault and tag, the plaintext matches the requested note ID and `t` is an integer timestamp at most five minutes ahead of the receiver's clock. Clients sort by the sealed copy time, newest first. The header's device ID is a claim made by a vault member.
+
+All three requests are binary `POST`s under `/vault/{vaultId hex}`. The leading 32 bytes are the current vault auth token.
+
+| Path suffix | Request body | `200` response |
+|---|---|---|
+| `/history` | `token[32] \| docTag[16] \| envelope` | Upload acknowledged |
+| `/history/list` | `token[32] \| docTag[16]` | `application/octet-stream` with up to 200 `u32 envelopeLength \| envelope` records, newest upload first |
+| `/history/clear` | `token[32] \| docTag[16]` for one note's current tag, or `token[32]` for the entire vault | Clear acknowledged |
+
+A `404` leaves only local history available. A `401` or `410` disables backup requests for the remainder of the vault session.
+
 ## Key storage on the device
 
 - The key ring, `{ "<epoch>": "<hex VMK>" }` as JSON, in Obsidian's secret storage under `ownsync-ring-<vault ID>`.
@@ -185,4 +201,4 @@ A connection starts with `fetch` (from the head's number, so the device sees whe
 
 ## Not yet specified
 
-- Envelope padding to fixed size buckets. A future version byte can add it.
+- Fixed size padding for envelope kinds other than history.
