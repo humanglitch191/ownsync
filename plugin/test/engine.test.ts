@@ -167,6 +167,46 @@ test("a deleted note restored onto a path another note took comes back under a n
 	noProblems([a!, b!]);
 });
 
+test("a file made where a crash cut short a remote deletion is a new note, so restoring the deleted one loses nothing", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "old");
+	await quiesce([a!, b!]);
+	const id = a!.engine!.noteAt("Note.md")!;
+	a!.remove("Note.md");
+	while (a!.events.length) a!.events.shift()!();
+	await a!.idle();
+	while (a!.pumpUp()) { /* to the server */ }
+	// B dies right after removing the file for the deletion, before recording anything: find that point.
+	const files = structuredClone([...b!.files]), data = structuredClone([...b!.data]);
+	const conn = () => b!.server.conns.get(b!)!, pending = [...conn().down];
+	for (let fuse = 1; ; fuse++) {
+		assert.ok(fuse < 30, "no crash point right after the file's removal");
+		b!.crash(fuse);
+		while (b!.pumpDown()) { /* deliver */ }
+		await b!.idle();
+		if (!b!.alive && !b!.files.has("Note.md")) break;
+		if (b!.alive) b!.crash();
+		b!.files = new Map(structuredClone(files));
+		b!.data = new Map(structuredClone(data));
+		b!.boot();
+		b!.connect();
+		await b!.idle();
+		while (b!.pumpUp()) { /* subscribe */ }
+		conn().down = [...pending];
+		conn().live = true;
+	}
+	b!.write("Note.md", "new"); // the user, seeing no file, makes a new one there while the app is closed
+	b!.boot();
+	await b!.idle();
+	await a!.engine!.restoreDeleted(id);
+	await quiesce([a!]);
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(Object.values(disk(a!)).sort(), ["new", "old"]);
+	assert.deepEqual(disk(b!), disk(a!));
+	noProblems([a!, b!]);
+});
+
 test("Recently deleted lists the last 30 days, at most 200 notes, newest first", async () => {
 	let now = 1_800_000_000_000;
 	const server = new Server(), a = new Device("a", server, rng(1));

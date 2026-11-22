@@ -842,7 +842,8 @@ export class Engine {
 				loose.set(path, theirs); // perhaps a different file now sits at the note's path
 				// Only a note whose file was here can claim it however much it changed. One that was only about to be
 				// written here (the engine stopped first) has no file yet: a different text here is someone else's.
-				if (m.baseHash !== undefined) home.set(id, path);
+				// A deleted note's file had to go: a different text there is a new note.
+				if (m.baseHash !== undefined && this.notes.get(id)?.d === undefined) home.set(id, path);
 			}
 			adrift.set(id, mine);
 		}
@@ -1098,6 +1099,9 @@ export class Engine {
 				// Only a recorded deletion removes the file. A note missing from the index altogether is one whose index
 				// entry hasn't arrived yet (it waits inside Yjs for an update this device lacks): leave it be until then.
 				if (this.notes.get(id) === undefined) return true;
+				// The deletion on record before the file goes: else, after a crash here, a new file the user puts
+				// at this path would be taken for this note, rewritten, and its edit would erase a later restore.
+				await this.flush();
 				await this.disk.remove(m.diskPath);
 				this.forget(id);
 				if (open) {
