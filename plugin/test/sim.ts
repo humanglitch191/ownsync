@@ -75,6 +75,8 @@ export class Device {
 	trace: ((line: string) => void) | null = null;
 	/** Engine options a test wants different from the simulator's defaults. */
 	overrides: Partial<EngineOptions> = {};
+	/** How many of the next database commits fail, as a full or broken IndexedDB would. */
+	failCommits = 0;
 	private clock = 1;
 	private life = { dead: true, fuse: Infinity };
 
@@ -181,6 +183,7 @@ export class Device {
 			list: async <T>(prefix: string) => (step(), [...this.data].filter(([k]) => k.startsWith(prefix)).map(([k, v]) => [k, structuredClone(v) as T] as [string, T])),
 			commit: async (puts, deletes) => {
 				step(); // all or nothing
+				if (this.failCommits > 0 && this.failCommits--) throw new Error("the local database refused a write");
 				this.trace?.(`${this.name} commits ${[...puts].map(([k, v]) => (k.startsWith("note:") ? `${k}@${(v as { diskPath?: string }).diskPath ?? "-"}` : k)).join(" ")}${[...deletes].length ? ` del ${[...deletes].join(" ")}` : ""}`);
 				for (const k of deletes) this.data.delete(k);
 				for (const [k, v] of puts) this.data.set(k, structuredClone(v));

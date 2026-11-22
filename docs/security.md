@@ -38,6 +38,7 @@ The vault key lives in Obsidian's secret storage (Obsidian 1.11.4 or later), nev
 
 - **Account:** a Cloudflare account (the free plan is enough) runs your Worker. I can't see it or sign in to it.
 - **Updates:** your Worker runs code I publish. Its updater installs only releases signed with my own release key, which never leaves my laptop, and only 3 days after it first sees one. You can turn it off ([updating](updating.md)).
+- **Plugin updates** come from Obsidian, which downloads them from this project's GitHub releases without checking a signature. So the plugin is only as safe as my GitHub account. Each release carries a build attestation, so you can check its files were built by GitHub from the signed release tag: `gh attestation verify main.js -R humanglitch191/ownsync`.
 - **Network:** the plugin connects only to your Worker.
 - **Your vault:** to sync it, the plugin lists and reads every file in it (except Obsidian's settings folder), and writes what arrives from your other devices.
 - **Clipboard:** written only when you press a Copy button (a pairing link, a code); never read.

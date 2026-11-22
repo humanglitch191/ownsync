@@ -2,14 +2,14 @@
 
 End-to-end encrypted, real-time collaborative sync for Obsidian. A Cloudflare Worker (one Durable Object per vault) relays and stores only ciphertext, while devices still see each other's edits live, in real time.
 
-Status: design draft, 2026-11-13. Nothing is built yet.
+Status: started as a design draft on 2026-11-13; kept up to date with what's built (0.2.0). Section 8 onwards covers note history, Recently deleted and vault snapshots.
 
 ## Goal
 
 - Edits from one device appear on others within about a second, character by character.
 - The server (Cloudflare) can't read note text, file names, folder structure or attachments.
 - Works on Obsidian desktop and iOS, offline first.
-- Out of scope for v1: sharing with other people (the key design leaves room for it, see "Later").
+- Out of scope for v1: sharing part of a vault with other people (the key design leaves room for it, see "Later"). People can already collaborate by joining the vault as a device: they then see and edit every note.
 
 ## The core idea: three planes
 
@@ -111,6 +111,8 @@ It is tested by a fuzzer (`plugin/test/engine.fuzz.test.ts`): three simulated de
 - `idbStore.ts`, `vaultDisk.ts`: the local database and the vault's files, as the engine sees them. `vaultDisk.ts` refuses paths from other devices that leave the vault or enter its settings or hidden folders.
 - `editors.ts`: binds each markdown editor that is on screen in edit mode to its note's document (`y-codemirror.next`). Reading view and tabs not loaded yet count as closed.
 - `collab.ts`: what a bound editor adds. Each note shown here has a y-protocols `Awareness` (cursor, device name, colour), cleared when the last editor showing it unbinds and timed out 30 s after a device stops renewing it. Arriving presence is cleaned first: a name of at most 40 characters without control characters, rendered as text; a `#rrggbb` colour; a well-formed cursor or none; never this device's own state. Frames from one device arrive in order, so the newest wins, whatever its clock. Undo uses a `Y.UndoManager` per editor that tracks only that editor's own changes, so another device's typing (and the engine's own merges) are never undone. It takes Mod-z, Mod-y and Mod-Shift-z at highest precedence over Obsidian's CodeMirror history, the platform's `historyUndo`/`historyRedo` input events, and the editor's `undo()`/`redo()`, which Obsidian's Undo command and the phone toolbar call directly. Unbound editors keep Obsidian's undo.
+- **Other people.** Someone else edits the vault by pairing their device like any other (section 1): they can read and change every note, and are removed like a device. While pairing, a device can be given a name ("Anna's iPhone 17 Pro"), shown next to its cursor and on the dashboard; there is no separate person or account.
+- **Note links.** Copy URL gives `https://<Worker>/open/#<vault ID>/<note ID>`: the note ID, so a rename doesn't break it. The page (`server/public/open/`, its own script only) passes the fragment, which never reaches the Worker, to `obsidian://ownsync-open?vaultId=…&note=…` (not `vault=`, which Obsidian reads as a vault name). The plugin takes only a 32-hex vault ID equal to its own and a 16-hex note ID, and only opens that note.
 - `pairing.ts`: QR pairing (section 1). `devices.ts`: the recovery kit, device removal, recovery and fork dialogs. `main.ts`: settings, status, commands.
 - The key ring (every epoch's VMK this device holds, as JSON) is kept in Obsidian's secret storage (`app.secretStorage`, Obsidian 1.11.4 and later), not in the vault folder; the device's key pair and its view of the membership log are in the vault's IndexedDB store. A key found in local storage, where earlier versions kept it, is moved on start.
 
@@ -128,7 +130,7 @@ The Worker's site is the owner's dashboard, signed in with a passkey. It shows o
 - **Vaults.** Registered by the Owner when created. Listed by short vault ID with an optional label (stored readable, said so), devices, last change and storage; "Connect a vault" with install steps and an Open in Obsidian button.
 - **Free-plan meter.** Storage (each Vault's `sql.databaseSize`, summed) against 5 GB, and today's requests and rows written (per-Vault daily counters, written along with activity at most once a minute and when the last device leaves, reset 00:00 UTC, the last 14 days kept for the activity bars) against 100,000 each; incoming WebSocket messages count at Cloudflare's 20 to one. Warns from 80%.
 - **Deleting a vault** is in Obsidian (Settings → Ownsync → Advanced), from a device with the current token, after typing the vault's short ID. The Vault keeps a tombstone: it can't be created again, and its devices are told "deleted on the server" (close 4004). The notes on devices stay.
-- **Not built (owner decisions):** backups and restore (a restore needs rollback protection first), recovery with a passkey (it would put the Cloudflare account in the trust path for the recovery code), and any page hosted elsewhere than the Worker.
+- **Not built (owner decisions):** restoring the whole vault from the dashboard (encrypted history copies and vault snapshots exist, sections 8 and 9, but only a device can open them), recovery with a passkey (it would put the Cloudflare account in the trust path for the recovery code), and any page hosted elsewhere than the Worker.
 - **Tests.** `server/test/dashboard.test.ts` runs setup, the race, the window, the lockout and replacing passkeys with a software authenticator (`server/test/passkey.ts`, real CBOR and ES256).
 
 ## 7. Updates (2026-11-22)
@@ -143,13 +145,17 @@ The owner's rule: only a release I author and sign myself can install. Each Work
 - **Failures install nothing** and fail the run.
 - **Limits.** If my release key is stolen, its holder can ship any Worker code; the 3-day wait is the only window to notice, and every updater trusts that key until its Owner replaces the file by hand (there's no rotation). A tag signs a SHA-1 commit ID. Replacing an older updater, or installing the first one, trusts whatever `main` serves that day. The plugin isn't covered: Obsidian downloads `main.js` from the GitHub release with no signature check, so whoever controls this GitHub repository controls the plugin, attested build or not.
 
-## 8. Encrypted history backup
+## 8. Note history, Recently deleted and history backup
 
-The plugin can upload copies from its local note history and list them from another device. Each copy is a separate encrypted envelope filed under the note's current-epoch document tag. The plugin pads the encoded copy to a power-of-two KiB bucket and skips copies larger than 1 MiB. When opening history, it checks the current epoch, vault, note tag, note ID and copy time. Copies appear newest first by their sealed timestamp. The reported device ID comes from the envelope and is a claim any vault member can make.
+**Local note history.** Each device keeps copies of the notes edited on it in its own IndexedDB, at most one every 10 minutes per note: everything from the last day, then one a day per note for 30 days, up to 50 MB in all. Only an explicit restore writes to the vault.
+
+**Recently deleted.** A deleted note's ID stays in the synced index, marked deleted, and every device keeps its state (see "Deleted notes keep their state" below). So any device can list deleted notes and bring one back; the restore is an ordinary change to the index that syncs like any other.
+
+**Encrypted history backup.** The plugin can upload copies from its local note history and list them from another device. Each copy is a separate encrypted envelope filed under the note's current-epoch document tag. The plugin pads the encoded copy to a power-of-two KiB bucket and skips copies larger than 1 MiB. When opening history, it checks the current epoch, vault, note tag, note ID and copy time. Copies appear newest first by their sealed timestamp. The reported device ID comes from the envelope and is a claim any vault member can make.
 
 Uploads wait a random 30 seconds to 5 minutes. On session stop, the plugin drops unsent uploads and keeps their local copies. Pending clears and requests already on the wire get up to five seconds to finish.
 
-After a key rotation, the plugin lists copies from the new epoch. It can clear copies for a note's current tag or for the whole vault. An older Worker leaves local history available. A restore writes the selected text as an ordinary edit, which the sync engine handles like any other edit.
+After a key rotation, the plugin lists copies from the new epoch. It can clear copies for a note's current tag or for the whole vault. An older Worker leaves local history available. The Worker keeps copies for 30 days and at most 50 MiB per vault, dropping the oldest first; that counts toward the vault's Durable Object storage. A restore writes the selected text as an ordinary edit, which the sync engine handles like any other edit.
 
 ## 9. Encrypted whole-vault snapshots
 

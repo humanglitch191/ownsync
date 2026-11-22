@@ -199,10 +199,10 @@ test("an expired multipart upload starts again from zero and records the new cip
 		await Promise.all([...f.uploaded.values()].map(async (bytes) => hex(await sha256(bytes)))));
 });
 
-test("mobile snapshots enforce 96 MiB before serializing or opening a vault", async () => {
+test("mobile snapshots take at most 32 MiB, checked before serializing, and open at most 96 MiB", async () => {
 	const f = fixture(true);
 	f.deps.listNotes = function* () {
-		yield { ...note, text: "\n".repeat(48 * 1024 * 1024 + 1) };
+		yield { ...note, text: "\n".repeat(16 * 1024 * 1024 + 1) };
 		assert.fail("preflight should stop reading notes when their JSON exceeds the limit");
 	};
 	assert.equal(await f.snapshots.takeIfDue(), "too large");

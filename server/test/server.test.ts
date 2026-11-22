@@ -3,6 +3,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
+import { request } from "node:http";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SNAPSHOT_BUDGET, snapshotsToPrune } from "../src/snapshots.ts";
@@ -419,6 +420,11 @@ test("history evicts the oldest copy when uploads exceed the vault's 50 MiB limi
 	assert.equal(await listMarker(), 5);
 	await upload(copy);
 	assert.equal(await listMarker(), 0);
+	// The running total follows a clear: a fresh copy is not evicted by bytes that are gone.
+	assert.equal((await fetch(`${root}/clear`, { method: "POST", body: tok })).status, 200);
+	await upload(Buffer.concat([marker, Uint8Array.of(1)]));
+	await upload(copy);
+	assert.equal(await listMarker(), 5);
 });
 
 const snapshotPost = (v: string, path: string, ...parts: Uint8Array[]) => fetch(`http://localhost:${PORT}/vault/${v}/${path}`, { method: "POST", body: Buffer.concat(parts) });
@@ -647,4 +653,51 @@ test("deleting a vault takes its token; then its devices are told 4004, it can't
 	assert.equal(await post("delete", tok), 410);
 	assert.equal(await post("names", new Uint8Array([...tok, ...bytes("{}")])), 410);
 	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: true, devices: [] });
+});
+
+test("history expiry has an index on its time, so it doesn't scan the table", async () => {
+	const { a, db } = await snapshotVaultWithDb();
+	assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'history_at'").get());
+	db.close();
+	a.ws.close();
+});
+
+test("delete and names read at most a small body before checking the token", async () => {
+	const v = vault(), tok = token();
+	const a = await connect(v, tok);
+	await a.catchUp(0);
+	for (const path of ["delete", "names"]) {
+		// A body that never ends: answered after the first bytes, not read to the end.
+		// Announces 1 GB and sends only the start: answered without waiting for the rest.
+		const status = await new Promise<number | undefined>((resolve, reject) => {
+			const req = request({ port: PORT, host: "localhost", method: "POST", path: `/vault/${v}/${path}`, agent: false, headers: { "content-length": String(1 << 30) } });
+			const timer = setTimeout(() => (req.destroy(), resolve(undefined)), 10_000);
+			req.on("response", (res) => (clearTimeout(timer), req.destroy(), resolve(res.statusCode)));
+			req.on("error", (err) => (clearTimeout(timer), reject(err)));
+			req.write(new Uint8Array(64 * 1024));
+		});
+		assert.equal(status, 401);
+	}
+	const big = await fetch(`http://localhost:${PORT}/vault/${v}/names`, { method: "POST", body: new Uint8Array([...tok, ...bytes(JSON.stringify({ vault: "x".repeat(1100) }))]) });
+	assert.equal(big.status, 413);
+	a.ws.close();
+});
+
+test("a request for a vault that doesn't exist leaves no storage behind", async () => {
+	const directory = join(dev.persistDir, "v3/do/ownsync-Vault");
+	const existing = new Set(readdirSync(directory));
+	const v = vault();
+	assert.equal((await fetch(`http://localhost:${PORT}/vault/${v}/names`, { method: "POST", body: new Uint8Array(40) })).status, 401);
+	assert.equal((await fetch(`http://localhost:${PORT}/vault/${v}/history/list`, { method: "POST", body: new Uint8Array(48) })).status, 401);
+	const bare = await connect(v);
+	bare.send({ t: "fetch", from: 0 });
+	assert.deepEqual(await bare.records(), { got: [], recovery: "" });
+	bare.send({ t: "hello", token: token() }); // no owner code
+	assert.equal(await bare.closed, CLOSE.notOwner);
+	for (const file of readdirSync(directory).filter((f) => f.endsWith(".sqlite") && !existing.has(f))) {
+		const db = new DatabaseSync(join(directory, file));
+		const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'").all();
+		db.close();
+		assert.deepEqual(tables, []);
+	}
 });

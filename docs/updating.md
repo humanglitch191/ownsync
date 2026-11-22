@@ -14,9 +14,9 @@ It updates itself. Once a day, a workflow in **your Ownsync repository** (the on
 
 Then Cloudflare redeploys your Worker from it in a minute or two. Your vaults, devices and passkeys stay as they are.
 
-**Don't want to wait?** Press **Update** on your dashboard, or in your repository go to **Actions → Update Ownsync → Run workflow**. That skips the 3 days, never the signature.
+**Don't want to wait?** Press **Update** on your dashboard. It opens the updater on GitHub; press **Run workflow** there. (Or go there yourself: in your repository, **Actions → Update Ownsync → Run workflow**.) That skips the 3 days, never the signature.
 
-**Updates that change how your Worker stores data** never install on their own. The daily run fails with "This update changes how your Worker stores data; press Run workflow to install it", and GitHub emails you. Press it when you're ready.
+**Updates that change how your Worker stores data** never install on their own. The daily run fails with "Ownsync x.y.z changes how your Worker stores data; press Run workflow to install it." (x.y.z is the new version), and GitHub emails you. Press it when you're ready.
 
 **To stay on your version,** turn the updater off: **Actions → Update Ownsync → ⋯ → Disable workflow**. Enable it again to catch up.
 

@@ -118,7 +118,8 @@ test("another device can list and restore a deleted note with a full snapshot", 
 	await quiesce(devs);
 	assert.deepEqual(disk(a), {});
 	assert.deepEqual(disk(b), {});
-	assert.deepEqual(await b.engine!.deletedNotes(), [{ id, path, deletedAt, text }]);
+	assert.deepEqual(await b.engine!.deletedNotes(), [{ id, path, deletedAt }]);
+	assert.equal(await b.engine!.deletedText(id), text);
 
 	// C keeps its index and cursor but drops the deleted note's state. It will only read new entries.
 	c.crash();
@@ -144,6 +145,93 @@ test("another device can list and restore a deleted note with a full snapshot", 
 	await quiesce(devs);
 	assert.deepEqual(disk(c), disk(a));
 	noProblems(devs);
+});
+
+test("a deleted note restored onto a path another note took comes back under a new name, leaving that note alone", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "old text");
+	await quiesce([a!, b!]);
+	const old = a!.engine!.noteAt("Note.md")!;
+	a!.remove("Note.md");
+	await quiesce([a!, b!]);
+	b!.write("Note.md", "new text");
+	await quiesce([a!, b!]);
+	const live = b!.engine!.noteAt("Note.md")!;
+	assert.notEqual(live, old);
+	assert.equal(await a!.engine!.restoreDeleted(old), "Note (restored).md");
+	await quiesce([a!, b!]);
+	for (const d of [a!, b!]) {
+		assert.deepEqual(disk(d), { "Note.md": "new text", "Note (restored).md": "old text" });
+		assert.equal(d.engine!.noteAt("Note.md"), live);
+	}
+	noProblems([a!, b!]);
+});
+
+test("Recently deleted lists the last 30 days, at most 200 notes, newest first", async () => {
+	let now = 1_800_000_000_000;
+	const server = new Server(), a = new Device("a", server, rng(1));
+	a.overrides.now = () => now;
+	a.boot();
+	a.connect();
+	const DAY = 24 * 60 * 60 * 1000;
+	a.write("Old.md", "old");
+	await quiesce([a]);
+	a.remove("Old.md");
+	await quiesce([a]);
+	now += 31 * DAY;
+	for (let i = 0; i < 201; i++) a.write(`N${i}.md`, `note ${i}`);
+	await quiesce([a]);
+	for (let i = 0; i < 201; i++) { now += 1000; a.remove(`N${i}.md`); await quiesce([a]); }
+	const listed = await a.engine!.deletedNotes();
+	assert.equal(listed.length, 200);
+	assert.deepEqual(listed.slice(0, 2).map((n) => n.path), ["N200.md", "N199.md"]);
+	assert.ok(!listed.some((n) => n.path === "Old.md" || n.path === "N0.md"));
+	assert.equal(await a.engine!.deletedText(listed[0]!.id), "note 200");
+	noProblems([a]);
+});
+
+// The failures the test caused, and nothing else.
+const onlyRefusedWrites = (devs: Device[]) => assert.deepEqual(devs.flatMap((d) => d.problems).filter((p) => !p.includes("the local database refused a write")), []);
+
+test("a failed database commit loses no remote edit, even after later commits move the cursor on", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "one");
+	await quiesce([a!, b!]);
+	// Read from the stored entry alone (no live copy of the edit to mask the loss), and its commit fails.
+	b!.disconnect();
+	a!.write("Note.md", "one two");
+	await quiesce([a!, b!]);
+	b!.failCommits = 1;
+	b!.connect();
+	await quiesce([a!, b!]);
+	a!.write("Note.md", "one two three");
+	await quiesce([a!, b!]);
+	assert.equal(b!.failCommits, 0);
+	b!.crash();
+	b!.boot();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "Note.md": "one two three" });
+	onlyRefusedWrites([a!, b!]);
+});
+
+test("a catch-up page whose commit fails is read again, not left waiting for the next connection", async () => {
+	const { devs: [a, b] } = world();
+	b!.disconnect();
+	for (let i = 0; i < 5; i++) a!.write(`N${i}.md`, `note ${i}`);
+	await quiesce([a!]);
+	b!.connect();
+	// The last entry of the first page fails to commit, and so does the page's end, which would ask for the next.
+	for (let more = false; !more;) {
+		while (b!.pumpUp());
+		if (b!.server.conns.get(b!)!.down[1]?.t === "more") { b!.failCommits = 2; more = true; }
+		b!.pumpDown();
+		await b!.idle();
+	}
+	await quiesce([a!, b!]);
+	assert.equal(b!.failCommits, 0);
+	assert.deepEqual(disk(b!), disk(a!));
+	onlyRefusedWrites([a!, b!]);
 });
 
 test("the snapshot ledger syncs, survives a full index snapshot and supports selective removal", async () => {

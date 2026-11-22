@@ -9,8 +9,9 @@ import type { createHistoryBackup } from "./historyBackup";
 import { MAX_BYTES, type Copy, deletedWhenLabel, diffLines, keepCopies, mergeCopies, whenLabel } from "./historyRules";
 
 interface DeletedNotesEngine {
-	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number; text: string }[]>;
-	restoreDeleted(id: string, path?: string): Promise<void>;
+	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number }[]>;
+	deletedText(id: string): Promise<string | undefined>;
+	restoreDeleted(id: string, path?: string): Promise<string | undefined>;
 }
 
 export interface HistoryHost {
@@ -510,16 +511,16 @@ class HistoryModal extends Modal {
 				const now = Date.now();
 				rows = [...entries].sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity)).map((entry) => ({
 					label: `${entry.path} (${deletedWhenLabel(entry.deletedAt, now)})`,
-					read: async () => entry.text,
+					read: () => engine.deletedText(entry.id),
 					restore: {
 						prompt: `Restore ${entry.path} to the vault?`,
-						comparePrompt: "A note already uses this path. The comparison shows how the deleted copy differs.",
+						comparePrompt: "A note already uses this path. The restored note will get a new name.",
 						compare: () => this.readAtPath(entry.path),
 						apply: async (_, current) => {
 							if (await this.readAtPath(entry.path) !== current) throw new Error("The note at this path changed. Select the copy again to review it.");
 							if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
-							await engine.restoreDeleted(entry.id);
-							new Notice("Note restored.");
+							const path = await engine.restoreDeleted(entry.id);
+							new Notice(path ? `Restored ${path}.` : "Note restored.");
 						},
 					},
 				}));

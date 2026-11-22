@@ -14,6 +14,7 @@ I wanted my notes on my laptop and my phone, in sync as I type, without handing 
 - **Live.** Edits show up on your other devices in under a second.
 - **Yours.** Only your devices hold the key. No account with me, nothing collected.
 - **Offline first.** Edit anywhere. It merges when you're back.
+- **History.** Earlier versions of each note, Recently deleted notes, and if you turn them on, daily encrypted snapshots of the whole vault on your Worker.
 - **Tested hard.** 500,000 random crashes, renames and reconnects, and not one note lost. [Results](https://ownsync.dev/docs/stress-test-results/).
 - **Free.** Runs on Cloudflare's free plan. Open source.
 
@@ -31,6 +32,7 @@ To add your phone, scan the QR code under Settings → Ownsync → Add a device.
 
 ## Good to know
 
+- Working with someone else? They can join your vault as a device. They then see and edit every note, and their edits show up live like yours.
 - It needs a free Cloudflare account, and the free plan is plenty for one person's notes. For more, Workers Paid is $5 a month. [Cost and limits](https://ownsync.dev/docs/cost-and-limits/).
 - The plugin only talks to your Worker. It reads every file in your vault to sync it, and uses the clipboard only when you press Copy. No telemetry, no ads.
 - Your Worker sees when your devices connect and how much is stored, never what you wrote. [What it can and can't see](https://ownsync.dev/docs/security/).

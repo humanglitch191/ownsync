@@ -136,6 +136,7 @@ async function run(seed: number, steps: number): Promise<void> {
 				const target = restoreRandom() < 0.5 ? undefined : NOTE_PATHS[Math.floor(restoreRandom() * NOTE_PATHS.length)];
 				const path = isCopy(note.path) ? undefined : target; // as with renames, keep recovery copies named as copies
 				log.push(`${d.name} restores ${note.path}${path ? ` → ${path}` : ""} (${note.id.slice(0, 6)})`);
+				const text = (await engine.deletedText(note.id)) ?? "";
 				await engine.restoreDeleted(note.id, path);
 				// A peer that still sees the old live note can reconcile an unprocessed delete and recreate
 				// as a text replacement. Its legitimate CRDT text deletion can merge after this restore.
@@ -148,7 +149,7 @@ async function run(seed: number, steps: number): Promise<void> {
 					const content = path ? peer.files.get(path)?.content : undefined;
 					return { peer, text: typeof content === "string" ? content : "" };
 				});
-				for (const t of tokensIn(note.text)) {
+				for (const t of tokensIn(text)) {
 					if (!livePeers.some(({ peer, text }) => removedBy.get(peer)!.has(t) && !text.includes(t))) restored.set(t, note.id);
 				}
 			}

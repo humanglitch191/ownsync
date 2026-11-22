@@ -86,9 +86,23 @@ export class Vault extends DurableObject<Env> {
 	// Today's counters for the dashboard's free-plan meter, kept in memory and written at most once a minute.
 	private usage: { day: number; requests: number; rows: number; lastActivity: number | null };
 	private flushedAt = 0;
+	private historyBytes: number | undefined; // the history table's total size, summed once per wake and kept up to date
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		// No tables until a vault is created (or an older Worker made them): a request for a random ID must not
+		// leave storage behind, or anyone could make objects that never go away.
+		const exists = this.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'auth'").toArray().length > 0;
+		if (exists) this.schema();
+		this.head = exists ? this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM entries").one().seq : 0;
+		const auth = exists ? this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0] : undefined;
+		this.token = auth ? toHex(auth.token_hash) : null;
+		this.deleted = exists && this.sql.exec("SELECT 1 FROM tombstone").toArray().length > 0;
+		const u = exists ? this.sql.exec<{ day: number; requests: number; rows: number; last_activity: number | null }>("SELECT day, requests, rows, last_activity FROM usage").toArray()[0] : undefined;
+		this.usage = u ? { day: u.day, requests: u.requests, rows: u.rows, lastActivity: u.last_activity } : { day: today(), requests: 0, rows: 0, lastActivity: null };
+	}
+
+	private schema(): void {
 		// seq is assigned here, not by AUTOINCREMENT (which costs a second row write per entry). It only ever
 		// grows: a snapshot is inserted before the entries it replaces are deleted.
 		this.sql.exec(`
@@ -100,6 +114,7 @@ export class Vault extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS chunks (name BLOB PRIMARY KEY, envelope BLOB NOT NULL);
 			CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, doc BLOB NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL, envelope BLOB NOT NULL);
 			CREATE INDEX IF NOT EXISTS history_doc ON history (doc, at);
+			CREATE INDEX IF NOT EXISTS history_at ON history (at);
 			CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, snapshot BLOB NOT NULL UNIQUE, day INTEGER NOT NULL UNIQUE, at INTEGER NOT NULL, epoch INTEGER NOT NULL, parts INTEGER NOT NULL, received INTEGER NOT NULL, size INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS snapshot_parts (snapshot BLOB NOT NULL REFERENCES snapshots(snapshot) ON DELETE CASCADE, part INTEGER NOT NULL, count INTEGER NOT NULL, day INTEGER NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL, envelope BLOB NOT NULL, PRIMARY KEY (snapshot, part));
 			CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, last_online INTEGER NOT NULL, version TEXT NOT NULL, conflicts INTEGER NOT NULL);
@@ -110,12 +125,6 @@ export class Vault extends DurableObject<Env> {
 		`);
 		// Added in 0.1.2: a device's name, as Obsidian has it. Vaults made earlier get the column now.
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");
-		this.head = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM entries").one().seq;
-		const auth = this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0];
-		this.token = auth ? toHex(auth.token_hash) : null;
-		this.deleted = this.sql.exec("SELECT 1 FROM tombstone").toArray().length > 0;
-		const u = this.sql.exec<{ day: number; requests: number; rows: number; last_activity: number | null }>("SELECT day, requests, rows, last_activity FROM usage").toArray()[0];
-		this.usage = u ? { day: u.day, requests: u.requests, rows: u.rows, lastActivity: u.last_activity } : { day: today(), requests: 0, rows: 0, lastActivity: null };
 	}
 
 	async fetch(req: Request): Promise<Response> {
@@ -127,14 +136,13 @@ export class Vault extends DurableObject<Env> {
 			if (this.deleted) return Response.json({ error: "deleted" }, { status: 410 });
 			const limit = action === "history" ? DOC_TAG_BYTES + (operation ? 0 : MAX_HISTORY_ENVELOPE)
 				: action === "snapshot" ? (operation === "list" ? 0 : operation ? SNAPSHOT_ID_BYTES : SNAPSHOT_PART_HEADER + MAX_SNAPSHOT_ENVELOPE)
-				: undefined;
-			const body = limit !== undefined
-				? await this.readBoundedBody(req, 32 + limit)
-				: new Uint8Array(await req.arrayBuffer());
+				: action === "names" ? 1024
+				: 0; // delete: the token alone
+			const body = await this.readBoundedBody(req, 32 + limit);
 			const token = action === "delete" ? body : body.subarray(0, 32);
 			const hash = await digest(token);
 			if (this.deleted) return Response.json({ error: "deleted" }, { status: 410 });
-			const stored = this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0]?.token_hash;
+			const stored = this.token === null ? undefined : this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0]?.token_hash;
 			if (!stored || token.length !== 32 || !crypto.subtle.timingSafeEqual(hash, stored)) return Response.json({ error: "unauthorized" }, { status: 401 });
 			if (action === "history") return this.history(operation, body.subarray(32));
 			if (action === "snapshot") return this.snapshot(operation, body.subarray(32));
@@ -190,42 +198,60 @@ export class Vault extends DurableObject<Env> {
 		}
 		const doc = body.subarray(0, DOC_TAG_BYTES);
 		if (operation === "clear") {
-			if (doc.length) this.write("DELETE FROM history WHERE doc = ?", doc);
-			else this.write("DELETE FROM history");
+			if (doc.length) this.dropHistory("WHERE doc = ?", doc);
+			else this.dropHistory("");
 			return Response.json({ ok: true });
 		}
 
 		const now = Date.now();
 		if (operation === "list") {
-			this.write("DELETE FROM history WHERE at < ?", now - HISTORY_RETENTION_MS);
-			const rows = this.sql.exec<{ envelope: ArrayBuffer }>("SELECT envelope FROM history WHERE doc = ? ORDER BY at DESC, id DESC LIMIT 200", doc).toArray();
+			this.dropHistory("WHERE at < ?", now - HISTORY_RETENTION_MS);
+			// One copy in memory at a time: the IDs first, then each envelope as the reader asks for it.
+			const ids = this.sql.exec<{ id: number }>("SELECT id FROM history WHERE doc = ? ORDER BY at DESC, id DESC LIMIT 200", doc).toArray();
 			return new Response(new ReadableStream<Uint8Array>({
-				pull(controller) {
-					const row = rows.shift();
-					if (!row) { controller.close(); return; }
-					const length = new Uint8Array(4);
-					new DataView(length.buffer).setUint32(0, row.envelope.byteLength);
-					controller.enqueue(length);
-					controller.enqueue(new Uint8Array(row.envelope));
+				pull: (controller) => {
+					for (let next; (next = ids.shift());) {
+						const row = this.deleted ? undefined : this.sql.exec<{ envelope: ArrayBuffer }>("SELECT envelope FROM history WHERE id = ?", next.id).toArray()[0];
+						if (!row) continue; // evicted or cleared since the list began
+						const length = new Uint8Array(4);
+						new DataView(length.buffer).setUint32(0, row.envelope.byteLength);
+						controller.enqueue(length);
+						controller.enqueue(new Uint8Array(row.envelope));
+						return;
+					}
+					controller.close();
 				},
 			}), { headers: { "content-type": "application/octet-stream" } });
 		}
 
 		const envelope = body.subarray(DOC_TAG_BYTES);
 		if (!envelope.length || envelope.length > MAX_HISTORY_ENVELOPE) return Response.json({ error: "bad envelope size" }, { status: 413 });
-		this.ctx.storage.transactionSync(() => {
-			this.write("INSERT INTO history (doc, at, size, envelope) VALUES (?, ?, ?, ?)", doc, now, envelope.length, envelope);
-			this.write("DELETE FROM history WHERE at < ?", now - HISTORY_RETENTION_MS);
-			const { size } = this.sql.exec<{ size: number }>("SELECT COALESCE(SUM(size), 0) AS size FROM history").one();
-			if (size > MAX_HISTORY_BYTES) {
-				// Keep the newest rows that fit. The ID breaks ties when copies arrive in the same millisecond.
-				this.write(`DELETE FROM history WHERE id IN (
-					SELECT id FROM (SELECT id, SUM(size) OVER (ORDER BY at DESC, id DESC) AS retained FROM history)
-					WHERE retained > ?
-				)`, MAX_HISTORY_BYTES);
-			}
-		});
+		try {
+			this.ctx.storage.transactionSync(() => {
+				this.historyBytes ??= this.sql.exec<{ size: number }>("SELECT COALESCE(SUM(size), 0) AS size FROM history").one().size;
+				this.write("INSERT INTO history (doc, at, size, envelope) VALUES (?, ?, ?, ?)", doc, now, envelope.length, envelope);
+				this.historyBytes += envelope.length;
+				this.dropHistory("WHERE at < ?", now - HISTORY_RETENTION_MS);
+				// Keep the newest rows that fit: drop the oldest until they do. The ID breaks ties within a millisecond.
+				while (this.historyBytes > MAX_HISTORY_BYTES && this.dropHistory("WHERE id = (SELECT id FROM history ORDER BY at, id LIMIT 1)"));
+			});
+		} catch (error) {
+			this.historyBytes = undefined; // rolled back: sum it again next time
+			throw error;
+		}
 		return Response.json({ ok: true });
+	}
+
+	// Every history delete goes through here, so the running total stays right.
+	private dropHistory(where: string, ...args: unknown[]): number {
+		const cursor = this.sql.exec<{ size: number }>(`DELETE FROM history ${where} RETURNING size`, ...args);
+		let dropped = 0;
+		for (const row of cursor) {
+			dropped++;
+			if (this.historyBytes !== undefined) this.historyBytes -= row.size;
+		}
+		this.count(0, cursor.rowsWritten);
+		return dropped;
 	}
 
 	private expireSnapshots(now: number): void {
@@ -353,7 +379,7 @@ export class Vault extends DurableObject<Env> {
 				const refused = await this.ctx.blockConcurrencyWhile(() => this.admit(f.token, f.owner));
 				if (refused) return ws.close(refused, refused === CLOSE.notOwner ? "owner code needed" : "unauthorized");
 				// History copies expire after 30 days even in a vault where nobody opens history.
-				this.write("DELETE FROM history WHERE at < ?", Date.now() - HISTORY_RETENTION_MS);
+				this.dropHistory("WHERE at < ?", Date.now() - HISTORY_RETENTION_MS);
 				this.expireSnapshots(Date.now());
 				return ws.serializeAttachment({ ...session, token: this.token });
 			}
@@ -409,8 +435,9 @@ export class Vault extends DurableObject<Env> {
 	// The first hello sets the vault's token, and only with the Worker's owner code. Returns a close code, or 0.
 	private async admit(token: Uint8Array, ownerCode: Uint8Array | undefined): Promise<number> {
 		const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", token));
-		if (!this.sql.exec("SELECT 1 FROM auth").toArray().length) {
+		if (this.token === null) {
 			if (!ownerCode || !(await owner(this.env).create(ownerCode).catch(() => false))) return CLOSE.notOwner;
+			this.schema();
 			this.write("INSERT OR IGNORE INTO auth (id, token_hash) VALUES (0, ?)", hash);
 			if (this.name) await owner(this.env).vaultCreated(this.name);
 		}
@@ -463,6 +490,7 @@ export class Vault extends DurableObject<Env> {
 
 	/** What the owner's dashboard shows of this vault: nothing a key would be needed for. */
 	async stats(): Promise<VaultStats> {
+		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [] };
 		const online = new Set(this.ctx.getWebSockets().map((ws) => (ws.deserializeAttachment() as Session).device));
 		const fresh = this.usage.day === today();
 		const devices = this.sql.exec<{ id: string; last_online: number; version: string; conflicts: number; name: string }>("SELECT id, last_online, version, conflicts, name FROM devices ORDER BY last_online DESC").toArray();
@@ -492,6 +520,7 @@ export class Vault extends DurableObject<Env> {
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;
+		this.historyBytes = undefined;
 		this.head = 0;
 		this.usage = { day: today(), requests: 0, rows: 0, lastActivity: null };
 		for (const ws of this.ctx.getWebSockets()) ws.close(CLOSE.deleted, "this vault was deleted");
@@ -514,6 +543,7 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	private flush(): void {
+		if (this.token === null) return; // no vault here (or deleted): write nothing
 		this.flushedAt = Date.now();
 		const u = this.usage;
 		u.rows += 2; // these writes
@@ -524,6 +554,7 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	private sendRecords(ws: WebSocket, from: number): void {
+		if (this.token === null) return void ws.send(encodeServer({ t: "records", recovery: new Uint8Array(0) })); // no vault (yet): no records
 		for (const r of this.sql.exec<{ number: number; blob: ArrayBuffer }>("SELECT number, blob FROM records WHERE number >= ? ORDER BY number", from)) {
 			ws.send(encodeServer({ t: "record", number: r.number, blob: new Uint8Array(r.blob) }));
 		}

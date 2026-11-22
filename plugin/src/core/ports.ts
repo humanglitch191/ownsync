@@ -10,7 +10,6 @@ export interface DeletedNote {
 	path: string;
 	/** Milliseconds since the epoch on the deleting device. Older tombstones have no timestamp. */
 	deletedAt?: number;
-	text: string;
 }
 
 /** An encrypted vault snapshot recorded in the synced index. */

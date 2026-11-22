@@ -154,7 +154,10 @@ export function createSnapshots(deps: SnapshotDeps): {
 	open(id: string): Promise<SnapshotContent>;
 	remove(id?: string): Promise<void>;
 } {
+	// A phone opens snapshots up to 96 MiB but takes them only up to 32 MiB: taking holds the notes, their JSON
+	// and its gzip at once.
 	const jsonLimit = deps.mobile ? 96 * 1024 * 1024 : MAX_VAULT_SNAPSHOT_JSON;
+	const takeLimit = deps.mobile ? 32 * 1024 * 1024 : MAX_VAULT_SNAPSHOT_JSON;
 	const { keys, vaultId, now = Date.now } = deps;
 	const url = `${deps.host.replace(/\/$/, "")}/vault/${hex(vaultId)}/snapshot`;
 	const dayKey = `ownsync-snapshot-day-${hex(vaultId)}-${hex(keys.me.id)}`;
@@ -203,6 +206,33 @@ export function createSnapshots(deps: SnapshotDeps): {
 		if (Array.isArray(rows) && rows.every(workerRow)) return rows;
 	}
 
+	// Its own function, so the notes and their JSON are gone before the upload starts.
+	async function build(day: number, epoch: number, takenAt: number, allowed: () => boolean): Promise<Upload | "unavailable" | "too large"> {
+		const notes: SnapshotNote[] = [];
+		let noteBytes = 0;
+		for await (const note of await deps.listNotes(takeLimit)) {
+			if (!allowed()) return "unavailable";
+			if (note.text.length > takeLimit - noteBytes) return "too large";
+			noteBytes += jsonTextBytes(note.text, takeLimit - noteBytes);
+			if (noteBytes > takeLimit) return "too large";
+			notes.push(note);
+		}
+		const attachments = await deps.listAttachments?.();
+		const id = hex(randomBytes(16));
+		const content: SnapshotBody = { v: 1, id, day, takenAt, notesOnly: attachments === undefined, notes, attachments: attachments ?? [] };
+		if (!allowed() || !validContent(content, deps)) return "unavailable";
+		let serialized: string | undefined = JSON.stringify(content);
+		notes.length = 0; // their text is in the JSON now
+		if (serialized.length > takeLimit) return "too large";
+		const bytes = encoder.encode(serialized);
+		serialized = undefined;
+		if (bytes.length > takeLimit) return "too large";
+		const compressed = await gzipVaultSnapshot(bytes);
+		const partCount = Math.ceil(compressed.length / VAULT_SNAPSHOT_PART_BYTES);
+		if (partCount > MAX_VAULT_SNAPSHOT_PARTS) return "too large";
+		return { id, compressed, partCount, entry: { day, epoch, parts: [], notesOnly: content.notesOnly, takenAt } };
+	}
+
 	async function take(): Promise<TakeResult> {
 		const { epoch, vmk } = keys;
 		const allowed = () => active(epoch) && deps.ready();
@@ -218,27 +248,9 @@ export function createSnapshots(deps: SnapshotDeps): {
 			if ([...ledger.values()].some((entry) => entry.day === day)) return "not due";
 			if (rows.some((row) => row.complete && row.day === day)) return "taken elsewhere";
 			if (!allowed()) return "unavailable";
-			const notes: SnapshotNote[] = [];
-			let noteBytes = 0;
-			for await (const note of await deps.listNotes(jsonLimit)) {
-				if (!allowed()) return "unavailable";
-				if (note.text.length > jsonLimit - noteBytes) return "too large";
-				noteBytes += jsonTextBytes(note.text, jsonLimit - noteBytes);
-				if (noteBytes > jsonLimit) return "too large";
-				notes.push(note);
-			}
-			const attachments = await deps.listAttachments?.();
-			const id = hex(randomBytes(16));
-			const content: SnapshotBody = { v: 1, id, day, takenAt, notesOnly: attachments === undefined, notes, attachments: attachments ?? [] };
-			if (!allowed() || !validContent(content, deps)) return "unavailable";
-			const serialized = JSON.stringify(content);
-			if (serialized.length > jsonLimit) return "too large";
-			const bytes = encoder.encode(serialized);
-			if (bytes.length > jsonLimit) return "too large";
-			const compressed = await gzipVaultSnapshot(bytes);
-			const partCount = Math.ceil(compressed.length / VAULT_SNAPSHOT_PART_BYTES);
-			if (partCount > MAX_VAULT_SNAPSHOT_PARTS) return "too large";
-			pending = { id, compressed, partCount, entry: { day, epoch, parts: [], notesOnly: content.notesOnly, takenAt } };
+			const built = await build(day, epoch, takenAt, allowed);
+			if (typeof built === "string") return built;
+			pending = built;
 		}
 
 		const upload = pending;

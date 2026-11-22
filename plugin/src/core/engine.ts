@@ -53,6 +53,8 @@ const REMOTE = "ownsync-remote"; // transaction origin for changes that didn't s
 type IndexValue = { p: string; d?: string; t?: number };
 const SNAPSHOT_ID = /^[0-9a-f]{32}$/;
 const PART_HASH = /^[0-9a-f]{64}$/i;
+// Recently deleted lists at most this many notes, from at most this many days back (as local history keeps them).
+const MAX_DELETED = 200, DELETED_DAYS = 30, DAY_MS = 24 * 60 * 60 * 1000;
 /** Chunks in flight each way: enough to keep the line busy, few enough that memory holds one file plus these. */
 const WINDOW = 4;
 
@@ -158,6 +160,8 @@ export class Engine {
 	private link: Link | null = null;
 	private live = false; // caught up on this link
 	private sent = 0; // highest outbox ID sent on this link
+	private committedCursor = 0; // the cursor as last committed
+	private replayFrom: number | undefined; // a commit failed: read again from here once one works
 	private tail = new Map<DocId, number>();
 	private puts = new Map<string, unknown>();
 	private dels = new Set<string>();
@@ -218,6 +222,7 @@ export class Engine {
 	start(): Promise<void> {
 		return this.run("start", async () => {
 			this.meta = (await this.store.get<Meta>("meta")) ?? this.meta;
+			this.committedCursor = this.meta.cursor;
 			const index = await this.store.get<Uint8Array>("index");
 			if (index) Y.applyUpdate(this.index, index, REMOTE);
 			this.indexDirty = false;
@@ -308,31 +313,60 @@ export class Engine {
 		});
 	}
 
-	/** Deleted markdown notes this device can preview, most recent first. */
+	/**
+	 * Deleted markdown notes this device can preview, most recent first: those of the last 30 days, at most
+	 * 200. Texts are read one at a time with `deletedText`, so a phone never decodes them all at once.
+	 */
 	deletedNotes(): Promise<DeletedNote[]> {
 		const deleted: DeletedNote[] = [];
 		return this.run("list deleted notes", async () => {
+			const since = (this.opts.now?.() ?? Date.now()) - DELETED_DAYS * DAY_MS;
+			const candidates: DeletedNote[] = [];
 			for (const [id, v] of this.notes) {
 				if (v.d === undefined || !isNote(v.p)) continue;
-				const text = await this.storedText(id);
-				if (text !== undefined) deleted.push({ id, path: v.p, deletedAt: Number.isSafeInteger(v.t) ? v.t : undefined, text }); // another device's claim
+				const deletedAt = Number.isSafeInteger(v.t) ? v.t : undefined;
+				if (deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
 			}
-		}).then(() => deleted.sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity)));
+			candidates.sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity));
+			for (const note of candidates) {
+				if (deleted.length === MAX_DELETED) break;
+				if (await this.state(note.id)) deleted.push(note); // without it, only another device can bring the note back
+			}
+		}).then(() => deleted);
 	}
 
-	/** Bring a deleted markdown note back at its old path or another markdown path. */
-	restoreDeleted(id: string, path?: string): Promise<void> {
+	/** The text of a deleted note, if this device holds it. */
+	deletedText(id: string): Promise<string | undefined> {
+		let text: string | undefined;
+		return this.run(`read deleted ${id}`, async () => {
+			if (this.notes.get(id)?.d !== undefined) text = await this.storedText(id);
+		}).then(() => text);
+	}
+
+	/**
+	 * Bring a deleted markdown note back at its old path or another markdown path. If another note uses the
+	 * old path now, it comes back as "<name> (restored).md": the path tie-break would rename the live note.
+	 * Resolves to the path it was given.
+	 */
+	restoreDeleted(id: string, path?: string): Promise<string | undefined> {
+		let restored: string | undefined;
 		return this.run(`restore ${id}`, async () => {
 			const v = this.notes.get(id);
 			if (v?.d === undefined || !isNote(v.p) || (path !== undefined && !isNote(path))) return;
 			const state = await this.state(id);
 			if (!state) return;
+			let to = path ?? v.p;
+			const base = v.p.replace(/\.md$/i, "");
+			for (let n = 1; path === undefined && (this.claimed.get(to) || this.byPath.has(to) || await this.disk.stat(to)); n++) {
+				to = `${base} (restored${n === 1 ? "" : ` ${n}`}).md`;
+			}
 			// Publish the full state with an ack: live devices may no longer hold it, and an offline
 			// restore must keep it in the outbox. Compaction snapshots don't reach live devices.
 			this.send(id, state, "snapshot");
-			this.notes.set(id, { p: path ?? v.p });
+			this.notes.set(id, { p: to });
+			restored = to;
 			await this.settle(id);
-		});
+		}).then(() => restored);
 	}
 
 	/** Record the ordered part hashes of an encrypted vault snapshot in the synced index. */
@@ -379,7 +413,8 @@ export class Engine {
 			this.fetching?.asked.clear();
 			for (const id of this.retry) this.toFetch.add(id);
 			this.retry.clear();
-			link.send({ t: "subscribe", after: this.meta.cursor });
+			link.send({ t: "subscribe", after: this.replayFrom ?? this.meta.cursor });
+			this.replayFrom = undefined;
 		});
 	}
 
@@ -493,6 +528,12 @@ export class Engine {
 			await this.nextTransfers().catch((err) => this.opts.onProblem?.("attachments", err));
 			this.unknown.clear();
 			await this.flush();
+			// An input cut short by a failed commit may not have finished (an editor not shown an edit, a catch-up
+			// page not asked for): read again from what is on record. Merging an entry twice changes nothing.
+			if (this.replayFrom !== undefined && this.link) {
+				this.link.send({ t: "subscribe", after: this.replayFrom });
+				this.replayFrom = undefined;
+			}
 			this.pump();
 		});
 		this.queue = next.catch((err) => this.opts.onProblem?.(`commit after ${what}`, err));
@@ -525,10 +566,17 @@ export class Engine {
 			this.indexDirty = false;
 		}
 		if (!this.puts.size && !this.dels.size) return;
-		const puts = this.puts, dels = this.dels;
+		try {
+			await this.store.commit(this.puts, this.dels);
+		} catch (err) {
+			// Kept, to go with the next commit: dropped, the cursor would later be committed past entries never stored.
+			this.replayFrom ??= this.committedCursor;
+			this.live = false; // nothing sent, and no snapshot offered, until it's read again
+			throw err;
+		}
 		this.puts = new Map();
 		this.dels = new Set();
-		await this.store.commit(puts, dels);
+		this.committedCursor = this.meta.cursor;
 	}
 
 	private send(doc: DocId, data: Uint8Array, kind: Entry["kind"] = "update"): void {
