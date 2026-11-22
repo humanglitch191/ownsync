@@ -51,7 +51,7 @@ export class SetupModal extends Modal {
 		if (this.screen === "choose") {
 			this.titleEl.setText("Set up Ownsync");
 			el.createEl("p", { cls: "ownsync-lead", text: "Sync this vault between your devices. Notes are encrypted on this device before they leave it." });
-			this.choice(el, "Start syncing this vault", "Your first vault, or a new one on your server.", () => this.go("first"));
+			this.choice(el, "Start syncing this vault", "Your first vault, or a new one on your Worker.", () => this.go("first"));
 			this.choice(el, "Join a vault from another device", "Get a vault you already sync, with a code from a device that syncs it.", () => this.go("join"));
 			const foot = el.createEl("p", { cls: "ownsync-quiet" });
 			foot.createSpan({ text: "Lost all your devices? " });
@@ -63,9 +63,9 @@ export class SetupModal extends Modal {
 		} else if (this.screen === "first") {
 			this.titleEl.setText("Connect this vault");
 			const steps = el.createEl("ol", { cls: "ownsync-steps" });
-			steps.createEl("li", { text: "Open your server's address in a browser and sign in." });
+			steps.createEl("li", { text: "Open your Worker's address in a browser and sign in." });
 			steps.createEl("li", { text: "Under Connect a vault, press Open in Obsidian, or copy the code and paste it here." });
-			const input = field(el, "Vault code", "The notes already in this vault are uploaded to your server, encrypted.");
+			const input = field(el, "Vault code", "The notes already in this vault are uploaded to your Worker, encrypted.");
 			input.placeholder = "https://…#…";
 			input.value = this.code;
 			const server = el.createEl("p", { cls: "ownsync-server" });
@@ -73,7 +73,7 @@ export class SetupModal extends Modal {
 			attachmentsToggle(el, attachments, (on) => (attachments = on));
 			const showServer = () => {
 				const code = parseVaultCode(input.value);
-				server.setText(code ? `Server: ${code.host}` : "");
+				server.setText(code ? `Worker: ${code.host}` : "");
 				server.toggle(!!code);
 			};
 			input.addEventListener("input", () => { this.code = input.value; showServer(); });
@@ -89,7 +89,7 @@ export class SetupModal extends Modal {
 			const connect = async () => {
 				const code = parseVaultCode(input.value);
 				error.hide();
-				if (!code) return this.fail(error, "That isn't a vault code. Copy it again from your server's dashboard.");
+				if (!code) return this.fail(error, "That isn't a vault code. Copy it again from your Worker's dashboard.");
 				busy(true);
 				try {
 					await this.plugin.setAttachments(attachments);
@@ -99,9 +99,9 @@ export class SetupModal extends Modal {
 					const outcome = await this.until(() => ["synced", "catching up", "needs owner code"].includes(this.plugin.status));
 					if (this.plugin.status === "needs owner code") {
 						await this.plugin.leave();
-						throw new Error("This code was already used or has expired. Get a new one from your server's dashboard.");
+						throw new Error("This code was already used or has expired. Get a new one from your Worker's dashboard.");
 					}
-					if (!outcome) throw new Error("Couldn't reach the server yet. Ownsync keeps trying; check this device is online.");
+					if (!outcome) throw new Error("Couldn't reach the Worker yet. Ownsync keeps trying; check this device is online.");
 					this.go("done");
 				} catch (err) {
 					busy(false);
@@ -120,12 +120,15 @@ export class SetupModal extends Modal {
 			attachmentsToggle(el, this.plugin.attachments, (on) => void this.plugin.setAttachments(on));
 			const buttons = el.createDiv({ cls: "modal-button-container" });
 			buttons.createEl("button", { text: "Back" }).addEventListener("click", () => this.go("choose"));
-			buttons.createEl("button", { text: "Pair", cls: "mod-cta" }).addEventListener("click", async () => {
+			const pair = async () => {
 				const params = paramsOfPairLink(pasted.value);
-				if (!params) return void new Notice("That isn't a Ownsync pairing link. Copy it again from your other device.", 8000);
+				if (!params) return void new Notice("That isn't an Ownsync pairing link. Copy it again from your other device.", 8000);
 				this.close();
 				await handlePairLink(this.plugin, params);
-			});
+			};
+			pasted.addEventListener("keydown", (e) => { if (e.key === "Enter") void pair(); });
+			window.setTimeout(() => pasted.focus(), 0);
+			buttons.createEl("button", { text: "Pair", cls: "mod-cta" }).addEventListener("click", () => void pair());
 		} else {
 			this.titleEl.setText("You're all set");
 			el.createEl("p", { cls: "ownsync-lead", text: "This vault is syncing. Changes appear on your other devices as you type." });

@@ -32,3 +32,29 @@
 .ownsync-setup textarea { width: 100%; resize: none; font-variant-numeric: tabular-nums; }
 .ownsync-code { width: 100%; resize: none; word-break: break-all; }
 .ownsync-server { font-weight: var(--font-semibold); color: var(--text-normal); }
+.ownsync-notice-actions { display: flex; gap: var(--size-4-2); margin-top: var(--size-4-2); }
+.ownsync-conflict { margin-bottom: var(--size-4-4); }
+.ownsync-conflict-row { display: flex; gap: var(--size-4-4); }
+.ownsync-conflict-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--size-4-2); }
+.ownsync-conflict-side img { max-width: 100%; max-height: 40vh; object-fit: contain; border-radius: var(--radius-s); }
+
+.ownsync-history-modal { width: min(900px, 95vw); }
+.ownsync-history { display: flex; gap: var(--size-4-3); height: 60vh; }
+.ownsync-history-list { display: flex; flex-direction: column; gap: var(--size-2-1); width: 38%; overflow-y: auto; }
+.ownsync-history-item { text-align: left; justify-content: flex-start; background: transparent; box-shadow: none; height: auto; padding: var(--size-2-3) var(--size-4-2); overflow-wrap: anywhere; }
+.ownsync-history-item:hover { background: var(--background-modifier-hover); }
+.ownsync-history-item.is-active { background: var(--background-modifier-active-hover); }
+.ownsync-history-right { display: flex; flex-direction: column; gap: var(--size-4-2); flex: 1; min-width: 0; }
+.ownsync-history-preview {
+	flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; user-select: text; padding: var(--size-4-2);
+	border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); font-size: var(--font-ui-small); color: var(--text-normal);
+}
+.ownsync-history-right > button { align-self: flex-end; }
+
+.ownsync-history-item { flex-shrink: 0; white-space: normal; }
+.ownsync-history-preview { min-height: 0; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+	.ownsync-history { flex-direction: column; }
+	.ownsync-history-list { width: 100%; max-height: 35%; }
+	.ownsync-history-right { min-height: 0; }
+}

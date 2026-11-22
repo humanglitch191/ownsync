@@ -60,7 +60,7 @@ export async function showPairingCode(host: PairingHost): Promise<void> {
 export async function handlePairLink(host: PairingHost, params: Record<string, string>): Promise<boolean> {
 	const link = parsePairLink(params);
 	if (!link) {
-		new Notice("This pairing link is incomplete or uses an insecure server address. Show a new code on your other device.", 8000);
+		new Notice("This pairing link is incomplete or uses an insecure Worker address. Show a new code on your other device.", 8000);
 		return false;
 	}
 	const { host: server, vaultId, code: codeHex } = link;
@@ -71,7 +71,7 @@ export async function handlePairLink(host: PairingHost, params: Record<string, s
 		return false;
 	}
 	let attachments = host.attachments;
-	const ok = await confirm(host.app, "Pair this device?", `Server: ${server}. The notes in this Obsidian vault will be encrypted and synced with the vault on that server. Only continue if you just scanned or copied this code from your own device.`, "Pair", (el) => attachmentsToggle(el, attachments, (on) => (attachments = on)));
+	const ok = await confirm(host.app, "Pair this device?", `Worker: ${server}. The notes in this Obsidian vault will be encrypted and synced with the vault on that Worker. Only continue if you just scanned or copied this code from your own device.`, "Pair", (el) => attachmentsToggle(el, attachments, (on) => (attachments = on)));
 	if (!ok) {
 		new Notice("Pairing cancelled. Nothing changed.", 6000);
 		return false;
@@ -91,7 +91,7 @@ export async function handlePairLink(host: PairingHost, params: Record<string, s
 	try {
 		p = unpackPairing(await openFromPairing(code, new Uint8Array(res.arrayBuffer)));
 	} catch {
-		new Notice("Pairing failed: the server returned something this code can't open. Both devices need the same Ownsync version.", 8000);
+		new Notice("Pairing failed: the Worker returned something this code can't open. Both devices need the same Ownsync version.", 8000);
 		return false;
 	}
 	await host.setAttachments(attachments);

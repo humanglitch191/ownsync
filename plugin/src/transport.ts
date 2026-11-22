@@ -86,7 +86,7 @@ export class Transport {
 		};
 		ws.onmessage = (e: MessageEvent) => {
 			const bytes = new Uint8Array(e.data as ArrayBuffer);
-			this.receiving = this.receiving.then(() => this.receive(ws, bytes)).catch((err) => this.opts.onProblem?.("a message from the server", err));
+			this.receiving = this.receiving.then(() => this.receive(ws, bytes)).catch((err) => this.opts.onProblem?.("a message from the Worker", err));
 		};
 		ws.onclose = (e: CloseEvent) => this.closed(ws, e.code);
 	}
@@ -177,7 +177,7 @@ export class Transport {
 		this.sending = this.sending.then(async () => {
 			const frame = await this.seal(msg);
 			if (frame && ws === this.ws && ws.readyState === WebSocket.OPEN) ws.send(encodeClient(frame));
-		}).catch((err) => this.opts.onProblem?.("sending to the server", err));
+		}).catch((err) => this.opts.onProblem?.("sending to the Worker", err));
 	}
 
 	private async seal(msg: ClientMsg | Presence): Promise<ClientFrame | null> {

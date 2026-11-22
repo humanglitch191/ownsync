@@ -1,8 +1,11 @@
-import { type App, type EventRef, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, requestUrl } from "obsidian";
+import { type App, type EventRef, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, apiVersion, requestUrl, setIcon } from "obsidian";
 import { cleanName } from "./collab";
 import { hex, randomBytes, sha256 } from "../../protocol/ownsync";
 import { Engine } from "./core/engine";
 import { RecoverModal, chooseFork, createVault, removeDevice, replaceRecovery } from "./devices";
+import { installConflictNotice } from "./conflicts";
+import { installHistory } from "./history";
+import { redactProblem } from "./diagnostics";
 import { Editors, editorBinding } from "./editors";
 import { IdbStore } from "./idbStore";
 import { type KeyPorts, type KeyState, VaultKeys, shortId } from "./keys";
@@ -13,6 +16,21 @@ import { type Status, Transport } from "./transport";
 import { VaultDisk } from "./vaultDisk";
 
 type State = Status | "not set up" | "starting";
+const STATUS_ICON: Record<State, string> = {
+	"not set up": "circle-dashed",
+	starting: "refresh-cw",
+	connecting: "refresh-cw",
+	"catching up": "refresh-cw",
+	synced: "circle-check",
+	offline: "cloud-off",
+	unauthorized: "circle-alert",
+	"needs owner code": "circle-alert",
+	removed: "circle-alert",
+	frozen: "circle-alert",
+	deleted: "circle-alert",
+};
+/** The states only leaving the vault gets out of. */
+const STUCK: State[] = ["unauthorized", "needs owner code", "deleted"];
 const STATUS_TEXT: Record<State, string> = {
 	"not set up": "not set up",
 	starting: "starting",
@@ -20,11 +38,11 @@ const STATUS_TEXT: Record<State, string> = {
 	"catching up": "catching up",
 	synced: "synced",
 	offline: "offline",
-	unauthorized: "the server rejected this vault's key",
-	"needs owner code": "the server refused this vault's code",
+	unauthorized: "the Worker rejected this vault's key",
+	"needs owner code": "the Worker refused this vault's code",
 	removed: "this device was removed from the vault",
 	frozen: "paused: choose between two changes to the device list",
-	deleted: "deleted on the server",
+	deleted: "deleted on the Worker",
 };
 
 /** One running sync for the vault: its database, keys, the engine, the editors and the connection. */
@@ -40,11 +58,13 @@ export default class OwnsyncPlugin extends Plugin {
 	// createdHere: the vault this device created. Only then does it send the Worker's owner code: pairing joins a
 	// vault and must never create one, or a pairing link could make it upload notes under someone else's key.
 	// welcomed: the setup screen opened by itself once, on the first start.
-	settings = { host: "", vaultId: "", deviceName: "", createdHere: "", maxFileMB: 20, attachments: true, welcomed: false };
+	settings = { host: "", vaultId: "", deviceName: "", createdHere: "", maxFileMB: 20, attachments: true, welcomed: false, skipUpdate: "" };
 	session: Session | null = null;
 	status: State = "not set up";
 	problems: string[] = []; // the most recent, newest last
 	private statusEl!: HTMLElement;
+	private ribbonEl!: HTMLElement;
+	onStatusChange: (() => void) | null = null; // the open settings tab, if any
 
 	// The key ring lives in Obsidian's secret storage, not in the vault folder, so it never ends up in iCloud,
 	// Dropbox or git along with the notes.
@@ -69,7 +89,7 @@ export default class OwnsyncPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		const data = ((await this.loadData()) ?? {}) as Partial<typeof this.settings>;
-		this.settings = { host: data.host ?? "", vaultId: data.vaultId ?? "", deviceName: data.deviceName ?? "", createdHere: data.createdHere ?? "", maxFileMB: data.maxFileMB ?? 20, attachments: data.attachments ?? true, welcomed: data.welcomed ?? !!data.host };
+		this.settings = { host: data.host ?? "", vaultId: data.vaultId ?? "", deviceName: data.deviceName ?? "", createdHere: data.createdHere ?? "", maxFileMB: data.maxFileMB ?? 20, attachments: data.attachments ?? true, welcomed: data.welcomed ?? !!data.host, skipUpdate: data.skipUpdate ?? "" };
 		// Earlier versions kept the key (of epoch 0: there were no rotations) in local storage.
 		const legacy = this.app.loadLocalStorage("ownsync-vault-key") as string | null;
 		if (legacy) {
@@ -78,8 +98,13 @@ export default class OwnsyncPlugin extends Plugin {
 		}
 		this.statusEl = this.addStatusBarItem();
 		this.statusEl.addClass("mod-clickable");
-		this.registerDomEvent(this.statusEl, "click", () => (this.hasKey() ? new Notice(this.describe(), 10000) : this.openSetup()));
+		const showStatus = () => (this.hasKey() ? new Notice(this.describe(), 10000) : this.openSetup());
+		this.registerDomEvent(this.statusEl, "click", showStatus);
+		// Phones hide the status bar: the ribbon (the menu there) carries the status.
+		this.ribbonEl = this.addRibbonIcon(STATUS_ICON[this.status], "Ownsync", showStatus);
 		this.addSettingTab(new OwnsyncSettingTab(this.app, this));
+		installConflictNotice(this);
+		this.addCommand({ id: "copy-diagnostics", name: "Copy diagnostics", callback: () => this.showDiagnostics() });
 		this.registerEditorExtension(editorBinding.of([]));
 		this.registerObsidianProtocolHandler("ownsync-pair", (params) => void handlePairLink(this, params));
 		this.registerObsidianProtocolHandler("ownsync-setup", (params) => {
@@ -95,6 +120,7 @@ export default class OwnsyncPlugin extends Plugin {
 		const wake = () => { if (document.visibilityState === "visible" && this.status === "offline") void this.session?.transport.connect().catch(() => {}); };
 		this.registerDomEvent(document, "visibilitychange", wake);
 		this.registerDomEvent(window, "online", wake);
+		installHistory(this);
 		this.app.workspace.onLayoutReady(async () => {
 			await this.restart();
 			if (!this.hasKey() && !this.settings.welcomed) {
@@ -133,7 +159,33 @@ export default class OwnsyncPlugin extends Plugin {
 		if (json === this.sentNames) return;
 		const body = new Uint8Array([...(await keys.token()), ...new TextEncoder().encode(json)]);
 		const res = await requestUrl({ url: `${this.settings.host}/vault/${hex(keys.vaultId)}/names`, method: "POST", body: body.buffer, throw: false }).catch(() => null);
-		if (res?.status === 200) this.sentNames = json;
+		if (res?.status !== 200) return;
+		this.sentNames = json;
+		this.offerUpdate(res.json as { latest?: unknown; worker?: unknown });
+	}
+
+	/**
+	 * One notice per new release. Obsidian doesn't let a plugin update itself, so the notice points to where Obsidian
+	 * does it (or, when only the Worker is behind, to the dashboard). An older Worker sends no versions: nothing shows.
+	 */
+	private offerUpdate({ latest, worker }: { latest?: unknown; worker?: unknown }): void {
+		const behind = (v: unknown) => typeof latest === "string" && /^\d+\.\d+\.\d+$/.test(latest) && typeof v === "string" && latest.localeCompare(v, undefined, { numeric: true }) > 0;
+		const plugin = behind(this.manifest.version);
+		if ((!plugin && !behind(worker)) || latest === this.settings.skipUpdate) return;
+		const notice = new Notice(createFragment((f) => {
+			f.createDiv({ text: plugin ? `Ownsync ${latest} is out.` : `Your Worker runs Ownsync ${worker as string}; ${latest as string} is out.` });
+			const row = f.createDiv({ cls: "ownsync-notice-actions" });
+			row.createEl("button", { text: plugin ? "Update" : "Open dashboard", cls: "mod-cta" }).addEventListener("click", () => {
+				if (plugin) window.open("obsidian://show-plugin?id=ownsync");
+				else openDashboard(this);
+				notice.hide();
+			});
+			row.createEl("button", { text: "Not now" }).addEventListener("click", () => {
+				this.settings.skipUpdate = latest as string;
+				void this.saveData(this.settings);
+				notice.hide();
+			});
+		}), 0);
 	}
 
 	openSetup(code = ""): void {
@@ -271,7 +323,7 @@ export default class OwnsyncPlugin extends Plugin {
 		// 410: already deleted, from another device.
 		if (res?.status !== 200 && res?.status !== 410) {
 			await this.restart();
-			throw new Error(res?.status === 401 ? "the server rejected this vault's key" : "couldn't reach the server");
+			throw new Error(res?.status === 401 ? "the Worker rejected this vault's key" : "couldn't reach the Worker");
 		}
 		await this.leave();
 	}
@@ -297,12 +349,50 @@ export default class OwnsyncPlugin extends Plugin {
 		return [`Ownsync: ${STATUS_TEXT[this.status]}`, ...this.problems.slice(-5)].join("\n");
 	}
 
+	/** What a bug report may carry: no vault ID, server, device IDs, keys, or note names. */
+	diagnostics(): string {
+		const { vault } = this.app, notes = vault.getMarkdownFiles().length;
+		const os = Platform.isIosApp ? "iOS" : Platform.isAndroidApp ? "Android" : Platform.isMacOS ? "macOS" : Platform.isWin ? "Windows" : Platform.isLinux ? "Linux" : "other";
+		const devices = this.session?.keys.state.head?.members.length;
+		return [
+			`Ownsync ${this.manifest.version}`,
+			`Obsidian API ${apiVersion}`,
+			`Platform: ${Platform.isMobile ? "mobile" : "desktop"}, ${os}`,
+			`Status: ${STATUS_TEXT[this.status]}`,
+			`Attachments: ${this.settings.attachments ? "on" : "off"}`,
+			`Notes: ${notes}, attachments: ${vault.getFiles().length - notes}${devices ? `, devices: ${devices}` : ""}`,
+			`Recent problems (details removed): ${this.problems.length ? "" : "none"}`,
+			...this.problems.slice(-5).map((p) => `- ${redactProblem(p)}`),
+		].join("\n");
+	}
+
+	showDiagnostics(): void {
+		const report = this.diagnostics();
+		const modal = new Modal(this.app);
+		modal.titleEl.setText("Diagnostics");
+		modal.contentEl.createEl("p", { text: "Nothing here names your vault, Worker, devices or notes. Read it, then copy it into your report." });
+		const text = modal.contentEl.createEl("textarea");
+		text.value = report;
+		text.readOnly = true;
+		text.rows = 10;
+		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
+		buttons.createEl("button", { text: "Copy", cls: "mod-cta" }).addEventListener("click", () => {
+			void navigator.clipboard.writeText(report).then(() => new Notice("Diagnostics copied."), () => new Notice("Failed to copy the diagnostics.", 6000));
+		});
+		modal.open();
+	}
+
 	private setStatus(status: State): void {
+		const changed = status !== this.status;
 		this.status = status;
+		setIcon(this.ribbonEl, STATUS_ICON[status]);
+		this.ribbonEl.setAttribute("aria-label", `Ownsync: ${STATUS_TEXT[status]}`);
+		this.onStatusChange?.();
 		this.statusEl.setText(`Ownsync: ${STATUS_TEXT[status]}${this.problems.length ? ` (${this.problems.length} problem${this.problems.length > 1 ? "s" : ""})` : ""}`);
-		if (status === "unauthorized") new Notice("Ownsync: the server rejected this vault's key. Pair this device again from one that syncs.", 15000);
-		if (status === "needs owner code") new Notice("Ownsync: the server refused this vault's code: it was already used or has expired. Use Settings → Ownsync → Leave this vault, then connect again with a new code from your server's dashboard.", 15000);
-		if (status === "deleted") new Notice("Ownsync: This vault was deleted from the server. Your notes stay on this device. Use Leave this vault, then set up again.", 15000);
+		if (!changed) return; // problems call this again in the same state: tell once per change
+		if (status === "unauthorized") new Notice("Ownsync: the Worker rejected this vault's key. Pair this device again from one that syncs.", 15000);
+		if (status === "needs owner code") new Notice("Ownsync: the Worker refused this vault's code: it was already used or has expired. Use Settings → Ownsync → Leave this vault, then connect again with a new code from your Worker's dashboard.", 15000);
+		if (status === "deleted") new Notice("Ownsync: This vault was deleted from the Worker. Your notes stay on this device. Use Leave this vault, then set up again.", 15000);
 	}
 
 	// One note failing must not stop the rest, but the user must be able to find out.
@@ -328,13 +418,18 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
+	hide(): void {
+		this.plugin.onStatusChange = null;
+	}
+
 	display(): void {
 		const { containerEl, plugin } = this;
 		containerEl.empty();
+		plugin.onStatusChange = null;
 		if (!plugin.hasKey()) {
 			new Setting(containerEl)
 				.setName("Set up Ownsync")
-				.setDesc("Sync this vault between your devices, end-to-end encrypted, through your own server.")
+				.setDesc("Sync this vault between your devices, end-to-end encrypted, through your own Worker.")
 				.addButton((b) => b.setButtonText("Set up").setCta().onClick(() => plugin.openSetup()));
 			new Setting(containerEl)
 				.setName("Recover a vault")
@@ -343,22 +438,29 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			this.advanced(containerEl);
 			return;
 		}
-		new Setting(containerEl).setName("Status").setDesc(`${plugin.describe()}\nServer: ${plugin.settings.host}`);
+		const status = new Setting(containerEl).setName("Status");
+		const showStatus = () => {
+			status.setDesc(`${plugin.describe()}\nWorker: ${plugin.settings.host}`);
+			status.controlEl.empty();
+			if (STUCK.includes(plugin.status)) status.addButton((b) => b.setButtonText("Leave this vault").setWarning().onClick(() => this.confirmLeave()));
+		};
+		showStatus();
+		plugin.onStatusChange = showStatus;
 		new Setting(containerEl)
 			.setName("Add a device")
 			.setDesc("Your phone, tablet or another computer: shows a one-time code to scan.")
 			.addButton((b) => b.setButtonText("Add a device").setCta().onClick(() => void showPairingCode(plugin)));
 		new Setting(containerEl)
 			.setName("Dashboard")
-			.setDesc("See your devices, when each last synced, conflicts, and how much of Cloudflare's free plan you use. Opens your server's page in the browser; sign in with your passkey.")
+			.setDesc("See your devices, when each last synced, conflicts, and how much of Cloudflare's free plan you use. Opens your Worker's page in the browser; sign in with your passkey.")
 			.addButton((b) => b.setButtonText("Open dashboard").onClick(() => openDashboard(plugin)));
 		new Setting(containerEl)
 			.setName("Add another vault")
-			.setDesc("Sync a different Obsidian vault through the same server. Your dashboard walks you through it.")
-			.addButton((b) => b.setButtonText("Open dashboard").onClick(() => openDashboard(plugin, "connect")));
+			.setDesc("Sync a different Obsidian vault through the same Worker. Your dashboard walks you through it.")
+			.addButton((b) => b.setButtonText("Connect another vault").onClick(() => openDashboard(plugin, "connect")));
 		new Setting(containerEl)
 			.setName("Device name")
-			.setDesc("Shown next to this device's cursor on your other devices, and on your server's dashboard.")
+			.setDesc("Shown next to this device's cursor on your other devices, and on your Worker's dashboard.")
 			.addText((t) => t.setPlaceholder(plugin.deviceName).setValue(plugin.settings.deviceName).onChange(async (v) => {
 				plugin.settings.deviceName = v;
 				await plugin.saveData(plugin.settings);
@@ -367,22 +469,26 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			}));
 		this.devices(containerEl);
 		this.advanced(containerEl);
+		new Setting(containerEl).setName("Leave or delete").setHeading();
 		new Setting(containerEl)
 			.setName("Leave this vault")
 			.setDesc("This device stops syncing and forgets the vault's key. Your notes stay here as ordinary files, and the vault keeps syncing on your other devices.")
-			.addButton((b) => b.setButtonText("Leave").setWarning().onClick(() => {
-				const modal = new Modal(this.app);
-				modal.titleEl.setText("Leave this vault?");
-				modal.contentEl.createEl("p", { text: "This device stops syncing and forgets the vault's key. To sync it again, add it from another device. If this is your only device, the copy on your server can no longer be opened." });
-				const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
-				buttons.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
-				buttons.createEl("button", { text: "Leave", cls: "mod-warning" }).addEventListener("click", async () => {
-					modal.close();
-					await plugin.leave();
-					this.display();
-				});
-				modal.open();
-			}));
+			.addButton((b) => b.setButtonText("Leave").setWarning().onClick(() => this.confirmLeave()));
+		this.deleteFromServer(containerEl);
+	}
+
+	private confirmLeave(): void {
+		const modal = new Modal(this.app);
+		modal.titleEl.setText("Leave this vault?");
+		modal.contentEl.createEl("p", { text: "This device stops syncing and forgets the vault's key. To sync it again, add it from another device. If this is your only device, the copy on your Worker can no longer be opened." });
+		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
+		buttons.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
+		buttons.createEl("button", { text: "Leave", cls: "mod-warning" }).addEventListener("click", async () => {
+			modal.close();
+			await this.plugin.leave();
+			this.display();
+		});
+		modal.open();
 	}
 
 	private advanced(containerEl: HTMLElement): void {
@@ -396,7 +502,7 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		let mb = String(plugin.settings.maxFileMB);
 		new Setting(containerEl)
 			.setName("Largest attachment (MB)")
-			.setDesc("Larger files are reported and not synced. The server holds at most about 1 GB in all.")
+			.setDesc("Larger files are reported and not synced. The Worker holds at most about 1 GB in all.")
 			.addText((t) => t.setValue(mb).onChange((v) => { mb = v.trim(); }))
 			.addButton((b) => b.setButtonText("Save").onClick(async () => {
 				const n = Number(mb);
@@ -414,29 +520,37 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		if (!plugin.hasKey()) return;
 		// The server, and its dashboard, know the vault by a hash of its ID; the short form is what the user types to delete it.
 		const keys = plugin.session?.keys, short = keys ? shortId(keys.vaultId) : "";
-		new Setting(containerEl).setName("Vault ID").setDesc(short ? `${plugin.settings.vaultId}\nOn the server and its dashboard: ${short}` : plugin.settings.vaultId);
+		new Setting(containerEl).setName("Vault ID").setDesc(short ? `${plugin.settings.vaultId}\nOn the Worker and its dashboard: ${short}` : plugin.settings.vaultId);
+		new Setting(containerEl)
+			.setName("Copy diagnostics")
+			.setDesc("A short report for a bug report, with no vault ID, Worker, device or note names. You read it before you copy it.")
+			.addButton((b) => b.setButtonText("Show").onClick(() => plugin.showDiagnostics()));
+	}
+
+	private deleteFromServer(containerEl: HTMLElement): void {
+		const keys = this.plugin.session?.keys, short = keys ? shortId(keys.vaultId) : "";
 		if (short) new Setting(containerEl)
-			.setName("Delete this vault from the server")
-			.setDesc("Sync stops on every device, and the server's copy is gone for good. The notes on your devices stay.")
-			.addButton((b) => b.setButtonText("Delete from server").setWarning().onClick(() => this.confirmDelete(short)));
+			.setName("Delete this vault from the Worker")
+			.setDesc("Sync stops on every device, and the Worker's copy is gone for good. The notes on your devices stay.")
+			.addButton((b) => b.setButtonText("Delete from Worker").setWarning().onClick(() => this.confirmDelete(short)));
 	}
 
 	private confirmDelete(short: string): void {
 		const { plugin } = this;
 		const modal = new Modal(this.app);
-		modal.titleEl.setText("Delete this vault from the server?");
-		modal.contentEl.createEl("p", { text: "Sync stops on every device of this vault. The notes on each device stay there as ordinary files. The copy on your server is deleted and can't be restored, and this vault can't be synced again: to sync these notes, set up a new vault." });
+		modal.titleEl.setText("Delete this vault from the Worker?");
+		modal.contentEl.createEl("p", { text: "Sync stops on every device of this vault. The notes on each device stay there as ordinary files. The copy on your Worker is deleted and can't be restored, and this vault can't be synced again: to sync these notes, set up a new vault." });
 		modal.contentEl.createEl("p", { text: `To confirm, type the vault's short ID: ${short}` });
 		new Setting(modal.contentEl).setName("Short ID").addText((t) => t.onChange((v) => { del.disabled = v.trim().toUpperCase() !== short; }));
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
-		const del = buttons.createEl("button", { text: "Delete from server", cls: "mod-warning" });
+		const del = buttons.createEl("button", { text: "Delete from Worker", cls: "mod-warning" });
 		del.disabled = true;
 		del.addEventListener("click", async () => {
 			modal.close();
 			try {
 				await plugin.deleteFromServer();
-				new Notice("Ownsync: the vault was deleted from the server. Your notes stay on this device.", 10000);
+				new Notice("Ownsync: the vault was deleted from the Worker. Your notes stay on this device.", 10000);
 			} catch (err) {
 				new Notice(`Ownsync: couldn't delete the vault: ${err instanceof Error ? err.message : String(err)}`, 10000);
 			}
