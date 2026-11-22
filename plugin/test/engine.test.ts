@@ -343,6 +343,28 @@ test("typing in an editor reaches the other device's editor and file", async () 
 	noProblems([a!, b!]);
 });
 
+test("a note open on both devices, deleted after the editor saved the other device's typing, stays deleted", async () => {
+	const { server, devs: [a, b] } = world();
+	a!.write("Note.md", "hello");
+	await quiesce([a!, b!]);
+	const id = a!.engine!.noteAt("Note.md")!;
+	const ea = (await a!.engine!.open(id))!, eb = (await b!.engine!.open(id))!;
+	eb.getText("t").insert(5, " from B");
+	await b!.idle();
+	while (b!.pumpUp()) { /* B's edit goes out live, and to be stored */ }
+	assert.deepEqual(server.conns.get(a!)!.down.map((m) => m.t), ["live", "entry"]);
+	a!.pumpDown(); // the live edit reaches A's editor
+	await a!.idle();
+	a!.write("Note.md", ea.getText("t").toString()); // A's editor saves it
+	await quiesce([a!, b!]); // the same edit arrives again, stored
+	a!.remove("Note.md");
+	await a!.engine!.close(id); // the editor goes with its file
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), {});
+	assert.deepEqual(disk(b!), {});
+	noProblems([a!, b!]);
+});
+
 test("a device that joins with its own copy of the vault adopts identical notes and keeps different ones", async () => {
 	const { server, devs: [a] } = world(1);
 	a!.write("Same.md", "same text");

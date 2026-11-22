@@ -684,10 +684,13 @@ export class Engine {
 		// Built from the stored state, never from the live editor document: that one may already hold
 		// keystrokes whose turn to be recorded and sent hasn't come yet.
 		const doc = this.load(before);
+		// A live edit arrives again as a stored entry (and in snapshots): one that adds nothing leaves the document where it was.
+		let changed = false;
+		doc.on("update", () => (changed = true));
 		Y.applyUpdate(doc, update, REMOTE);
 		const after = Y.encodeStateAsUpdate(doc); // also drops the content of deleted text
 		doc.destroy();
-		if (!fromDisk && before && this.metaOf(id).baseHash !== undefined && !(await this.read(`base:${id}`))) this.put(`base:${id}`, before);
+		if (changed && !fromDisk && before && this.metaOf(id).baseHash !== undefined && !(await this.read(`base:${id}`))) this.put(`base:${id}`, before);
 		this.put(`state:${id}`, after);
 		if (local) return this.send(id, update);
 		const open = this.opened.get(id);
