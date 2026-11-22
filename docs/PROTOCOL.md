@@ -1,6 +1,6 @@
 # Ownsync protocol v1
 
-Status: draft, 2026-11-14. Covers keys, envelopes, rotation, recovery, the membership log, pairing and history backup. WebSocket frames are specified in `server/src/wire.ts`.
+Status: draft, 2026-11-14. Covers keys, envelopes, rotation, recovery, the membership log, pairing, history backup and whole-vault snapshots. WebSocket frames are specified in `server/src/wire.ts`.
 
 The reference implementation is `protocol/ownsync.ts`, and `protocol/vectors.json` holds fixed test vectors. `cd protocol && npm test` checks the code against them; `npm run vectors` rewrites the outputs after a deliberate format change. Any other implementation (plugin, headless client) must reproduce every output in `vectors.json`. Design reasoning is in `DESIGN.md` section 1; this file states only the rules.
 
@@ -21,7 +21,7 @@ Every key below comes from the VMK of one epoch, with `salt = vaultId`.
 
 | Key | Derivation | Use |
 |---|---|---|
-| seal key | `HKDF(VMK, vaultId, L("seal") \| deviceId)` | seals that device's updates, snapshots, presence, attachment chunks and history copies |
+| seal key | `HKDF(VMK, vaultId, L("seal") \| deviceId)` | seals that device's updates, snapshots, presence, attachment chunks, history copies and whole-vault snapshot parts |
 | name key | `HKDF(VMK, vaultId, L("name"))` | with epoch 0's VMK: names attachment chunks; with the current one: document tags |
 | auth token | `HKDF(VMK, vaultId, L("auth"))` | sent in `hello`; the server stores only `SHA-256(auth token)` |
 | member key | `HKDF(VMK, vaultId, L("member"))` | encrypts membership records |
@@ -38,15 +38,15 @@ AD       = header | vaultId | docId
 key      = seal key of (VMK of epoch, deviceId)
 ```
 
-- `kind`: 1 update, 2 snapshot, 3 presence, 4 attachment chunk, 5 update part, 6 history copy.
+- `kind`: 1 update, 2 snapshot, 3 presence, 4 attachment chunk, 5 update part, 6 history copy, 7 whole-vault snapshot part.
 - **Update parts.** A Worker WebSocket frame holds at most 1 MiB, so an update larger than `PART_SIZE` (512 KiB) is split. Each part is its own kind-5 envelope with plaintext `groupId(16) | u16 index | u16 count | bytes`. The server stores parts as ordinary log entries. A receiver applies the update only when every part of the group has arrived. A group that never completes is resent whole by its sender's next catch-up. A snapshot can't be split yet, so a device sends no snapshot larger than `PART_SIZE`.
 - For chunks, `docId` in the AD is the chunk name.
 - `nonce` is 12 random bytes.
-- The header is in clear so a receiver can pick the key. The server never parses it.
+- The header is in clear so a receiver can pick the key. The Worker can read it without opening the envelope.
 - `deviceId` is self-asserted. It picks the key and identifies the sender; it doesn't authenticate anyone, since every member holds every seal key.
 - Rules for receivers:
   - Reject an unknown version or suite.
-  - Reject any envelope whose epoch is older than the newest epoch accepted (see "After a rotation").
+  - Apply the epoch rules for the envelope kind (see "After a rotation", "History backup" and "Whole-vault snapshots").
   - Find the VMK for the epoch in the key ring.
 
 Plaintexts: an update is a Yjs update (`Y.mergeUpdates` of about 250 ms of edits). A snapshot is `Y.encodeStateAsUpdate`. Presence is a y-protocols awareness update. A chunk (kind 4) is up to 1 MiB (`MAX_CHUNK`) of an attachment's content, with no framing.
@@ -194,6 +194,33 @@ All three requests are binary `POST`s under `/vault/{vaultId hex}`. The leading 
 
 A `404` leaves only local history available. A `401` or `410` disables backup requests for the remainder of the vault session.
 
+## Whole-vault snapshots
+
+Kind 7 is used only by the snapshot HTTP endpoints. WebSocket entries, live frames and chunk downloads refuse it. The envelope's associated data uses the 16-byte snapshot ID as `docId`. New snapshots use the current epoch's VMK.
+
+The UTF-8 JSON body is `{ v: 1, id, day, takenAt, notesOnly, notes, attachments }`. `id` is a fresh random 16-byte ID encoded in lowercase hex. `day` is the number of UTC days since the Unix epoch and `takenAt` is the device's Unix timestamp in milliseconds. Notes are `{ id, path, text }`. Attachments are `{ id, path, ref }`, where `ref` holds `h`, `n`, `c` and optionally `u` as in the attachment document. A notes-only snapshot has an empty attachment list.
+
+Gzip the JSON and split the resulting stream into slices of up to 1 MiB. For a single slice, pad its payload with zeros to the smallest fitting power-of-two bucket from 64 KiB through 1 MiB. For multiple slices, every padded payload is 1 MiB. Seal each part independently with this plaintext, using big-endian integers and zero-based indices.
+
+```
+snapshotId[16] | u32 day | u64 takenAt | u16 partIndex | u16 partCount | u32 payloadLength | payload | zero padding
+```
+
+The sealed header adds 36 bytes inside the envelope. With the 51-byte envelope overhead, the largest envelope is 1 MiB + 87 bytes. Clients cap snapshots at 512 parts and 512 MiB of decompressed UTF-8 JSON. They reject invalid gzip or UTF-8 and stop reading if the output exceeds the byte limit.
+
+Every request is a binary `POST` under `/vault/{vaultId hex}` with the current 32-byte auth token first.
+
+| Path suffix | Request body | `200` response |
+|---|---|---|
+| `/snapshot` | `token[32] \| snapshotId[16] \| u16 partIndex \| u16 partCount \| envelope` | `{ ok, day, complete }` |
+| `/snapshot/list` | `token[32]` | JSON array of `{ id, day, epoch, parts, received, size, complete, at }` |
+| `/snapshot/get` | `token[32] \| snapshotId[16]` | Repeated `u16 partIndex \| u32 envelopeLength \| envelope` frames |
+| `/snapshot/delete` | `token[32] \| snapshotId[16]` for one snapshot, or `token[32]` for all | `{ ok }` |
+
+The Worker reserves the day on the first upload. It returns `409` with `{ "error": "taken" }` when another snapshot holds that day and `413` when a size cap is exceeded. The sender seals using its local UTC day and accepts the first acknowledgement's day only if it agrees. A mismatch ends the attempt without resealing. A missing list endpoint (`404`) or rejected token (`401` or `410`) disables requests for the session. A `404` on a download can also mean the snapshot is absent.
+
+After the complete upload is acknowledged, the sender records `{ day, epoch, parts, notesOnly, takenAt }` under the ID in the synced vault index. `parts` holds the lowercase SHA-256 hex digests of the complete envelopes, in index order. To open a snapshot of any epoch, the receiver checks every envelope against its ledger digest and opens it with that epoch's key. It requires exactly one of each index, with the sealed ID, day, timestamp, index and part count matching the request and ledger. The decoded body must agree with the sealed metadata and ledger, and every note and attachment path must pass vault path validation. Worker list metadata alone cannot authorize opening any snapshot.
+
 ## Key storage on the device
 
 - The key ring, `{ "<epoch>": "<hex VMK>" }` as JSON, in Obsidian's secret storage under `ownsync-ring-<vault ID>`.
@@ -201,4 +228,4 @@ A `404` leaves only local history available. A `401` or `410` disables backup re
 
 ## Not yet specified
 
-- Fixed size padding for envelope kinds other than history.
+- Fixed size padding for sync envelope kinds.

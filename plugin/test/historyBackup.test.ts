@@ -13,17 +13,43 @@ function frame(envelope: Uint8Array): Uint8Array {
 	return concat(length, envelope);
 }
 
-function fixture() {
+function fakeTiming(random = () => 0) {
+	let now = 0;
+	const timers = new Map<() => void, number>();
+	const timing: NonNullable<HistoryBackupDeps["timing"]> = {
+		now: () => now,
+		random,
+		setTimer: (callback, delay) => {
+			timers.set(callback, now + delay);
+			return () => { timers.delete(callback); };
+		},
+	};
+	return {
+		timing,
+		next: () => Math.min(...timers.values()),
+		advance(ms: number) {
+			now += ms;
+			for (const [callback, due] of [...timers]) {
+				if (due > now) continue;
+				timers.delete(callback);
+				callback();
+			}
+		},
+	};
+}
+
+function fixture(random?: () => number) {
+	const clock = fakeTiming(random);
 	const vaultId = randomBytes(16);
 	const keys = { vmk: randomBytes(32), epoch: 3, me: { id: randomBytes(16) }, state: {} };
 	const deps: HistoryBackupDeps = {
-		host: "https://example.test/", vaultId, keys,
+		host: "https://example.test/", vaultId, keys, timing: clock.timing,
 		token: () => authToken(keys.vmk, vaultId),
 		docTag: (id) => docTag(keys.vmk, vaultId, id),
 		noteIdForPath: (value) => value === path ? note : undefined,
 		requestUrl: async () => ({ status: 200, arrayBuffer: new ArrayBuffer(0) }),
 	};
-	return { keys, deps, vaultId };
+	return { keys, deps, vaultId, clock };
 }
 
 test("history uses the smallest UTF-8 bucket and round-trips markdown, Unicode and NUL", () => {
@@ -109,7 +135,7 @@ test("list framing skips corrupt frames and keeps complete copies before a trunc
 });
 
 test("the upload and clear calls use the binary Worker contract and preserve mutation order", async () => {
-	const { deps, keys, vaultId } = fixture();
+	const { deps, keys, vaultId, clock } = fixture();
 	const calls: Parameters<HistoryBackupDeps["requestUrl"]>[0][] = [];
 	deps.requestUrl = async (request) => {
 		calls.push(request);
@@ -118,8 +144,12 @@ test("the upload and clear calls use the binary Worker contract and preserve mut
 	const backup = createHistoryBackup(deps);
 	assert.equal(backup.supported(), undefined);
 	assert.equal(backup.noteIdForPath(path), note);
-	assert.deepEqual(await Promise.all([backup.upload(note, "text", 123), backup.forget(note), backup.forgetAll()]), [undefined, true, true]);
-	await backup.upload(note, "x".repeat(1024 * 1024), 123);
+	const operations = Promise.all([backup.upload(note, "text", 123), backup.forget(note), backup.forgetAll()]);
+	clock.advance(30_000);
+	assert.deepEqual(await operations, [undefined, true, true]);
+	const oversized = backup.upload(note, "x".repeat(1024 * 1024), 123);
+	clock.advance(30_000);
+	await oversized;
 	await backup.list(note);
 	const base = `https://example.test/vault/${hex(vaultId)}/history`;
 	assert.deepEqual(calls.map((call) => call.url), [base, base + "/clear", base + "/clear", base + "/list"]);
@@ -167,7 +197,7 @@ test("404, 401 and 410 disable the session while a transient error allows anothe
 });
 
 test("a rotation during tag derivation prevents uploading under a stale epoch", async () => {
-	const { deps, keys } = fixture();
+	const { deps, keys, clock } = fixture();
 	const currentTag = deps.docTag;
 	deps.docTag = async (id) => {
 		const tag = await currentTag(id);
@@ -180,6 +210,98 @@ test("a rotation during tag derivation prevents uploading under a stale epoch", 
 		requests++;
 		return { status: 200, arrayBuffer: new ArrayBuffer(0) };
 	};
-	await createHistoryBackup(deps).upload(note, "text", 123);
+	const uploaded = createHistoryBackup(deps).upload(note, "text", 123);
+	clock.advance(30_000);
+	await uploaded;
 	assert.equal(requests, 0);
+});
+
+test("one timer starts all due uploads and leaves later uploads queued", async () => {
+	const random = [0, 0.5, 1 - 2 ** -32];
+	const { deps, clock } = fixture(() => random.shift()!);
+	let requests = 0;
+	deps.requestUrl = async () => {
+		requests++;
+		return { status: 200, arrayBuffer: new ArrayBuffer(0) };
+	};
+	const backup = createHistoryBackup(deps);
+	const earliest = backup.upload(note, "early", 1);
+	const middle = backup.upload(note, "middle", 2);
+	const latest = backup.upload(note, "late", 3);
+	assert.equal(clock.next(), 30_000);
+	clock.advance(29_999);
+	assert.equal(requests, 0);
+	clock.advance(135_001);
+	await Promise.all([earliest, middle]);
+	assert.equal(requests, 2);
+	assert.equal(clock.next(), 300_000);
+	clock.advance(135_000);
+	await latest;
+	assert.equal(requests, 3);
+	assert.equal(clock.next(), Infinity);
+});
+
+test("Forget preserves the pending upload's delay and runs before newer copies of the same note", async () => {
+	const random = [0.5, 0];
+	const { deps, clock, keys, vaultId } = fixture(() => random.shift()!);
+	const calls: string[] = [];
+	deps.requestUrl = async ({ url, body }) => {
+		if (url.endsWith("/clear")) calls.push("clear");
+		else {
+			const tag = await deps.docTag(note);
+			const opened = await openEnvelope(new Uint8Array(body).subarray(48), vaultId, tag, () => keys.vmk);
+			calls.push(unpackHistory(opened.plaintext, note)!.text);
+		}
+		return { status: 200, arrayBuffer: new ArrayBuffer(0) };
+	};
+	const backup = createHistoryBackup(deps);
+	const before = backup.upload(note, "before", 1);
+	const forget = backup.forget(note);
+	const after = backup.upload(note, "after", 2);
+	assert.equal(clock.next(), 165_000);
+	clock.advance(165_000);
+	assert.deepEqual(await Promise.all([before, forget, after]), [undefined, true, undefined]);
+	assert.deepEqual(calls, ["before", "clear", "after"]);
+});
+
+test("session stop drops delayed uploads, finishes pending clears and leaves no timer", async () => {
+	const { deps, clock } = fixture();
+	const calls: string[] = [];
+	deps.requestUrl = async ({ url }) => {
+		calls.push(url.endsWith("/clear") ? "clear" : "upload");
+		return { status: 200, arrayBuffer: new ArrayBuffer(0) };
+	};
+	const backup = createHistoryBackup(deps);
+	const uploaded = backup.upload(note, "text", 1);
+	const forgotten = backup.forget(note);
+	await backup.idle();
+	assert.deepEqual(await Promise.all([uploaded, forgotten]), [undefined, true]);
+	assert.deepEqual(calls, ["clear"]);
+	assert.equal(clock.next(), Infinity);
+});
+
+test("switching backups off cancels queued uploads, stops lists and still permits a vault-wide clear", async () => {
+	const { deps, clock } = fixture();
+	let enabled = true;
+	deps.enabled = () => enabled;
+	const calls: string[] = [];
+	deps.requestUrl = async ({ url }) => {
+		calls.push(url);
+		return { status: 200, arrayBuffer: new ArrayBuffer(0) };
+	};
+	const backup = createHistoryBackup(deps);
+	const pending = backup.upload(note, "old", 1);
+	const listing = backup.list(note);
+	enabled = false;
+	backup.discardUploads();
+	await pending;
+	assert.deepEqual(await listing, []);
+	assert.deepEqual(await backup.list(note), []);
+	await backup.upload(note, "disabled", 2);
+	assert.equal(clock.next(), Infinity);
+	assert.equal(await backup.forgetAll(), true);
+	enabled = true;
+	clock.advance(300_000);
+	assert.equal(calls.length, 1);
+	assert.ok(calls[0]?.endsWith("/clear"));
 });

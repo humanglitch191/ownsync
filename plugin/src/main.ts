@@ -1,11 +1,11 @@
-import { type App, type EventRef, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, apiVersion, requestUrl, setIcon } from "obsidian";
+import { type App, type EventRef, Events, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, apiVersion, normalizePath, requestUrl, setIcon } from "obsidian";
 import { cleanName } from "./collab";
 import { docTag, hex, randomBytes, sha256 } from "../../protocol/ownsync";
 import { Engine } from "./core/engine";
 import { RecoverModal, chooseFork, createVault, removeDevice, replaceRecovery } from "./devices";
 import { installConflictNotice } from "./conflicts";
 import { installHistory } from "./history";
-import { createHistoryBackup } from "./historyBackup";
+import { createHistoryBackup, type HistoryBackupDeps } from "./historyBackup";
 import { redactProblem } from "./diagnostics";
 import { Editors, editorBinding } from "./editors";
 import { IdbStore } from "./idbStore";
@@ -13,6 +13,8 @@ import { type KeyPorts, type KeyState, VaultKeys, shortId } from "./keys";
 import { parseSetupLink, trimHost } from "./links";
 import { handlePairLink, showPairingCode } from "./pairing";
 import { SetupModal, openDashboard } from "./setup";
+import { createSnapshots } from "./snapshots";
+import { installSnapshots, snapshotSettings } from "./snapshotsView";
 import { type Status, Transport } from "./transport";
 import { VaultDisk } from "./vaultDisk";
 
@@ -53,6 +55,7 @@ interface Session {
 	editors: Editors;
 	transport: Transport;
 	historyBackup: ReturnType<typeof createHistoryBackup>;
+	snapshots: ReturnType<typeof createSnapshots>;
 	stop(): Promise<void>;
 }
 
@@ -60,12 +63,13 @@ export default class OwnsyncPlugin extends Plugin {
 	// createdHere: the vault this device created. Only then does it send the Worker's owner code: pairing joins a
 	// vault and must never create one, or a pairing link could make it upload notes under someone else's key.
 	// welcomed: the setup screen opened by itself once, on the first start.
-	settings = { host: "", vaultId: "", deviceName: "", createdHere: "", maxFileMB: 20, attachments: true, welcomed: false, skipUpdate: "" };
+	settings = { host: "", vaultId: "", deviceName: "", createdHere: "", maxFileMB: 20, attachments: true, backUpHistoryToWorker: true, snapshots: false, snapshotsOffered: false, welcomed: false, skipUpdate: "" };
 	session: Session | null = null;
 	status: State = "not set up";
 	problems: string[] = []; // the most recent, newest last
 	private statusEl!: HTMLElement;
 	private ribbonEl!: HTMLElement;
+	private snapshotSyncEvents = new Events();
 	onStatusChange: (() => void) | null = null; // the open settings tab, if any
 
 	// The key ring lives in Obsidian's secret storage, not in the vault folder, so it never ends up in iCloud,
@@ -91,7 +95,7 @@ export default class OwnsyncPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		const data = ((await this.loadData()) ?? {}) as Partial<typeof this.settings>;
-		this.settings = { host: data.host ?? "", vaultId: data.vaultId ?? "", deviceName: data.deviceName ?? "", createdHere: data.createdHere ?? "", maxFileMB: data.maxFileMB ?? 20, attachments: data.attachments ?? true, welcomed: data.welcomed ?? !!data.host, skipUpdate: data.skipUpdate ?? "" };
+		this.settings = { host: data.host ?? "", vaultId: data.vaultId ?? "", deviceName: data.deviceName ?? "", createdHere: data.createdHere ?? "", maxFileMB: data.maxFileMB ?? 20, attachments: data.attachments ?? true, backUpHistoryToWorker: data.backUpHistoryToWorker ?? true, snapshots: data.snapshots ?? false, snapshotsOffered: data.snapshotsOffered ?? false, welcomed: data.welcomed ?? !!data.host, skipUpdate: data.skipUpdate ?? "" };
 		// Earlier versions kept the key (of epoch 0: there were no rotations) in local storage.
 		const legacy = this.app.loadLocalStorage("ownsync-vault-key") as string | null;
 		if (legacy) {
@@ -126,6 +130,7 @@ export default class OwnsyncPlugin extends Plugin {
 			client: this.session.historyBackup,
 			connected: this.session.transport.status === "synced",
 		});
+		installSnapshots(this);
 		this.app.workspace.onLayoutReady(async () => {
 			await this.restart();
 			if (!this.hasKey() && !this.settings.welcomed) {
@@ -151,6 +156,12 @@ export default class OwnsyncPlugin extends Plugin {
 	// What was last told to the server, so it's only told again when something changes.
 	/** The running engine, for the history screens (undefined while the vault isn't set up). */
 	engine = () => this.session?.engine;
+	snapshots = () => this.session?.snapshots;
+	snapshotsSynced = () => this.status === "synced" && this.session?.transport.status === "synced";
+	onSnapshotSyncChange = (callback: () => void) => this.snapshotSyncEvents.on("change", callback);
+	noteAt = (path: string) => this.session?.engine.noteAt(path);
+	pathOf = (id: string) => this.session?.engine.pathOf(id);
+
 	private sentNames = "";
 	readonly namesChanged = debounce(() => void this.reportNames(), 1500, true);
 
@@ -203,15 +214,20 @@ export default class OwnsyncPlugin extends Plugin {
 		void this.session?.stop();
 	}
 
+	private setSession(session: Session | null): void {
+		this.session = session;
+		this.snapshotSyncEvents.trigger("change");
+	}
+
 	async restart(): Promise<void> {
 		await this.session?.stop();
-		this.session = null;
+		this.setSession(null);
 		this.problems = [];
 		const { host, vaultId } = this.settings;
 		if (!host || !vaultId || !this.hasKey()) return this.setStatus("not set up");
 		this.setStatus("starting");
 		try {
-			this.session = await this.start(host, vaultId);
+			this.setSession(await this.start(host, vaultId));
 		} catch (err) {
 			this.problem("starting sync", err);
 		}
@@ -263,15 +279,45 @@ export default class OwnsyncPlugin extends Plugin {
 			version: `${this.manifest.version}${Platform.isMobile ? " mobile" : ""}${this.settings.attachments ? "" : " notes-only"}`,
 			conflicts: () => vault.getFiles().filter((f) => disk.synced(f) && (f.path.includes(" (conflict ") || f.path.includes(" (recovered "))).length,
 		});
-		const historyBackup = createHistoryBackup({
+		const connected = () => this.session?.transport === transport && transport.status === "synced";
+		const backupConnection = {
 			host, vaultId: keys.vaultId, keys, token: () => keys.token(),
+			requestUrl: async (request: Parameters<HistoryBackupDeps["requestUrl"]>[0]) => {
+				if (!connected()) throw new Error("Ownsync is offline.");
+				return requestUrl(request);
+			},
+		};
+		const historyBackup = createHistoryBackup({
+			...backupConnection,
+			enabled: () => this.settings.backUpHistoryToWorker,
 			docTag: (id) => docTag(keys.vmk, keys.vaultId, id),
 			allDocTags: (id) => Promise.all(keys.vmks.map((vmk) => docTag(vmk, keys.vaultId, id))),
 			noteIdForPath: (path) => engine.noteAt(path),
-			requestUrl: async (request) => {
-				if (this.session?.transport !== transport || transport.status !== "synced") throw new Error("Ownsync is offline.");
-				return requestUrl(request);
+		});
+		const snapshots = createSnapshots({
+			...backupConnection,
+			mobile: Platform.isMobile,
+			ready: () => connected() && !keys.state.removed && !keys.state.fork,
+			vmkFor: keys.keyFor,
+			async *listNotes(maxBytes) {
+				let bytes = 0;
+				for (const file of vault.getMarkdownFiles()) {
+					if (!disk.synced(file)) continue;
+					const { path } = file;
+					const id = engine.noteAt(path);
+					if (!id) continue;
+					bytes += file.stat.size;
+					if (bytes > maxBytes) throw new RangeError("snapshot notes exceed the size limit");
+					yield { id, path, text: await vault.cachedRead(file) };
+				}
 			},
+			// The engine keeps attachment references private. Use notes-only mode if any would be omitted.
+			listAttachments: () => !this.attachments || vault.getFiles().some((file) => disk.synced(file) && !file.path.endsWith(".md")) ? undefined : [],
+			snapshotLedger: () => engine.snapshotLedger(),
+			recordSnapshot: (id, entry) => engine.recordSnapshot(id, entry),
+			forgetSnapshots: (ids) => engine.forgetSnapshots(ids),
+			configDir: vault.configDir,
+			normalizePath,
 		});
 		const refresh = debounce(() => { editors.refresh(); report(); }, 50, true);
 		const report = debounce(() => transport.report(), 5000);
@@ -297,9 +343,9 @@ export default class OwnsyncPlugin extends Plugin {
 		void transport.connect().catch((err) => problem("connecting", err));
 		editors.refresh();
 		return {
-			keys, engine, editors, transport, historyBackup,
+			keys, engine, editors, transport, historyBackup, snapshots,
 			stop: async () => {
-				// Uploads already sent finish first, so a Forget in the next session can't be overtaken by one. At most 5 s.
+				// Drop unsent uploads and give in-flight requests and pending clears up to 5 s to finish.
 				await Promise.race([historyBackup.idle(), new Promise((done) => window.setTimeout(done, 5000))]);
 				for (const [owner, ref] of refs) owner.offref(ref);
 				await editors.stop();
@@ -350,7 +396,7 @@ export default class OwnsyncPlugin extends Plugin {
 	/** Starts this device afresh in a vault (created, paired or recovered): new device keys, then `init`. */
 	async setUp(host: string, vaultId: string, ring: Map<number, Uint8Array>, init?: (keys: VaultKeys) => Promise<void>, pin?: KeyState["pin"]): Promise<void> {
 		await this.session?.stop();
-		this.session = null;
+		this.setSession(null);
 		const store = new IdbStore(`ownsync:${vaultId}`);
 		try {
 			const keys = await VaultKeys.fresh(vaultId, this.ports(store, vaultId), { onProblem: (what, err) => this.problem(what, err) }, ring, pin);
@@ -409,6 +455,7 @@ export default class OwnsyncPlugin extends Plugin {
 		this.onStatusChange?.();
 		this.statusEl.setText(`Ownsync: ${STATUS_TEXT[status]}${this.problems.length ? ` (${this.problems.length} problem${this.problems.length > 1 ? "s" : ""})` : ""}`);
 		if (!changed) return; // problems call this again in the same state: tell once per change
+		this.snapshotSyncEvents.trigger("change");
 		if (status === "unauthorized") new Notice("Ownsync: the Worker rejected this vault's key. Pair this device again from one that syncs.", 15000);
 		if (status === "needs owner code") new Notice("Ownsync: the Worker refused this vault's code: it was already used or has expired. Use Settings → Ownsync → Leave this vault, then connect again with a new code from your Worker's dashboard.", 15000);
 		if (status === "deleted") new Notice("Ownsync: This vault was deleted from the Worker. Your notes stay on this device. Use Leave this vault, then set up again.", 15000);
@@ -516,6 +563,29 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			.setName("Sync attachments")
 			.setDesc("Images, PDFs and other files. Off: this device syncs notes only, and leaves attachments on your other devices alone.")
 			.addToggle((t) => t.setValue(plugin.attachments).onChange(async (on) => { await plugin.setAttachments(on); this.display(); }));
+		new Setting(containerEl)
+			.setName("Back up history to your Worker")
+			.setDesc("Encrypted copies of notes you edit on this device, kept 30 days on your Worker. Off stops this device's backups. Your other devices have their own setting.")
+			.addToggle((toggle) => toggle.setValue(plugin.settings.backUpHistoryToWorker).onChange(async (on) => {
+				const { host, vaultId } = plugin.settings;
+				plugin.settings.backUpHistoryToWorker = on;
+				if (!on) plugin.session?.historyBackup.discardUploads();
+				toggle.setDisabled(true);
+				try {
+					await plugin.saveData(plugin.settings);
+				} catch {
+					plugin.settings.backUpHistoryToWorker = !on;
+					toggle.setValue(!on);
+					new Notice("Couldn't save the history backup setting.");
+					return;
+				} finally {
+					toggle.setDisabled(false);
+				}
+				if (!on && plugin.hasKey() && plugin.settings.host === host && plugin.settings.vaultId === vaultId) {
+					this.confirmDeleteHistoryBackups(host, vaultId);
+				}
+			}));
+		if (plugin.hasKey()) snapshotSettings(containerEl, plugin);
 		new Setting(containerEl).setName("Advanced").setHeading();
 		if (!plugin.attachments) return this.vaultFacts(containerEl);
 		let mb = String(plugin.settings.maxFileMB);
@@ -532,6 +602,22 @@ class OwnsyncSettingTab extends PluginSettingTab {
 				this.display();
 			}));
 		this.vaultFacts(containerEl);
+	}
+
+	private confirmDeleteHistoryBackups(host: string, vaultId: string): void {
+		const { plugin } = this;
+		const modal = new Modal(this.app);
+		modal.titleEl.setText("Delete history backups?");
+		modal.contentEl.createEl("p", { text: "This deletes this vault's history backups from your Worker, including copies uploaded by other devices." });
+		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
+		buttons.createEl("button", { text: "Keep backups" }).onclick = () => modal.close();
+		buttons.createEl("button", { text: "Delete backups", cls: "mod-warning" }).onclick = async () => {
+			modal.close();
+			if (plugin.settings.backUpHistoryToWorker || plugin.settings.host !== host || plugin.settings.vaultId !== vaultId) return;
+			const cleared = await plugin.session?.historyBackup.forgetAll().catch(() => false);
+			new Notice(cleared ? "History backups deleted from the Worker." : "Couldn't delete history backups from the Worker.");
+		};
+		modal.open();
 	}
 
 	private vaultFacts(containerEl: HTMLElement): void {

@@ -10,6 +10,8 @@ Note text, attachment content, file names, folders, or the vault key. Your vault
 
 - How many notes and attachments a vault has, as meaningless IDs, and when and by how much each changes.
 - Attachments as encrypted pieces of up to 1 MB: how many, their sizes, and when two files hold the same content.
+- Encrypted copies from your note history, grouped by opaque note tags. Your Worker can see when each copy arrives and its padded size.
+- If you turn on vault snapshots, your Worker stores them as encrypted parts. It can see when you upload them, how many parts there are, and their padded sizes.
 - When a note is open in an editor and its cursor moves (not where, and not your device's name).
 - When each device is online, its IP address, its random device ID, its Ownsync version, whether it's a phone or a computer, whether it syncs notes only, and how many conflict copies a vault has.
 

@@ -6,7 +6,7 @@ import { type EditorView, ViewPlugin } from "@codemirror/view";
 import { ySyncAnnotation, ySyncFacet } from "y-codemirror.next";
 import { type Doc, type Transaction as YTransaction, UndoManager } from "yjs";
 import type { createHistoryBackup } from "./historyBackup";
-import { MAX_BYTES, type Copy, deletedWhenLabel, keepCopies, mergeCopies, whenLabel } from "./historyRules";
+import { MAX_BYTES, type Copy, deletedWhenLabel, diffLines, keepCopies, mergeCopies, whenLabel } from "./historyRules";
 
 interface DeletedNotesEngine {
 	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number; text: string }[]>;
@@ -408,7 +408,7 @@ class History {
 
 	backupFor(path: string) {
 		const backup = this.backup();
-		if (!backup || backup.client.supported() === false) return;
+		if (!backup || !backup.client.enabled() || backup.client.supported() === false) return;
 		const noteId = backup.client.noteIdForPath(path);
 		if (noteId) return { ...backup, noteId };
 	}
@@ -449,7 +449,9 @@ function isNote(file: unknown): file is TFile {
 
 interface RestoreAction {
 	prompt: string;
-	apply(): Promise<void>;
+	comparePrompt?: string;
+	compare(): Promise<string | undefined>;
+	apply(copy: string, current: string | undefined): Promise<void>;
 }
 
 interface HistoryRow {
@@ -457,6 +459,25 @@ interface HistoryRow {
 	backup?: boolean;
 	read(): Promise<string | undefined>;
 	restore?: RestoreAction;
+}
+
+function showComparison(preview: HTMLElement, current: string, copy: string, context?: string): string {
+	const diff = diffLines(current, copy);
+	const summary = diff ? `${diff.added} ${diff.added === 1 ? "line" : "lines"} added, ${diff.removed} removed.` : "Too long to compare.";
+	preview.setText("");
+	if (context) preview.createEl("span", { text: context, cls: "ownsync-history-diff-summary" });
+	preview.createEl("span", { text: summary, cls: "ownsync-history-diff-summary" });
+	if (!diff) {
+		preview.createEl("span", { text: copy.length > 8_000 ? `${copy.slice(0, 8_000)}…` : copy });
+		return summary;
+	}
+	for (const { type, text } of diff.changes.slice(0, 200)) {
+		const sign = type === "added" ? "+" : "−";
+		const line = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+		preview.createEl("span", { text: `${sign} ${line}`, cls: `ownsync-history-diff-${type}` });
+	}
+	if (diff.changes.length > 200) preview.createEl("span", { text: "Showing the first 200 changed lines." });
+	return summary;
 }
 
 class HistoryModal extends Modal {
@@ -487,7 +508,10 @@ class HistoryModal extends Modal {
 					read: async () => entry.text,
 					restore: {
 						prompt: `Restore ${entry.path} to the vault?`,
-						apply: async () => {
+						comparePrompt: "A note already uses this path. The comparison shows how the deleted copy differs.",
+						compare: () => this.readAtPath(entry.path),
+						apply: async (_, current) => {
+							if (await this.readAtPath(entry.path) !== current) throw new Error("The note at this path changed. Select the copy again to review it.");
 							if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
 							await engine.restoreDeleted(entry.id);
 							new Notice("Note restored.");
@@ -520,19 +544,21 @@ class HistoryModal extends Modal {
 		});
 		const status = this.contentEl.createEl("p", { text: "Loading…", cls: "ownsync-quiet", attr: { role: "status" } });
 		const show = this.showEntries();
-		const current: HistoryRow = { label: "Now", read: () => this.app.vault.cachedRead(file) };
+		const current: HistoryRow = { label: "Now", read: () => this.app.vault.read(file) };
 		show([current]);
 		const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
 		const forget = actions.createEl("button", { text: "Forget this note's history" });
-		forget.onclick = () => this.confirm(forget, "Forget this note's history?", "Forget", {
-			prompt: "Delete this device's copies and clear the note's backup?",
-			apply: async () => {
-				const result = await this.history.forgetNote(file.path);
-				if (!result) return;
-				if (await result.remote === false) new Notice("Local history cleared. Couldn't clear the backup.");
-				if (this.showing) this.close();
-			},
-		}, true);
+		forget.onclick = () => {
+			const prompt = this.history.backupFor(file.path) ? "Delete this device's copies and clear the note's backup?" : "Delete this device's copies?";
+			this.confirm(forget, "Forget this note's history?", "Forget",
+				`${prompt} Snapshots still hold this note's text until they expire or you delete them.`,
+				async () => {
+					const result = await this.history.forgetNote(file.path);
+					if (!result) return;
+					if (this.showing) this.close();
+					if (await result.remote === false) new Notice("Local history cleared. Couldn't clear the backup.");
+				}, true);
+		};
 		const local = await this.history.list(path).then((entries) => Promise.all(entries.map(async (entry) => {
 			const read = () => this.history.text(entry);
 			const text = await read();
@@ -562,12 +588,14 @@ class HistoryModal extends Modal {
 			read,
 			restore: {
 				prompt: "This replaces the current text of the note.",
-				apply: async () => {
-					const text = await read();
-					if (text === undefined) throw new Error("This copy is no longer available.");
+				compare: () => this.app.vault.read(file),
+				apply: async (text, current) => {
 					const { vault } = this.app;
 					if (!isNote(file) || vault.getFileByPath(file.path) !== file) throw new Error("The note is gone.");
-					await vault.modify(file, text);
+					await vault.process(file, (latest) => {
+						if (latest !== current) throw new Error("The note changed. Select the copy again to review it.");
+						return text;
+					});
 				},
 			},
 		};
@@ -580,13 +608,16 @@ class HistoryModal extends Modal {
 			read,
 			restore: {
 				prompt: `Restore ${entry.path} to the vault?`,
-				apply: async () => {
-					const text = await read();
-					if (text === undefined) throw new Error("This copy is no longer available.");
-					await this.restoreLocalDeleted(entry, text);
-				},
+				comparePrompt: "A note already uses this path. The restored note will get a new name.",
+				compare: () => this.readAtPath(entry.path),
+				apply: (text) => this.restoreLocalDeleted(entry, text),
 			},
 		};
+	}
+
+	private async readAtPath(path: string): Promise<string | undefined> {
+		const file = this.app.vault.getFileByPath(path);
+		if (isNote(file)) return this.app.vault.read(file);
 	}
 
 	private showEntries(): (entries: HistoryRow[]) => void {
@@ -614,13 +645,21 @@ class HistoryModal extends Modal {
 			try {
 				const text = await entry.read();
 				if (!this.showing || selection !== version) return;
-				preview.setText(text ?? "This copy is no longer available.");
+				const current = text === undefined ? undefined : await action?.compare();
+				if (!this.showing || selection !== version) return;
+				let prompt = action?.prompt ?? "";
+				if (current !== undefined && text !== undefined) {
+					const summary = showComparison(preview, current, text, action?.comparePrompt);
+					if (action?.comparePrompt) prompt += ` ${action.comparePrompt}`;
+					prompt += ` ${summary}`;
+				} else preview.setText(text ?? "This copy is no longer available.");
+				preview.scrollTop = 0;
 				if (action && text !== undefined) {
 					restore.disabled = false;
-					restore.onclick = () => this.confirm(restore, "Restore this copy?", "Restore", {
-						prompt: action.prompt,
-						apply: () => this.restore(action),
-					}, !!this.file);
+					restore.onclick = () => this.confirm(restore, "Restore this copy?", "Restore", prompt, () => this.restore(async () => {
+						if (await entry.read() !== text) throw new Error("This copy is no longer available.");
+						await action.apply(text, current);
+					}), !!this.file);
 				}
 			} catch {
 				if (this.showing && selection === version) preview.setText("Couldn't load the preview.");
@@ -647,20 +686,20 @@ class HistoryModal extends Modal {
 		};
 	}
 
-	private confirm(button: HTMLButtonElement, title: string, label: string, action: RestoreAction, warning: boolean): void {
+	private confirm(button: HTMLButtonElement, title: string, label: string, prompt: string, apply: () => Promise<void>, warning: boolean): void {
 		if (this.confirmation || this.acting) return;
 		const modal = new Modal(this.app);
 		this.confirmation = modal;
 		modal.onClose = () => { this.confirmation = undefined; };
 		modal.titleEl.setText(title);
-		modal.contentEl.createEl("p", { text: action.prompt });
+		modal.contentEl.createEl("p", { text: prompt });
 		const actions = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		actions.createEl("button", { text: "Cancel" }).onclick = () => modal.close();
 		actions.createEl("button", { text: label, cls: warning ? "mod-warning" : "mod-cta" }).onclick = () => {
 			modal.close();
 			button.disabled = true;
 			this.acting = true;
-			void action.apply().finally(() => {
+			void apply().finally(() => {
 				this.acting = false;
 				if (this.showing) button.disabled = false;
 			});
@@ -668,9 +707,9 @@ class HistoryModal extends Modal {
 		modal.open();
 	}
 
-	private async restore(action: RestoreAction): Promise<void> {
+	private async restore(apply: () => Promise<void>): Promise<void> {
 		try {
-			await action.apply();
+			await apply();
 			this.close();
 		} catch (err) {
 			new Notice(err instanceof Error ? `Couldn't restore the note. ${err.message}` : "Couldn't restore the note.");

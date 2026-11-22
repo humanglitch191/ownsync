@@ -48,6 +48,59 @@ export function mergeCopies<T extends { takenAt: number; text: string }>(local: 
 	return kept.sort(newestFirst);
 }
 
+interface LineChange {
+	type: "added" | "removed";
+	text: string;
+}
+
+/** Compare the current text with a restore candidate. Omit unchanged lines and bound the LCS table. */
+export function diffLines(current: string, copy: string): { added: number; removed: number; changes: LineChange[] } | undefined {
+	if (current === copy) return { added: 0, removed: 0, changes: [] };
+	const maxLines = 5_000;
+	if (current.length + copy.length > 2 * 1024 * 1024) return;
+	const split = (text: string) => text ? text.split(/\r?\n/, maxLines + 1) : [];
+	const before = split(current), after = split(copy);
+	if (before.length > maxLines || after.length > maxLines) return;
+	let start = 0, endBefore = before.length, endAfter = after.length;
+	while (start < endBefore && start < endAfter && before[start] === after[start]) start++;
+	while (endBefore > start && endAfter > start && before[endBefore - 1] === after[endAfter - 1]) {
+		endBefore--;
+		endAfter--;
+	}
+	const rows = endBefore - start + 1, columns = endAfter - start + 1;
+	if (rows * columns > 2_000_000) return;
+	const ids = new Map<string, number>();
+	const identify = (line: string): number => {
+		let id = ids.get(line);
+		if (id === undefined) ids.set(line, id = ids.size);
+		return id;
+	};
+	const from = before.slice(start, endBefore).map(identify), to = after.slice(start, endAfter).map(identify);
+	const lcs = new Uint16Array(rows * columns);
+	for (let i = from.length - 1; i >= 0; i--) {
+		for (let j = to.length - 1; j >= 0; j--) {
+			const cell = i * columns + j;
+			lcs[cell] = from[i] === to[j] ? 1 + lcs[cell + columns + 1]! : Math.max(lcs[cell + columns]!, lcs[cell + 1]!);
+		}
+	}
+	const changes: LineChange[] = [];
+	let added = 0, removed = 0, i = 0, j = 0;
+	while (i < from.length || j < to.length) {
+		const cell = i * columns + j;
+		if (i < from.length && j < to.length && from[i] === to[j]) {
+			i++;
+			j++;
+		} else if (i < from.length && (j === to.length || lcs[cell + columns]! >= lcs[cell + 1]!)) {
+			changes.push({ type: "removed", text: before[start + i++]! });
+			removed++;
+		} else {
+			changes.push({ type: "added", text: after[start + j++]! });
+			added++;
+		}
+	}
+	return { added, removed, changes };
+}
+
 export function whenLabel(time: number, now: number): string {
 	const date = new Date(time), today = new Date(now);
 	const pad = (number: number) => String(number).padStart(2, "0");

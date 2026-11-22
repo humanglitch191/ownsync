@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deletedWhenLabel, keepCopies, mergeCopies, whenLabel, type Copy } from "../src/historyRules";
+import { deletedWhenLabel, diffLines, keepCopies, mergeCopies, whenLabel, type Copy } from "../src/historyRules";
 
 const HOUR = 60 * 60_000;
 const now = new Date(2026, 10, 22, 15, 0).getTime();
@@ -61,4 +61,33 @@ test("copies within one source also deduplicate, keeping the latest timestamp", 
 	const copies = [first, latest];
 	assert.deepEqual(mergeCopies(copies, []), [latest]);
 	assert.deepEqual(mergeCopies([], copies), [latest]);
+});
+
+test("the restore diff keeps a common subsequence and reports changes from Now to the copy", () => {
+	assert.deepEqual(diffLines("heading\nold\nkeep\nkeep\ncurrent end\n", "heading\nkeep\nnew\nkeep\ncopy end\n"), {
+		added: 2, removed: 2,
+		changes: [
+			{ type: "removed", text: "old" },
+			{ type: "added", text: "new" },
+			{ type: "removed", text: "current end" },
+			{ type: "added", text: "copy end" },
+		],
+	});
+});
+
+test("the restore diff handles empty notes, line endings and a missing final newline", () => {
+	assert.deepEqual(diffLines("", "first"), { added: 1, removed: 0, changes: [{ type: "added", text: "first" }] });
+	assert.deepEqual(diffLines("first", ""), { added: 0, removed: 1, changes: [{ type: "removed", text: "first" }] });
+	assert.deepEqual(diffLines("first\r\nsecond\r\n", "first\nsecond\n"), { added: 0, removed: 0, changes: [] });
+	assert.deepEqual(diffLines("first\n", "first"), { added: 0, removed: 1, changes: [{ type: "removed", text: "" }] });
+});
+
+test("the restore diff caps line count, table size and text size while allowing small changes in long notes", () => {
+	assert.equal(diffLines("x\n".repeat(5_000), "y"), undefined);
+	assert.equal(diffLines("x\n".repeat(2_000), "y\n".repeat(2_000)), undefined);
+	assert.equal(diffLines("x".repeat(2 * 1024 * 1024), "y"), undefined);
+	const prefix = "x\n".repeat(4_999);
+	assert.deepEqual(diffLines(prefix + "old", prefix + "new"), {
+		added: 1, removed: 1, changes: [{ type: "removed", text: "old" }, { type: "added", text: "new" }],
+	});
 });

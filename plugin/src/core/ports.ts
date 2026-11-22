@@ -1,7 +1,7 @@
 // What the sync engine needs from the outside world. The Obsidian plugin implements these with IndexedDB,
 // the vault and the encrypted connection; the tests implement them in memory.
 
-/** "index" (the map from note ID to path) or a note's or attachment's ID. */
+/** "index" (the vault's note map and snapshot ledger) or a note's or attachment's ID. */
 export type DocId = string;
 
 /** A deleted markdown note whose text is stored on this device. */
@@ -11,6 +11,18 @@ export interface DeletedNote {
 	/** Milliseconds since the epoch on the deleting device. Older tombstones have no timestamp. */
 	deletedAt?: number;
 	text: string;
+}
+
+/** An encrypted vault snapshot recorded in the synced index. */
+export interface SnapshotLedgerEntry {
+	/** The Worker's UTC day number (days since the epoch). */
+	day: number;
+	epoch: number;
+	/** SHA-256 hashes of the sealed part envelopes, in order. */
+	parts: string[];
+	notesOnly: boolean;
+	/** Milliseconds since the epoch on the device that took the snapshot. */
+	takenAt: number;
 }
 
 /** A Yjs update for one document. A snapshot is the whole document; the server may drop what it replaces. */

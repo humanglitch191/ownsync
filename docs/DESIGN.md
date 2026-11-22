@@ -34,7 +34,7 @@ Rule: the server only ever participates in the third plane. Any feature that nee
 
 - **Vault master key (VMK).** A random 256-bit key created on the first device. It never leaves a device except wrapped: to another device during pairing or rotation, or to the recovery public key.
 - **Subkeys via HKDF from the VMK:**
-  - seal key, one per device: seals that device's updates, snapshots, presence, attachment chunks and history copies (the kind is bound in the AD, so one key serves all of them)
+  - seal key, one per device: seals that device's updates, snapshots, presence, attachment chunks, history copies and whole-vault snapshot parts (the kind is bound in the AD, so one key serves all of them)
   - name key: HMAC that names attachment chunks
   - auth token: proves to the server that a socket belongs to the vault. The server stores only its SHA-256 and rejects anything else.
 - **No per-device signatures in v1.** Every device holds the VMK and the server doesn't, so AES-GCM already stops the server forging or altering content. Signatures would only tell your own devices apart. Each envelope starts with a version byte and a cipher-suite id, both covered by the AD, and receivers reject unknown versions, so signatures can be added as a trailer later (needed for sharing) without breaking old data. Decided 2026-11-13 after an independent review.
@@ -147,7 +147,19 @@ The owner's rule: only a release I author and sign myself can install. Each Work
 
 The plugin can upload copies from its local note history and list them from another device. Each copy is a separate encrypted envelope filed under the note's current-epoch document tag. The plugin pads the encoded copy to a power-of-two KiB bucket and skips copies larger than 1 MiB. When opening history, it checks the current epoch, vault, note tag, note ID and copy time. Copies appear newest first by their sealed timestamp. The reported device ID comes from the envelope and is a claim any vault member can make.
 
+Uploads wait a random 30 seconds to 5 minutes. On session stop, the plugin drops unsent uploads and keeps their local copies. Pending clears and requests already on the wire get up to five seconds to finish.
+
 After a key rotation, the plugin lists copies from the new epoch. It can clear copies for a note's current tag or for the whole vault. An older Worker leaves local history available. A restore writes the selected text as an ordinary edit, which the sync engine handles like any other edit.
+
+## 9. Encrypted whole-vault snapshots
+
+Once a device is connected and caught up, it can take a daily snapshot of Markdown text and the current attachment references. If references are unavailable, it can take a notes-only snapshot. The Worker assigns the UTC day and stores individually encrypted parts. The device checks the Worker's list before collecting files and records the ordered hashes in the encrypted synced index after the Worker acknowledges the complete upload. It remembers the successful day in local storage so a restart after deletion won't recreate the day's snapshot.
+
+The Worker keeps seven UTC days and the newest snapshot in each of the four ISO weeks entirely before that window. It can prune older complete snapshots as uploads arrive to stay within 400 MiB, and always protects the newest complete copy.
+
+The synced index determines which snapshots a device can open. The Worker can supply ciphertext and report availability. Devices verify each envelope against the ledger before decrypting it, including when using an older key from the key ring. After validating every part and the bounded gzip stream, the plugin checks all file paths against the vault's path rules. The snapshot client exposes note text and attachment paths to the caller. File restores are handled by the caller.
+
+The list shows ledger entries whose data is absent from the Worker. Removing a snapshot asks the Worker to delete it and then removes the ledger entry. Upload and deletion are serialized within each vault session.
 
 ## What the server can still see
 
@@ -156,9 +168,10 @@ After a key rotation, the plugin lists copies from the new epoch. It can clear c
 - when a note is open in an editor and its cursor moves (presence frames), though not where or by whom
 - attachment chunk count and sizes, when chunks are uploaded and which device fetches which; that two files in the vault hold the same content (same chunk names)
 - which note tags get history copies, the padded sizes and upload times, and which device's connection sends them
+- whole-vault snapshot IDs, upload days and times, epochs, part counts and padded envelope sizes
 - the number and size of membership records, when the epoch changes, whether there is a recovery key, and for each rotation the IDs of the devices it wraps the key to and the rotating device's ID and public key (in clear so a recovering device can open its wrap). Device IDs are also in every envelope header.
 
-History envelopes already use fixed size buckets. Padding other envelope kinds would also reduce the precision of their visible sizes. Identifiers are random or HMAC-derived.
+History envelopes and whole-vault snapshot parts use fixed size buckets. Identifiers are random or HMAC-derived.
 
 ## Prior art
 
@@ -204,7 +217,7 @@ Deferred so far, one line each:
 - Before the first vault exists, a botnet sending over 1,000 wrong setup keys an hour can block creating it; the way out is a new `SETUP_KEY` in the Cloudflare dashboard, which the locked message says.
 - Scanning a real pairing QR on iOS is untested; the handler is tested by calling it directly. The QR opens the Worker's own add-device page, which hands the link to Obsidian, because a phone's camera opens web links. That page can read the pairing code, so whoever controls the Worker (or the Cloudflare account) could change it and take the vault key while a device is being added. Accepted (owner decision 2026-11-14: everything on the Worker, no other site); copying the link on a computer skips the page.
 - File names that are invalid on one platform, or differ only by case, are reported per note and not synced there.
-- No envelope padding.
+- Sync envelopes use their encoded size.
 - Attachment chunks no longer referenced are never deleted from the Worker (garbage collection), so replaced and deleted attachments keep using its 1 GB.
 - A chunk reference records no epoch: every chunk is under epoch 0 until rotation exists, which must add it.
 - A file is in memory whole while it is read, hashed or written (Obsidian has no partial reads or writes), so the size limit also bounds memory. A download interrupted by a crash starts over.
