@@ -2,6 +2,10 @@
 
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { SNAPSHOT_BUDGET, snapshotsToPrune } from "../src/snapshots.ts";
 import { CLOSE, type ClientFrame, type ServerFrame, decodeClient, decodeServer, encodeClient, encodeServer } from "../src/wire.ts";
 import { type Stats, claim, startDev, stats } from "./devServer.ts";
 
@@ -415,6 +419,211 @@ test("history evicts the oldest copy when uploads exceed the vault's 50 MiB limi
 	assert.equal(await listMarker(), 5);
 	await upload(copy);
 	assert.equal(await listMarker(), 0);
+});
+
+const snapshotPost = (v: string, path: string, ...parts: Uint8Array[]) => fetch(`http://localhost:${PORT}/vault/${v}/${path}`, { method: "POST", body: Buffer.concat(parts) });
+const snapshotPart = (id: Uint8Array, index: number, count: number, envelope: Uint8Array) => {
+	const header = Buffer.alloc(4);
+	header.writeUInt16BE(index, 0);
+	header.writeUInt16BE(count, 2);
+	return Buffer.concat([id, header, envelope]);
+};
+
+test("sealed vault snapshots authenticate, complete out of order, stream in order, and can be erased", async () => {
+	const v = vault(), tok = token(), a = await connect(v, tok);
+	await a.catchUp(0);
+	const post = (path: string, ...parts: Uint8Array[]) => snapshotPost(v, path, tok, ...parts);
+	const id = doc(1), other = doc(2);
+	const envelopes = [Uint8Array.of(1, 1, 7, 1, 2, 3, 4, 30), Uint8Array.of(20, 21), Uint8Array.of(10)];
+	const paths = ["snapshot", "snapshot/list", "snapshot/get", "snapshot/delete"];
+	for (const path of paths) {
+		assert.equal((await snapshotPost(v, path, token())).status, 401);
+		assert.equal((await fetch(`http://localhost:${PORT}/vault/${v}/${path}`)).status, 405);
+	}
+	assert.equal((await post("snapshot/list", id)).status, 400);
+	assert.equal((await post("snapshot/get", id.subarray(0, 15))).status, 400);
+	assert.equal((await post("snapshot/delete", id.subarray(0, 15))).status, 400);
+	assert.equal((await post("snapshot/get", id)).status, 404);
+	for (const [index, count] of [[0, 0], [0, 513], [1, 1]]) {
+		assert.equal((await post("snapshot", snapshotPart(id, index, count, envelopes[0]))).status, 400);
+	}
+	for (const length of [0, 1024 * 1024 + 257]) {
+		assert.equal((await post("snapshot", snapshotPart(id, 0, 1, new Uint8Array(length)))).status, 413);
+	}
+
+	const home = `http://localhost:${PORT}`;
+	const unknown = await post("snapshot", snapshotPart(id, 2, 3, envelopes[2]));
+	assert.equal(unknown.status, 409);
+	assert.deepEqual(await unknown.json(), { error: "restart" });
+	const before = await stats(home, v);
+	const first = snapshotPart(id, 0, 3, envelopes[0]);
+	const response = await post("snapshot", first);
+	assert.equal(response.status, 200);
+	const started = await response.json() as { day: number };
+	const day = started.day;
+	assert.deepEqual(started, { ok: true, day, complete: false });
+	const after = await stats(home, v);
+	assert.equal(after.requestsToday - before.requestsToday, 1);
+	assert.ok(after.rowsWrittenToday - before.rowsWrittenToday >= 2);
+	const list = async () => {
+		const r = await post("snapshot/list");
+		assert.equal(r.status, 200);
+		return await r.json() as { at: number }[];
+	};
+	const [row] = await list();
+	assert.ok(row.at >= Date.now() - 60_000 && row.at <= Date.now());
+	assert.equal(Math.floor(row.at / 86_400_000), day);
+	const metadata = { id: Buffer.from(id).toString("hex"), day, epoch: 0x01020304, parts: 3, at: row.at };
+	assert.deepEqual(row, { ...metadata, received: 1, size: 8, complete: false });
+	assert.equal((await post("snapshot/get", id)).status, 404);
+	const taken = await post("snapshot", snapshotPart(other, 0, 1, envelopes[0]));
+	assert.equal(taken.status, 409);
+	assert.deepEqual(await taken.json(), { error: "taken" });
+	const retry = await post("snapshot", first);
+	assert.equal(retry.status, 200);
+	assert.deepEqual(await retry.json(), started);
+	assert.equal((await post("snapshot", snapshotPart(id, 0, 3, Uint8Array.of(2, ...envelopes[0].subarray(1))))).status, 409);
+	assert.equal((await post("snapshot", snapshotPart(id, 0, 2, envelopes[0]))).status, 409);
+	for (const index of [2, 1]) {
+		const upload = await post("snapshot", snapshotPart(id, index, 3, envelopes[index]));
+		assert.equal(upload.status, 200);
+		assert.deepEqual(await upload.json(), { ok: true, day, complete: index === 1 });
+	}
+	const [finished] = await list();
+	assert.ok(finished.at >= row.at);
+	assert.deepEqual(finished, { ...metadata, at: finished.at, received: 3, size: 11, complete: true });
+	const get = await post("snapshot/get", id);
+	assert.equal(get.status, 200);
+	assert.equal(get.headers.get("content-type"), "application/octet-stream");
+	assert.deepEqual(new Uint8Array(await get.arrayBuffer()), Uint8Array.of(
+		0, 0, 0, 0, 0, 8, ...envelopes[0],
+		0, 1, 0, 0, 0, 2, ...envelopes[1],
+		0, 2, 0, 0, 0, 1, ...envelopes[2],
+	));
+	const retried = await post("snapshot", first);
+	assert.equal(retried.status, 200);
+	assert.deepEqual(await retried.json(), { ok: true, day, complete: true });
+
+	assert.equal((await post("snapshot/delete", other)).status, 200);
+	assert.equal((await post("snapshot/get", id)).status, 200);
+	assert.equal((await post("snapshot/delete", id)).status, 200);
+	assert.equal((await post("snapshot/get", id)).status, 404);
+	const replacement = snapshotPart(id, 0, 1, envelopes[1]);
+	assert.equal((await post("snapshot", replacement)).status, 200);
+	assert.equal((await post("snapshot/delete")).status, 200);
+	assert.deepEqual(await list(), []);
+	assert.equal((await post("snapshot", replacement)).status, 200);
+	assert.equal((await post("delete")).status, 200);
+	assert.equal(await a.closed, CLOSE.deleted);
+	for (const path of paths) assert.equal((await post(path)).status, 410);
+});
+
+async function snapshotVaultWithDb() {
+	const directory = join(dev.persistDir, "v3/do/ownsync-Vault");
+	const existing = new Set(readdirSync(directory));
+	const v = vault(), tok = token(), a = await connect(v, tok);
+	await a.catchUp(0);
+	const [file] = readdirSync(directory).filter((file) => /^[0-9a-f]{64}\.sqlite$/.test(file) && !existing.has(file));
+	assert.ok(file, "the local Worker created a new SQLite database for this vault");
+	return { v, tok, a, db: new DatabaseSync(join(directory, file)) };
+}
+
+test("snapshot leases renew on accepted parts, and expired uploads must restart", async () => {
+	const { v, tok, a, db } = await snapshotVaultWithDb();
+	try {
+		const upload = (id: Uint8Array, index = 0) => snapshotPost(v, "snapshot", tok, snapshotPart(id, index, 3, Uint8Array.of(1)));
+		const age = (id: Uint8Array, elapsed = 3_600_001) => {
+			// The Worker runs in a separate process. Age the lease in its local database without a test route.
+			assert.equal(db.prepare("UPDATE snapshots SET at = ? WHERE snapshot = ?").run(Date.now() - elapsed, id).changes, 1);
+		};
+		const first = doc(1), second = doc(2);
+		assert.equal((await upload(first)).status, 200);
+		assert.equal((await upload(second)).status, 409);
+		for (const index of [0, 1]) {
+			age(first, 3_000_000);
+			const now = Date.now();
+			assert.equal((await upload(first, index)).status, 200);
+			assert.ok(Number(db.prepare("SELECT at FROM snapshots WHERE snapshot = ?").get(first)?.at) >= now);
+		}
+		age(first);
+		const expired = await upload(first, 2);
+		assert.equal(expired.status, 409);
+		assert.deepEqual(await expired.json(), { error: "restart" });
+		assert.equal((await upload(second)).status, 200);
+		assert.equal(db.prepare("SELECT count(*) AS n FROM snapshot_parts WHERE snapshot = ?").get(first)?.n, 0);
+		age(second);
+		a.send({ t: "hello", token: tok });
+		await a.catchUp(0);
+		assert.equal(db.prepare("SELECT count(*) AS n FROM snapshots").get()?.n, 0);
+		assert.equal(db.prepare("SELECT count(*) AS n FROM snapshot_parts").get()?.n, 0);
+		assert.equal((await upload(first)).status, 200);
+		assert.equal((await upload(first, 1)).status, 200);
+		assert.equal((await upload(first, 2)).status, 200);
+		db.exec("UPDATE snapshots SET day = day - 1, at = at - 86400000; UPDATE snapshot_parts SET day = day - 1, at = at - 86400000");
+		assert.equal((await upload(second)).status, 200);
+		const response = await snapshotPost(v, "snapshot/list", tok);
+		assert.equal(response.status, 200);
+		const listed = await response.json() as { id: string; complete: boolean }[];
+		assert.deepEqual(listed.map(({ id, complete }) => [id, complete]), [[Buffer.from(second).toString("hex"), false], [Buffer.from(first).toString("hex"), true]]);
+		assert.equal((await snapshotPost(v, "delete", tok)).status, 200);
+		for (const table of ["history", "snapshots", "snapshot_parts"]) {
+			assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.n, 0);
+		}
+	} finally {
+		db.close();
+		a.ws.close();
+	}
+});
+
+test("a snapshot part prunes old complete rows for space or is refused without erasing uploads", async () => {
+	const { v, tok, a, db } = await snapshotVaultWithDb();
+	try {
+		const today = Math.floor(Date.now() / 86_400_000);
+		const insert = db.prepare("INSERT INTO snapshots (snapshot, day, at, epoch, parts, received, size) VALUES (?, ?, ?, 0, 2, ?, ?)");
+		const size = SNAPSHOT_BUDGET / 8;
+		for (let i = 1; i <= 8; i++) insert.run(doc(i), today - i, Date.now(), i <= 2 ? 2 : 1, size);
+		const upload = (index: number) => snapshotPost(v, "snapshot", tok, snapshotPart(doc(9), index, 3, Uint8Array.of(1)));
+		assert.equal((await upload(0)).status, 200);
+		assert.equal(db.prepare("SELECT 1 FROM snapshots WHERE snapshot = ?").get(doc(2)), undefined);
+		assert.ok(db.prepare("SELECT 1 FROM snapshots WHERE snapshot = ?").get(doc(1)));
+		insert.run(doc(10), today - 9, Date.now(), 1, size - 1);
+		const refused = await upload(1);
+		assert.equal(refused.status, 413);
+		assert.deepEqual(await refused.json(), { error: "snapshot storage full" });
+		assert.equal(db.prepare("SELECT sum(size) AS size FROM snapshots").get()?.size, SNAPSHOT_BUDGET);
+		assert.equal(db.prepare("SELECT received FROM snapshots WHERE snapshot = ?").get(doc(9))?.received, 1);
+		assert.ok(db.prepare("SELECT 1 FROM snapshots WHERE snapshot = ?").get(doc(1)));
+	} finally {
+		db.close();
+		a.ws.close();
+	}
+});
+
+test("a vault snapshot cannot exceed 50 MiB, and rejection leaves the final part available", async () => {
+	const v = vault(), tok = token(), a = await connect(v, tok);
+	await a.catchUp(0);
+	a.ws.close();
+	const id = doc(1), part = new Uint8Array(1024 * 1024 + 64);
+	const upload = (index: number, envelope: Uint8Array) => snapshotPost(v, "snapshot", tok, snapshotPart(id, index, 50, envelope));
+	for (let index = 0; index < 49; index++) assert.equal((await upload(index, part)).status, 200);
+	const remaining = 50 * 1024 * 1024 - 49 * part.length;
+	assert.equal((await upload(49, part.subarray(0, remaining + 1))).status, 413);
+	const last = await upload(49, part.subarray(0, remaining));
+	assert.equal(last.status, 200);
+	const result = await last.json() as { complete: boolean };
+	assert.equal(result.complete, true);
+});
+
+test("vault snapshot retention keeps daily and ISO-weekly representatives and trims oldest bytes first", () => {
+	const today = Date.parse("2026-11-19") / 86_400_000; // Thursday
+	const row = (age: number, size = 1, complete = true) => ({ day: today - age, size, complete });
+	const retainedAges = (rows: ReturnType<typeof row>[]) => {
+		const removed = snapshotsToPrune(rows, today);
+		return rows.filter((item) => !removed.includes(item)).map((item) => today - item.day).sort((a, b) => a - b);
+	};
+	assert.deepEqual(retainedAges(Array.from({ length: 45 }, (_, age) => row(age)).reverse()), [0, 1, 2, 3, 4, 5, 6, 11, 18, 25, 32]);
+	assert.deepEqual(retainedAges([row(0, 1, false), row(45), row(46)]), [0, 45]);
+	assert.deepEqual(retainedAges([0, 1, 2, 3, 4, 5, 6, 11, 18].map((age) => row(age, 50 * 1024 * 1024))), [0, 1, 2, 3, 4, 5, 6, 11]);
 });
 
 test("deleting a vault takes its token; then its devices are told 4004, it can't be created again, and only a tombstone is left", async () => {

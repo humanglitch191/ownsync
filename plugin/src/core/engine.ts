@@ -2,8 +2,9 @@
 // connection (ports.ts), and keeps them in agreement.
 //
 // Model
-//   - The index: one Yjs map from a permanent note ID to { p: path } or, for a deleted note,
-//     { p, d: the state vector the deleting device had seen, t: when it deleted the note (if known) }.
+//   - The index: one Yjs document with a "notes" map from a permanent note ID to { p: path } or, for a
+//     deleted note, { p, d: the state vector the deleting device had seen, t: when it deleted the note
+//     (if known) }, and a "snapshots" map that records hashes of encrypted vault snapshots.
 //   - One Yjs document per note (text "t"). Only notes open in an editor stay loaded.
 //   - Per note, this device remembers where the file is and a hash of the text that file and document last
 //     agreed on. "base:<id>" holds the note's state at that agreement for as long as the document is ahead
@@ -45,11 +46,13 @@
 
 import * as Y from "yjs";
 import { applyText } from "./text";
-import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, Meta, NoteMeta, Ref, ServerMsg, Store, Upload } from "./ports";
+import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
 
 const INDEX: DocId = "index";
 const REMOTE = "ownsync-remote"; // transaction origin for changes that didn't start on this device
 type IndexValue = { p: string; d?: string; t?: number };
+const SNAPSHOT_ID = /^[0-9a-f]{32}$/;
+const PART_HASH = /^[0-9a-f]{64}$/i;
 /** Chunks in flight each way: enough to keep the line busy, few enough that memory holds one file plus these. */
 const WINDOW = 4;
 
@@ -119,10 +122,26 @@ const conflictName = (path: string, id: string) => path.replace(/(\.[^./]*)?$/, 
 /** Everything else is an attachment. Exactly Obsidian's rule, so a file is the same kind everywhere. */
 const isNote = (path: string) => path.endsWith(".md");
 
+function parseSnapshotLedgerEntry(value: unknown): SnapshotLedgerEntry | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+	const { day, epoch, parts, notesOnly, takenAt } = value as Partial<SnapshotLedgerEntry>;
+	if (typeof day !== "number" || !Number.isSafeInteger(day) ||
+		typeof epoch !== "number" || !Number.isSafeInteger(epoch) ||
+		typeof takenAt !== "number" || !Number.isSafeInteger(takenAt) || typeof notesOnly !== "boolean" ||
+		!Array.isArray(parts) || parts.length < 1 || parts.length > 512) return;
+	const hashes: string[] = [];
+	for (const part of parts) {
+		if (typeof part !== "string" || !PART_HASH.test(part)) return;
+		hashes.push(part);
+	}
+	return { day, epoch, parts: hashes, notesOnly, takenAt };
+}
+
 export class Engine {
 	private meta: Meta = { cursor: 0, synced: false, nextOut: 1 };
 	private index = new Y.Doc();
 	private notes = this.index.getMap<IndexValue>("notes");
+	private snapshots = this.index.getMap<unknown>("snapshots");
 	private metas = new Map<string, NoteMeta>();
 	private byPath = new Map<string, string>(); // disk path → note ID
 	private opened = new Map<string, Y.Doc>();
@@ -316,6 +335,40 @@ export class Engine {
 		});
 	}
 
+	/** Record the ordered part hashes of an encrypted vault snapshot in the synced index. */
+	recordSnapshot(id: string, entry: SnapshotLedgerEntry): Promise<void> {
+		return this.run("record snapshot", async () => {
+			if (typeof id !== "string" || !SNAPSHOT_ID.test(id)) return;
+			const snapshot = parseSnapshotLedgerEntry(entry);
+			if (!snapshot) return;
+			if (this.snapshots.has(id)) {
+				const previous = parseSnapshotLedgerEntry(this.snapshots.get(id));
+				if (!previous || previous.parts.length !== snapshot.parts.length ||
+					previous.parts.some((part, i) => part !== snapshot.parts[i])) return;
+			}
+			this.snapshots.set(id, snapshot);
+		});
+	}
+
+	snapshotLedger(): Promise<Map<string, SnapshotLedgerEntry>> {
+		const ledger = new Map<string, SnapshotLedgerEntry>();
+		return this.run("read snapshot ledger", async () => {
+			for (const [id, value] of this.snapshots) {
+				if (!SNAPSHOT_ID.test(id)) continue;
+				const snapshot = parseSnapshotLedgerEntry(value);
+				if (snapshot) ledger.set(id, snapshot);
+			}
+		}).then(() => ledger);
+	}
+
+	forgetSnapshots(ids?: string[]): Promise<void> {
+		return this.run("forget snapshots", async () => {
+			this.index.transact(() => {
+				for (const id of ids ?? this.snapshots.keys()) this.snapshots.delete(id);
+			});
+		});
+	}
+
 	connected(link: Link): Promise<void> {
 		return this.run("connected", async () => {
 			this.link = link;
@@ -410,6 +463,10 @@ export class Engine {
 
 	noteAt(path: string): string | undefined {
 		return this.byPath.get(path);
+	}
+
+	pathOf(id: string): string | undefined {
+		return this.effectivePath(id);
 	}
 
 	isOpen(id: string): boolean {

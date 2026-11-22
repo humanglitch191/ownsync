@@ -2,6 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as Y from "yjs";
 import { Device, Server, bytes, latin1, quiesce, rng } from "./sim";
 
 function world(n = 2, seed = 1) {
@@ -19,13 +20,18 @@ test("a note created, edited, renamed and deleted on one device follows on the o
 	a!.write("Plan.md", "first");
 	await quiesce([a!, b!]);
 	assert.deepEqual(disk(b!), { "Plan.md": "first" });
+	const id = b!.engine!.noteAt("Plan.md");
+	assert.ok(id);
+	assert.equal(b!.engine!.pathOf(id), "Plan.md");
 	a!.write("Plan.md", "first second");
 	a!.rename("Plan.md", "Work/Plan.md");
 	await quiesce([a!, b!]);
 	assert.deepEqual(disk(b!), { "Work/Plan.md": "first second" });
+	assert.equal(b!.engine!.pathOf(id), "Work/Plan.md");
 	b!.remove("Work/Plan.md");
 	await quiesce([a!, b!]);
 	assert.deepEqual(disk(a!), {});
+	assert.equal(a!.engine!.pathOf(id), undefined);
 	noProblems([a!, b!]);
 });
 
@@ -137,6 +143,61 @@ test("another device can list and restore a deleted note with a full snapshot", 
 	c.connect();
 	await quiesce(devs);
 	assert.deepEqual(disk(c), disk(a));
+	noProblems(devs);
+});
+
+test("the snapshot ledger syncs, survives a full index snapshot and supports selective removal", async () => {
+	const { server, devs: [a, b] } = world();
+	const id = "a".repeat(32), other = "b".repeat(32);
+	const entry = { day: 20_000, epoch: 1, parts: ["1".repeat(64), "2".repeat(64)], notesOnly: true, takenAt: 1_728_000_000_000 };
+	await quiesce([a!, b!]);
+	await a!.engine!.recordSnapshot(id, entry);
+	await a!.engine!.recordSnapshot(other, entry);
+	await quiesce([a!, b!]);
+	const expected = new Map([[id, entry], [other, entry]]);
+	assert.deepEqual(await b!.engine!.snapshotLedger(), expected);
+	await b!.engine!.recordSnapshot(id, { ...entry, parts: [...entry.parts].reverse() });
+	assert.deepEqual(await b!.engine!.snapshotLedger(), expected);
+
+	assert.equal(await a!.engine!.snapshotAll(), true);
+	await quiesce([a!, b!]);
+	assert.deepEqual(server.rows.map(({ entry }) => [entry.doc, entry.kind]), [["index", "snapshot"]]);
+	const c = new Device("c", server, rng(7));
+	c.boot();
+	c.connect();
+	const devs = [a!, b!, c];
+	await quiesce(devs);
+	assert.deepEqual(await c.engine!.snapshotLedger(), expected);
+
+	await b!.engine!.forgetSnapshots([id]);
+	await quiesce(devs);
+	for (const d of devs) assert.deepEqual(await d.engine!.snapshotLedger(), new Map([[other, entry]]));
+	noProblems(devs);
+});
+
+test("the snapshot ledger skips malformed entries and forgets all entries across devices", async () => {
+	const { server, devs } = world(3);
+	const [a, b, peer] = devs;
+	const id = "a".repeat(32);
+	const entry = { day: 20_000, epoch: 1, parts: ["1".repeat(64)], notesOnly: true, takenAt: 1_728_000_000_000 };
+	await quiesce(devs);
+	await a!.engine!.recordSnapshot(id, { ...entry, takenAt: Number.MAX_SAFE_INTEGER + 1 });
+	assert.deepEqual(await a!.engine!.snapshotLedger(), new Map());
+	await a!.engine!.recordSnapshot(id, entry);
+
+	const doc = new Y.Doc();
+	const snapshots = doc.getMap("snapshots");
+	snapshots.set("B".repeat(32), entry);
+	snapshots.set("c".repeat(32), { ...entry, parts: ["invalid"] });
+	snapshots.set("d".repeat(32), { ...entry, day: 0.5 });
+	server.handle(peer!, { t: "live", entry: { doc: "index", kind: "update", data: Y.encodeStateAsUpdate(doc) } });
+	doc.destroy();
+	await quiesce(devs);
+	assert.deepEqual(await b!.engine!.snapshotLedger(), new Map([[id, entry]]));
+
+	await b!.engine!.forgetSnapshots();
+	await quiesce(devs);
+	for (const d of devs) assert.deepEqual(await d.engine!.snapshotLedger(), new Map());
 	noProblems(devs);
 });
 

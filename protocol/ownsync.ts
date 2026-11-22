@@ -1,12 +1,12 @@
 // Ownsync protocol v1, reference implementation of docs/PROTOCOL.md.
-// WebCrypto only, so the same file runs in Node, Obsidian desktop and iOS.
+// Web platform APIs, so the same file runs in Node, Obsidian desktop and iOS.
 
 const subtle = globalThis.crypto.subtle;
 const te = new TextEncoder();
 
 export const VERSION = 1;
 export const SUITE = 1; // AES-256-GCM, HKDF-SHA256, HMAC-SHA256, ECDH P-256
-export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5, history: 6 } as const;
+export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5, history: 6, vaultSnapshot: 7 } as const;
 export const RECOVERY_ID = new Uint8Array(16); // member ID of the recovery key pair
 const ZERO_NONCE = new Uint8Array(12); // only for keys that seal exactly one message
 
@@ -109,7 +109,7 @@ export function parseHeader(envelope: Uint8Array): Header {
 	return { kind: r.u8(), epoch: r.u32(), deviceId: r.bytes(16) };
 }
 
-// docId is the document tag for updates, snapshots, presence and history, and the chunk name for chunks.
+// docId is the document tag for sync and history, the chunk name for chunks, or the whole-vault snapshot ID.
 export async function sealEnvelope(a: Header & { vmk: Uint8Array; vaultId: Uint8Array; docId: Uint8Array; plaintext: Uint8Array; nonce?: Uint8Array }) {
 	const header = concat(u8(VERSION), u8(SUITE), u8(a.kind), uint(a.epoch, 4), a.deviceId);
 	const nonce = a.nonce ?? randomBytes(12);
@@ -178,6 +178,102 @@ export function unpackHistory(plaintext: Uint8Array, note: string, now = Date.no
 		return { takenAt: t, text };
 	} catch {
 		return undefined;
+	}
+}
+
+// --- whole-vault snapshots: individually sealed slices of a padded gzip stream ---
+
+const MIN_VAULT_SNAPSHOT_BUCKET = 64 * 1024;
+export const VAULT_SNAPSHOT_PART_BYTES = 1024 * 1024;
+export const MAX_VAULT_SNAPSHOT_JSON = 512 * 1024 * 1024;
+export const MAX_VAULT_SNAPSHOT_PARTS = 512;
+const VAULT_SNAPSHOT_PART_HEADER = 36;
+export const MAX_VAULT_SNAPSHOT_ENVELOPE = VAULT_SNAPSHOT_PART_BYTES + VAULT_SNAPSHOT_PART_HEADER + HEADER_LEN + 12 + 16;
+
+interface VaultSnapshotPart {
+	id: string;
+	day: number;
+	takenAt: number;
+	partIndex: number;
+	partCount: number;
+}
+
+function snapshotBucket(part: VaultSnapshotPart, length: number): number {
+	if (!Number.isSafeInteger(part.day) || part.day < 0 || part.day > 0xffffffff
+		|| !Number.isSafeInteger(part.takenAt) || part.takenAt < 0
+		|| !Number.isInteger(part.partIndex) || !Number.isInteger(part.partCount)
+		|| part.partIndex < 0 || part.partIndex >= part.partCount || part.partCount > MAX_VAULT_SNAPSHOT_PARTS
+		|| length < 1 || length > VAULT_SNAPSHOT_PART_BYTES
+		|| (part.partIndex < part.partCount - 1 && length !== VAULT_SNAPSHOT_PART_BYTES)) {
+		throw new Error("invalid snapshot part header");
+	}
+	if (part.partCount > 1) return VAULT_SNAPSHOT_PART_BYTES;
+	let size = MIN_VAULT_SNAPSHOT_BUCKET;
+	while (size < length) size *= 2;
+	return size;
+}
+
+export function packVaultSnapshotPart(part: VaultSnapshotPart, bytes: Uint8Array): Uint8Array {
+	if (!/^[0-9a-f]{32}$/.test(part.id)) throw new Error("invalid snapshot ID");
+	const padded = new Uint8Array(VAULT_SNAPSHOT_PART_HEADER + snapshotBucket(part, bytes.length));
+	const header = concat(unhex(part.id), uint(part.day, 4), uint(part.takenAt, 8),
+		uint(part.partIndex, 2), uint(part.partCount, 2), uint(bytes.length, 4));
+	padded.set(header);
+	padded.set(bytes, VAULT_SNAPSHOT_PART_HEADER);
+	return padded;
+}
+
+export function unpackVaultSnapshotPart(plaintext: Uint8Array): VaultSnapshotPart & { bytes: Uint8Array } {
+	if (plaintext.length < VAULT_SNAPSHOT_PART_HEADER) throw new Error("truncated snapshot part header");
+	const r = new Reader(plaintext);
+	const part = { id: hex(r.bytes(16)), day: r.u32(), takenAt: r.u64(), partIndex: r.u16(), partCount: r.u16() };
+	const length = r.u32();
+	const end = r.i + length;
+	if (plaintext.length !== r.i + snapshotBucket(part, length) || plaintext.subarray(end).some((byte) => byte !== 0)) {
+		throw new Error("invalid snapshot part padding");
+	}
+	return { ...part, bytes: plaintext.subarray(r.i, end) };
+}
+
+function byteStream(chunks: Iterable<Uint8Array> | AsyncIterable<Uint8Array>): ReadableStream<Uint8Array> {
+	const iterator = Symbol.asyncIterator in chunks ? chunks[Symbol.asyncIterator]() : chunks[Symbol.iterator]();
+	return new ReadableStream({
+		async pull(controller) {
+			const chunk = await iterator.next();
+			if (chunk.done) controller.close();
+			else controller.enqueue(chunk.value);
+		},
+		async cancel() { await iterator.return?.(); },
+	});
+}
+
+export async function gzipVaultSnapshot(json: Uint8Array): Promise<Uint8Array> {
+	function* chunks() {
+		for (let i = 0; i < json.length; i += VAULT_SNAPSHOT_PART_BYTES) yield json.subarray(i, i + VAULT_SNAPSHOT_PART_BYTES);
+	}
+	return new Uint8Array(await new Response(byteStream(chunks()).pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+}
+
+export async function gunzipVaultSnapshot(parts: Iterable<Uint8Array> | AsyncIterable<Uint8Array>, maxBytes = MAX_VAULT_SNAPSHOT_JSON): Promise<string> {
+	const reader = byteStream(parts).pipeThrough(new DecompressionStream("gzip")).getReader();
+	const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+	const text: string[] = [];
+	let size = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			if (size > maxBytes) throw new Error("snapshot exceeds decompression limit");
+			text.push(decoder.decode(value, { stream: true }));
+		}
+		text.push(decoder.decode());
+		return text.join("");
+	} catch (error) {
+		await reader.cancel().catch(() => undefined);
+		throw error;
+	} finally {
+		reader.releaseLock();
 	}
 }
 

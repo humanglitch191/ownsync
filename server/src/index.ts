@@ -5,6 +5,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { Dashboard, VERSION, type VaultStats } from "./dashboard";
+import { SNAPSHOT_BUDGET, snapshotsToPrune } from "./snapshots";
 import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, DOC_TAG_BYTES, MAX_CHUNK, MAX_ENVELOPE, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
 
 interface Env {
@@ -36,6 +37,13 @@ const HISTORY_DAYS = 14;
 const MAX_HISTORY_ENVELOPE = 1024 * 1024 + CHUNK_OVERHEAD;
 const MAX_HISTORY_BYTES = 50 * 1024 * 1024;
 const HISTORY_RETENTION_MS = 30 * DAY_MS;
+const SNAPSHOT_ID_BYTES = 16;
+const SNAPSHOT_PART_HEADER = SNAPSHOT_ID_BYTES + 4;
+const MAX_SNAPSHOT_PARTS = 512;
+const MAX_SNAPSHOT_ENVELOPE = 1024 * 1024 + 256; // a full 1 MiB part, sealed: its header, the envelope header and the tag (87 bytes today), with room to spare
+const MAX_SNAPSHOT = SNAPSHOT_BUDGET / 8;
+const SNAPSHOT_LEASE_MS = 60 * 60 * 1000;
+type VaultSnapshot = { id: number; day: number; parts: number; received: number; size: number };
 
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
@@ -60,7 +68,7 @@ export default {
 		}
 		// The owner dashboard's API; its pages are static assets.
 		if (path.startsWith("/api/")) return owner(env).fetch(req);
-		const vault = path.match(/^\/vault\/([0-9a-f]{32})(?:\/delete|\/names|\/history(?:\/list|\/clear)?)?$/);
+		const vault = path.match(/^\/vault\/([0-9a-f]{32})(?:\/delete|\/names|\/history(?:\/list|\/clear)?|\/snapshot(?:\/list|\/get|\/delete)?)?$/);
 		if (vault) return env.VAULT.get(env.VAULT.idFromName(vault[1]!)).fetch(req);
 		// The room is a hash of the pairing code, so the server can't open what it holds.
 		const pair = path.match(/^\/pair\/([0-9a-f]{32})$/);
@@ -92,6 +100,8 @@ export class Vault extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS chunks (name BLOB PRIMARY KEY, envelope BLOB NOT NULL);
 			CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, doc BLOB NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL, envelope BLOB NOT NULL);
 			CREATE INDEX IF NOT EXISTS history_doc ON history (doc, at);
+			CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, snapshot BLOB NOT NULL UNIQUE, day INTEGER NOT NULL UNIQUE, at INTEGER NOT NULL, epoch INTEGER NOT NULL, parts INTEGER NOT NULL, received INTEGER NOT NULL, size INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS snapshot_parts (snapshot BLOB NOT NULL REFERENCES snapshots(snapshot) ON DELETE CASCADE, part INTEGER NOT NULL, count INTEGER NOT NULL, day INTEGER NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL, envelope BLOB NOT NULL, PRIMARY KEY (snapshot, part));
 			CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, last_online INTEGER NOT NULL, version TEXT NOT NULL, conflicts INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY CHECK (id = 0), day INTEGER NOT NULL, requests INTEGER NOT NULL, rows INTEGER NOT NULL, last_activity INTEGER);
 			CREATE TABLE IF NOT EXISTS usage_days (day INTEGER PRIMARY KEY, requests REAL NOT NULL, rows INTEGER NOT NULL);
@@ -115,8 +125,11 @@ export class Vault extends DurableObject<Env> {
 		if (action) {
 			if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
 			if (this.deleted) return Response.json({ error: "deleted" }, { status: 410 });
-			const body = action === "history"
-				? await this.readHistoryBody(req, 32 + DOC_TAG_BYTES + (operation ? 0 : MAX_HISTORY_ENVELOPE))
+			const limit = action === "history" ? DOC_TAG_BYTES + (operation ? 0 : MAX_HISTORY_ENVELOPE)
+				: action === "snapshot" ? (operation === "list" ? 0 : operation ? SNAPSHOT_ID_BYTES : SNAPSHOT_PART_HEADER + MAX_SNAPSHOT_ENVELOPE)
+				: undefined;
+			const body = limit !== undefined
+				? await this.readBoundedBody(req, 32 + limit)
 				: new Uint8Array(await req.arrayBuffer());
 			const token = action === "delete" ? body : body.subarray(0, 32);
 			const hash = await digest(token);
@@ -124,6 +137,7 @@ export class Vault extends DurableObject<Env> {
 			const stored = this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0]?.token_hash;
 			if (!stored || token.length !== 32 || !crypto.subtle.timingSafeEqual(hash, stored)) return Response.json({ error: "unauthorized" }, { status: 401 });
 			if (action === "history") return this.history(operation, body.subarray(32));
+			if (action === "snapshot") return this.snapshot(operation, body.subarray(32));
 			if (action === "names") {
 				if (body.length > 32 + 1024) return Response.json({ error: "too large" }, { status: 413 });
 				let n: { device?: unknown; name?: unknown; vault?: unknown };
@@ -147,7 +161,7 @@ export class Vault extends DurableObject<Env> {
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
-	private async readHistoryBody(req: Request, limit: number): Promise<Uint8Array> {
+	private async readBoundedBody(req: Request, limit: number): Promise<Uint8Array> {
 		const reader = req.body?.getReader();
 		if (!reader) return new Uint8Array(0);
 		// Keep one extra byte so validation can reject an oversized body after checking its token.
@@ -214,6 +228,113 @@ export class Vault extends DurableObject<Env> {
 		return Response.json({ ok: true });
 	}
 
+	private expireSnapshots(now: number): void {
+		this.write("DELETE FROM snapshots WHERE received < parts AND at <= ?", now - SNAPSHOT_LEASE_MS);
+	}
+
+	private snapshot(operation: string | undefined, body: Uint8Array, now = Date.now()): Response {
+		this.expireSnapshots(now);
+		if (!operation) return this.uploadSnapshot(body, now);
+		if (operation === "list") {
+			if (body.length) return Response.json({ error: "bad body" }, { status: 400 });
+			const rows = this.sql.exec<{ id: string; day: number; epoch: number; parts: number; received: number; size: number; complete: number; at: number }>(
+				"SELECT lower(hex(snapshot)) AS id, day, epoch, parts, received, size, received = parts AS complete, at FROM snapshots ORDER BY day DESC",
+			).toArray();
+			return Response.json(rows.map((row) => ({ ...row, complete: !!row.complete })));
+		}
+		if (operation === "delete" && body.length === 0) {
+			this.write("DELETE FROM snapshots");
+			return Response.json({ ok: true });
+		}
+		if (body.length !== SNAPSHOT_ID_BYTES) return Response.json({ error: "bad snapshot ID" }, { status: 400 });
+		if (operation === "delete") {
+			this.write("DELETE FROM snapshots WHERE snapshot = ?", body);
+			return Response.json({ ok: true });
+		}
+		const saved = this.storedSnapshot(body);
+		if (!saved || saved.received < saved.parts) return Response.json({ error: "not found" }, { status: 404 });
+		return this.streamSnapshot(saved);
+	}
+
+	private storedSnapshot(snapshot: Uint8Array): VaultSnapshot | undefined {
+		return this.sql.exec<VaultSnapshot>("SELECT id, day, parts, received, size FROM snapshots WHERE snapshot = ?", snapshot).toArray()[0];
+	}
+
+	private uploadSnapshot(body: Uint8Array, now: number): Response {
+		if (body.length < SNAPSHOT_PART_HEADER) return Response.json({ error: "bad part header" }, { status: 400 });
+		const snapshot = body.subarray(0, SNAPSHOT_ID_BYTES);
+		const header = new DataView(body.buffer, body.byteOffset, body.length);
+		const part = header.getUint16(SNAPSHOT_ID_BYTES);
+		const parts = header.getUint16(SNAPSHOT_ID_BYTES + 2);
+		if (parts < 1 || parts > MAX_SNAPSHOT_PARTS || part >= parts) return Response.json({ error: "bad part index or count" }, { status: 400 });
+		const envelope = body.subarray(SNAPSHOT_PART_HEADER);
+		if (!envelope.length || envelope.length > MAX_SNAPSHOT_ENVELOPE) return Response.json({ error: "bad envelope size" }, { status: 413 });
+
+		const saved = this.storedSnapshot(snapshot);
+		const today = Math.floor(now / DAY_MS);
+		const day = saved?.day ?? today;
+		if (!saved && part !== 0) return Response.json({ error: "restart" }, { status: 409 });
+		if (!saved && this.sql.exec("SELECT 1 FROM snapshots WHERE day = ?", day).toArray().length) return Response.json({ error: "taken" }, { status: 409 });
+		if (saved && parts !== saved.parts) return Response.json({ error: "part count changed" }, { status: 409 });
+		if (saved) {
+			const stored = this.sql.exec<{ envelope: ArrayBuffer }>("SELECT envelope FROM snapshot_parts WHERE snapshot = ? AND part = ?", snapshot, part).toArray()[0];
+			if (stored) {
+				if (envelope.length !== stored.envelope.byteLength || !crypto.subtle.timingSafeEqual(envelope, stored.envelope)) return Response.json({ error: "part changed" }, { status: 409 });
+				if (saved.received < parts) this.write("UPDATE snapshots SET at = ? WHERE id = ?", now, saved.id);
+				return Response.json({ ok: true, day, complete: saved.received === parts });
+			}
+		}
+		const size = (saved?.size ?? 0) + envelope.length;
+		if (size > MAX_SNAPSHOT) return Response.json({ error: "snapshot too large" }, { status: 413 });
+		const received = (saved?.received ?? 0) + 1;
+		const complete = received === parts;
+		const rows = this.sql.exec<{ id: number; day: number; size: number; complete: number }>(
+			"SELECT id, day, size, received = parts AS complete FROM snapshots",
+		).toArray();
+		const prune = new Set(snapshotsToPrune(rows, today, envelope.length));
+		const retainedBytes = rows.reduce((sum, row) => sum + (prune.has(row) ? 0 : row.size), envelope.length);
+		if (retainedBytes > SNAPSHOT_BUDGET) return Response.json({ error: "snapshot storage full" }, { status: 413 });
+		if (complete) {
+			const finished = { id: saved?.id ?? 0, day, size, complete: 1 };
+			const remaining = rows.filter((row) => row.id !== saved?.id && !prune.has(row));
+			for (const row of snapshotsToPrune([...remaining, finished], today)) {
+				if (row !== finished) prune.add(row);
+			}
+		}
+		this.ctx.storage.transactionSync(() => {
+			for (const row of prune) this.write("DELETE FROM snapshots WHERE id = ?", row.id);
+			if (saved) {
+				this.write("UPDATE snapshots SET received = ?, size = ?, at = ? WHERE id = ?", received, size, now, saved.id);
+			} else {
+				// The clear header starts with version, suite and kind, then the four-byte epoch.
+				const epoch = envelope.length >= 7 ? header.getUint32(SNAPSHOT_PART_HEADER + 3) : 0;
+				this.write("INSERT INTO snapshots (snapshot, day, at, epoch, parts, received, size) VALUES (?, ?, ?, ?, ?, ?, ?)", snapshot, day, now, epoch, parts, received, size);
+			}
+			this.write("INSERT INTO snapshot_parts (snapshot, part, count, day, at, size, envelope) VALUES (?, ?, ?, ?, ?, ?, ?)", snapshot, part, parts, day, now, envelope.length, envelope);
+		});
+		return Response.json({ ok: true, day, complete });
+	}
+
+	private streamSnapshot(saved: VaultSnapshot): Response {
+		let part = 0;
+		return new Response(new ReadableStream<Uint8Array>({
+			pull: (controller) => {
+				// The row ID pins the download to this upload, even if the client deletes and reuses its snapshot ID.
+				const row = this.deleted ? undefined : this.sql.exec<{ envelope: ArrayBuffer }>(
+					"SELECT envelope FROM snapshot_parts WHERE snapshot = (SELECT snapshot FROM snapshots WHERE id = ?) AND part = ?", saved.id, part,
+				).toArray()[0];
+				if (!row) return controller.error(new Error("snapshot removed during download"));
+				const frame = new Uint8Array(6);
+				const header = new DataView(frame.buffer);
+				header.setUint16(0, part);
+				header.setUint32(2, row.envelope.byteLength);
+				controller.enqueue(frame);
+				controller.enqueue(new Uint8Array(row.envelope));
+				if (++part === saved.parts) controller.close();
+			},
+		}), { headers: { "content-type": "application/octet-stream" } });
+	}
+
 	async webSocketMessage(ws: WebSocket, msg: ArrayBuffer | string): Promise<void> {
 		if (typeof msg === "string" || msg.byteLength < 1 || msg.byteLength > MAX_ENVELOPE + 64) return ws.close(CLOSE.badMessage, "bad frame");
 		const session = ws.deserializeAttachment() as Session;
@@ -233,10 +354,11 @@ export class Vault extends DurableObject<Env> {
 				if (refused) return ws.close(refused, refused === CLOSE.notOwner ? "owner code needed" : "unauthorized");
 				// History copies expire after 30 days even in a vault where nobody opens history.
 				this.write("DELETE FROM history WHERE at < ?", Date.now() - HISTORY_RETENTION_MS);
+				this.expireSnapshots(Date.now());
 				return ws.serializeAttachment({ ...session, token: this.token });
 			}
 			if (f.t === "subscribe") return this.subscribe(ws, session, f.after);
-			if (f.t === "hello") return;
+			if (f.t === "hello") return this.expireSnapshots(Date.now());
 			if (f.t === "append" || f.t === "rotate") return this.append(ws, f);
 			if (f.t === "status") return this.status(ws, session, f);
 			if (f.t === "get") {
@@ -366,7 +488,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async erase(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "devices", "usage", "usage_days", "vault_name"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "devices", "usage", "usage_days", "vault_name"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;
