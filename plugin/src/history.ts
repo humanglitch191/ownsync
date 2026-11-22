@@ -62,7 +62,8 @@ const localEdit = StateField.define<boolean>({
 const EVERY = 10 * 60_000;
 const META = "meta", TEXT = "text";
 
-interface Entry extends Copy { id: string; mtime: number }
+/** `gone`: a copy of a note since deleted, kept only for its deleted copy's sake; another note at its path doesn't list it. */
+interface Entry extends Copy { id: string; mtime: number; gone?: boolean }
 interface Sample { path: string; text: string; mtime: number }
 interface LocalEdit { text: Text; consumed?: boolean }
 interface Pending { sample: Sample; edit?: LocalEdit; timer?: number }
@@ -154,7 +155,7 @@ class HistoryDb {
 function newestByPath(entries: Iterable<Entry>, deleted = false): Map<string, Entry> {
 	const newest = new Map<string, Entry>();
 	for (const e of entries) {
-		if (!!e.deleted !== deleted) continue;
+		if (!!e.deleted !== deleted || e.gone) continue;
 		const previous = newest.get(e.path);
 		if (!previous || previous.time < e.time) newest.set(e.path, e);
 	}
@@ -275,6 +276,7 @@ class History {
 			return [pending];
 		});
 		if (!samples.length) return;
+		const noteIds = new Map(samples.map(({ sample: { path } }) => [path, this.backupFor(path)?.noteId]));
 		const { due, uploads } = await this.db.edit(async ({ entries, read, add }) => {
 			const newest = newestByPath(entries.values());
 			const now = Date.now();
@@ -311,7 +313,8 @@ class History {
 		}
 		for (const { sample: { path, text }, takenAt } of uploads) {
 			const target = this.backupFor(path);
-			if (target?.connected) void target.client.upload(target.noteId, text, takenAt).catch(() => {});
+			// The same note's before and after the wait: the path can change hands meanwhile (a rename moves another note onto it).
+			if (target?.connected && target.noteId === noteIds.get(path)) void target.client.upload(target.noteId, text, takenAt).catch(() => {});
 		}
 	}
 
@@ -356,6 +359,8 @@ class History {
 						await read(previous.id) === sample.text) continue;
 					add({ ...sample, path: p }, now, true);
 				}
+				// A note that comes to this path later (a new note with the old name) starts a history of its own.
+				for (const e of [...entries.values()]) if (!e.deleted && !e.gone && matches(e.path)) entries.set(e.id, { ...e, gone: true });
 				return paths;
 			});
 			for (const p of cleared) this.clearPending(p);
@@ -395,7 +400,7 @@ class History {
 	async list(path?: string): Promise<Entry[]> {
 		await this.work;
 		const entries = keepCopies(await this.db.entries(), Date.now());
-		return entries.filter((e) => path === undefined ? e.deleted : !e.deleted && e.path === path);
+		return entries.filter((e) => path === undefined ? e.deleted : !e.deleted && !e.gone && e.path === path);
 	}
 
 	text(entry: Entry): Promise<string | undefined> {

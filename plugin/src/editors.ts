@@ -77,6 +77,11 @@ export class Editors {
 			if (!id) return; // not a synced note yet; a later refresh binds it
 			const doc = await this.engine.open(id);
 			if (!doc) return;
+			// The tab may show another file by now: look again rather than bind it to this note.
+			if (!view.file || this.engine.noteAt(view.file.path) !== id) {
+				await this.release(id);
+				continue;
+			}
 			// No awaits from here on: nothing can change between comparing the two texts and binding them.
 			const text = doc.getText("t"), shown = cm.state.doc.toString(), synced = text.toString();
 			if (shown !== synced) {
