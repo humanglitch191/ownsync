@@ -34,7 +34,8 @@ The vault key lives in Obsidian's secret storage (Obsidian 1.11.4 or later), nev
 
 ## Network use and accounts
 
-- **Account:** a Cloudflare account (the free plan is enough) runs your Worker. Nobody else runs or sees it, including me.
+- **Account:** a Cloudflare account (the free plan is enough) runs your Worker. I can't see it or sign in to it.
+- **Updates:** your Worker runs code I publish. Its updater installs only releases signed with my own release key, which never leaves my laptop, and only 3 days after it first sees one. You can turn it off ([updating](updating.md)).
 - **Network:** the plugin connects only to your Worker.
 - **Your vault:** to sync it, the plugin lists and reads every file in it (except Obsidian's settings folder), and writes what arrives from your other devices.
 - **Clipboard:** written only when you press a Copy button (a pairing link, a code); never read.

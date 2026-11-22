@@ -1,34 +1,142 @@
 name: Update Ownsync
 
-# Your copy of Ownsync's server, made by the Deploy to Cloudflare button. Press "Run workflow" (Actions tab →
-# Update Ownsync) when your dashboard says a new version is out: this brings in the latest release, and
-# Cloudflare redeploys your server from it. Nothing runs on its own.
+# Your copy of Ownsync's Worker, made by the Deploy to Cloudflare button. Once a day this looks for a new Ownsync
+# release and installs it, and Cloudflare redeploys your Worker from it. It installs a release only if:
+# - its tag is signed with the author's release key (below; the private half never leaves the author's laptop),
+# - it's newer than yours (never older),
+# - this updater first saw it, unchanged, 3 days ago or more. If several are newer, it installs the newest one
+#   that has waited 3 days. Pressing "Run workflow" installs the newest now, without the wait, but never without
+#   the signature. When each release was first seen is kept in refs/notes/ownsync-update, not on a branch, so
+#   keeping it doesn't redeploy your Worker.
+# A release that changes how your Worker stores data never installs on its own: the daily run fails and GitHub
+# emails you, and "Run workflow" installs it. Any check that fails installs nothing and fails the run.
+# To stay on your version, disable this workflow (Actions → Update Ownsync → ⋯ → Disable workflow).
 
 on:
+  schedule:
+    - cron: "41 3 * * *" # daily, 03:41 UTC
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency: update-ownsync
 
 jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Bring in the latest Ownsync release
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the newest signed Ownsync release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag=$(gh api repos/humanglitch191/ownsync/releases/latest --jq .tag_name)
-          git clone --quiet --depth 1 --branch "$tag" https://github.com/humanglitch191/ownsync /tmp/ownsync
-          # The server is this repository's root (or its server/ folder, if the whole project was copied).
+          upstream=humanglitch191/ownsync
+          state_ref=refs/notes/ownsync-update
+          delay=259200 # 3 days
+          fail() { echo "::error::$*"; exit 1; }
+          as_updater() { git -c user.name="Ownsync updater" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" "$@"; }
+          with_token() { git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" "$@"; }
+          when() { date -ud "@$1" '+%-d %B, %H:%M UTC'; }
+
+          # The only key Ownsync releases may be signed with.
+          signers=$RUNNER_TEMP/allowed_signers
+          cat > "$signers" <<'EOF'
+          * namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKmGr6jezQ/ds6snzV6svfiMo5oSsip77TgPhJq5Gdaq
+          EOF
+          if grep -q PLACEHOLDER "$signers"; then fail "This updater has no release key yet, so it installs nothing."; fi
+
+          # The Worker is this repository's root (or its server/ folder, if the whole project was copied).
           dir=.; [ -f wrangler.toml ] || dir=server
+          installed=$(sed -n 's/^export const VERSION = "\(.*\)";$/\1/p' "$dir/src/dashboard.ts")
+          [ -n "$installed" ] || fail "Couldn't find your Ownsync version in $dir/src/dashboard.ts. Nothing installed."
+
+          # Published releases newer than yours, newest first, by version number (not the one marked "latest").
+          releases=$(gh api --paginate "repos/$upstream/releases?per_page=100" --jq '.[] | select((.draft or .prerelease) | not) | .tag_name') \
+            || fail "Couldn't list Ownsync's releases. Nothing installed."
+          newer=()
+          while read -r t; do
+            if [ "$t" != "$installed" ] && [ "$(printf '%s\n%s\n' "$t" "$installed" | sort -V | tail -n 1)" = "$t" ]; then newer+=("$t"); fi
+            [ ${#newer[@]} -lt 5 ] || break # shortcut: only the 5 newest are tracked; enough unless 5 ship within 3 days
+          done < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$releases" | sort -urV)
+          [ ${#newer[@]} -gt 0 ] || { echo "Ownsync $installed is up to date."; exit 0; }
+
+          # Fetch each tag itself and check its signature. From here on only the commit it signs is used.
+          src=$RUNNER_TEMP/ownsync
+          git init --quiet "$src"
+          declare -A commit_of seen_commit seen_at
+          for t in "${newer[@]}"; do
+            git -C "$src" fetch --quiet --no-tags --depth 1 "https://github.com/$upstream" "refs/tags/$t:refs/tags/$t" \
+              || fail "Couldn't download Ownsync $t. Nothing installed."
+            [ "$(git -C "$src" cat-file -t "refs/tags/$t")" = tag ] || fail "Ownsync $t isn't a signed tag. Nothing installed."
+            head=$(git -C "$src" cat-file tag "refs/tags/$t" | sed '/^$/q')
+            # The tag must name itself: a signed tag for another version, moved here, doesn't count.
+            { grep -qx "type commit" <<<"$head" && grep -qx "tag $t" <<<"$head"; } || fail "Ownsync $t's tag is for something else. Nothing installed."
+            git -C "$src" -c gpg.program=false -c gpg.x509.program=false -c gpg.ssh.allowedSignersFile="$signers" verify-tag "refs/tags/$t" \
+              || fail "Ownsync $t isn't signed with the author's release key. Nothing installed."
+            commit_of[$t]=$(sed -n 's/^object //p' <<<"$head")
+            git -C "$src" show "${commit_of[$t]}:server/src/dashboard.ts" | grep -qx "export const VERSION = \"$t\";" \
+              || fail "Ownsync $t's files say another version. Nothing installed."
+          done
+
+          # When this updater first saw each release, by its own clock. A missing ref is a first run; anything else fails.
+          old='' parent=()
+          if with_token ls-remote --exit-code origin "$state_ref" > /dev/null; then
+            with_token fetch --quiet --no-tags origin "+$state_ref:$state_ref" || fail "Couldn't read $state_ref. Nothing installed."
+            old=$(git show "$state_ref:state") || fail "Couldn't read $state_ref. Nothing installed."
+            parent=(-p "$(git rev-parse "$state_ref")")
+          else
+            [ $? -eq 2 ] || fail "Couldn't read $state_ref. Nothing installed."
+          fi
+          while read -r v c at; do
+            [ -n "$v" ] || continue
+            [[ $at =~ ^[0-9]+$ ]] || fail "$state_ref is damaged. Delete it (git push origin :$state_ref) to start every wait again."
+            seen_commit[$v]=$c seen_at[$v]=$at
+          done <<<"$old"
+          now=$(date +%s) moved='' new=''
+          for t in "${newer[@]}"; do
+            if [ "${seen_commit[$t]:-}" != "${commit_of[$t]}" ]; then
+              [ -z "${seen_commit[$t]:-}" ] || moved+=" $t was commit ${seen_commit[$t]}, now ${commit_of[$t]}."
+              seen_commit[$t]=${commit_of[$t]} seen_at[$t]=$now
+            fi
+            new+="$t ${commit_of[$t]} ${seen_at[$t]}"$'\n'
+          done
+          if [ "${new%$'\n'}" != "$old" ]; then
+            tree=$(printf '100644 blob %s\tstate\n' "$(printf '%s' "$new" | git hash-object -w --stdin)" | git mktree)
+            state=$(as_updater commit-tree "$tree" "${parent[@]}" -m "When this updater first saw each Ownsync release")
+            with_token push --quiet origin "$state:$state_ref" || fail "Couldn't save $state_ref. Nothing installed."
+          fi
+          [ -z "$moved" ] || fail "Ownsync changed after it came out:$moved Its 3-day wait starts again. Nothing installed."
+
+          tag=''
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            tag=${newer[0]}
+          else
+            for t in "${newer[@]}"; do
+              if [ $((now - seen_at[$t])) -ge $delay ]; then tag=$t; break; fi
+              echo "Ownsync $t installs on $(when $((seen_at[$t] + delay))) or later."
+            done
+            [ -n "$tag" ] || exit 0
+          fi
+          sha=${commit_of[$tag]}
+          git -C "$src" -c advice.detachedHead=false checkout --quiet "$sha"
+
+          # Durable Objects and their migrations: where the Worker keeps vaults, devices and passkeys.
+          storage() { [ -f "$1" ] && awk '/^[[:space:]]*\[/ { keep = /migrations|durable_objects/ } keep && !/^[[:space:]]*(#|$)/' "$1"; }
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] \
+            && ! { a=$(storage "$dir/wrangler.toml") && b=$(storage "$src/server/wrangler.toml") && [ "$a" = "$b" ]; }; then
+            fail "Ownsync $tag changes how your Worker stores data; press Run workflow to install it."
+          fi
+
           # Workflow files are left alone: GitHub doesn't let this workflow change them.
-          rsync -a --delete --exclude .git --exclude .github --exclude .gitignore /tmp/ownsync/server/ "$dir/"
+          # --checksum: two checkouts made in the same second share mtimes, and a same-size file would be skipped.
+          rsync -a --checksum --delete --exclude .git --exclude .github --exclude .gitignore "$src/server/" "$dir/"
           git add -A
           if git diff --cached --quiet; then echo "Already on Ownsync $tag."; exit 0; fi
-          git -c user.name="Ownsync updater" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit --quiet -m "Update Ownsync to $tag"
-          git push --quiet
-          echo "Updated to Ownsync $tag. Cloudflare redeploys your server in a minute or two."
+          as_updater commit --quiet -m "Update Ownsync to $tag"
+          with_token push --quiet origin "HEAD:$GITHUB_REF"
+          echo "Updated to Ownsync $tag ($sha). Cloudflare redeploys your Worker in a minute or two."

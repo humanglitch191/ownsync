@@ -131,6 +131,18 @@ The Worker's site is the owner's dashboard, signed in with a passkey. It shows o
 - **Not built (owner decisions):** backups and restore (a restore needs rollback protection first), recovery with a passkey (it would put the Cloudflare account in the trust path for the recovery code), and any page hosted elsewhere than the Worker.
 - **Tests.** `server/test/dashboard.test.ts` runs setup, the race, the window, the lockout and replacing passkeys with a software authenticator (`server/test/passkey.ts`, real CBOR and ES256).
 
+## 7. Updates (2026-11-22)
+
+The owner's rule: only a release I author and sign myself can install. Each Worker runs code from my releases, so this is the one place someone other than the Owner can change what a Worker does.
+
+- **The release key.** An SSH key (`gpg.format ssh`) used only to sign release tags, behind a passphrase, on my laptop. GitHub never holds it. `scripts/sign-release.sh` makes the annotated, signed tag (bare version, `0.2.0`) and checks it; `release.yml` refuses to publish a tag that isn't annotated, signed with that key, naming itself and pointing at the commit it builds.
+- **One pinned key.** Its public half is in `server/.github/workflows/update-ownsync.yml` as an allowed-signers line (`* namespaces="git" ssh-ed25519 …`). `scripts/verify-release-tag.sh` and `release.yml` read it from there, so a release passes exactly the check the updaters run. While it's the placeholder, every check fails.
+- **The updater** lives in each Owner's repository, and the update never touches `.github`, so the copy an Owner has is frozen: its checks and its key are those of the day it was installed. Daily and on "Run workflow" it takes the newest published release by version number, fetches that tag with git, checks it's an annotated tag naming itself, verifies its SSH signature against the pinned key (OpenPGP and X.509 are switched off), and from then on uses only the commit it signs. It installs that commit's `server/` only if it's newer than the installed `VERSION` and its own `VERSION` matches the tag.
+- **The 3-day wait** is counted on the Owner's side, per version: each run records the first time it saw each verified (version, commit) newer than the installed one (the 5 newest), with its own clock, in a commit on `refs/notes/ownsync-update` in the Owner's repository. That ref isn't a branch, so Workers Builds doesn't redeploy for it. A scheduled run installs the newest version that has waited 3 days, even while a newer one still waits. A different commit for a version starts that version's wait again and fails the run. State that can't be read or saved fails the run; a missing ref is a first run. "Run workflow" installs the newest at once, never skipping the signature.
+- **Storage changes** (`[[migrations]]` or Durable Object bindings in `wrangler.toml`) never install on a schedule: the run fails, so GitHub emails the Owner, and "Run workflow" installs.
+- **Failures install nothing** and fail the run.
+- **Limits.** If my release key is stolen, its holder can ship any Worker code; the 3-day wait is the only window to notice, and every updater trusts that key until its Owner replaces the file by hand (there's no rotation). A tag signs a SHA-1 commit ID. Replacing an older updater, or installing the first one, trusts whatever `main` serves that day. The plugin isn't covered: Obsidian downloads `main.js` from the GitHub release with no signature check, so whoever controls this GitHub repository controls the plugin, attested build or not.
+
 ## What the server can still see
 
 - the number of documents and log entries, their sizes, and edit times and frequency
