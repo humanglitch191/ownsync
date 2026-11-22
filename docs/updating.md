@@ -20,6 +20,6 @@ Then Cloudflare redeploys your Worker from it in a minute or two. Your vaults, d
 
 **To stay on your version,** turn the updater off: **Actions → Update Ownsync → ⋯ → Disable workflow**. Enable it again to catch up.
 
-**Deployed before 0.1.6?** Your updater only runs when you press it, and doesn't check signatures. GitHub doesn't let a workflow change itself, so replace it once: in your repository, open `.github/workflows/update-ownsync.yml`, press the pencil, replace everything with [this file](https://raw.githubusercontent.com/humanglitch191/ownsync/main/server/.github/workflows/update-ownsync.yml), and commit. (No such file? Choose **Add file → Create new file**, with that name.) If GitHub asks you to enable workflows, do that.
+**Deployed before 0.2.0?** Your updater only runs when you press it, and doesn't check signatures. GitHub doesn't let a workflow change itself, so replace it once: in your repository, open `.github/workflows/update-ownsync.yml`, press the pencil, replace everything with [this file](https://raw.githubusercontent.com/humanglitch191/ownsync/main/server/.github/workflows/update-ownsync.yml), and commit. (No such file? Choose **Add file → Create new file**, with that name.) If GitHub asks you to enable workflows, do that.
 
 The plugin and your Worker don't have to be on the same version: each works with the other's earlier versions.
