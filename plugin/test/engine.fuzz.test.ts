@@ -2,6 +2,7 @@
 // delays and drops at random and devices crash in the middle of operations. Every run must end with:
 //   1. every device holding the same files with the same text, and attachments with the same bytes,
 //   2. every piece of text a user typed still there, unless a user who could see it deleted its note,
+//      including text brought back by a restore unless deleted again,
 //      and every attachment content a user saved, unless a user who could see it replaced or deleted it,
 //   3. no piece of text or attachment content duplicated,
 //   4. no errors.
@@ -15,14 +16,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
+import type { NoteMeta } from "../src/core/ports";
 import { type Content, Device, Server, bytes, latin1, quiesce, rng } from "./sim";
 
 const POOL = ["a.md", "b.md", "c.md", "d.md", "x/e.md", "x/f.md", "x/y/g.md", "p.png", "q.bin", "x/r.png"];
 const isCopy = (path: string) => path.includes("(recovered ");
 const isNote = (path: string) => path.endsWith(".md");
+const NOTE_PATHS = POOL.filter(isNote);
 
 async function run(seed: number, steps: number): Promise<void> {
 	const random = rng(seed);
+	const restoreRandom = rng(seed ^ 0x6ae5371d);
+	const exerciseRestores = !FIXED.includes(seed); // preserve the original operation sequence for regressions
 	const chance = (p: number) => random() < p;
 	const pick = <T>(items: T[]): T | undefined => items[Math.floor(random() * items.length)];
 	const server = new Server();
@@ -33,6 +38,8 @@ async function run(seed: number, steps: number): Promise<void> {
 	for (const d of notesOnly) d.overrides = { ...d.overrides, attachments: false };
 	const synced = (d: Device, path: string) => isNote(path) || !notesOnly.has(d);
 	const fate = new Map<string, "must" | "may">(); // token → must still exist at the end, or may be gone
+	const restored = new Map<string, string>(); // restored token → note ID, until a user deletes the token again
+	const removedBy = new Map(devs.map((d) => [d, new Set<string>()]));
 	const log: string[] = [];
 	const seenFiles = new Map<Device, string>();
 	const stuck = new Set<Device>();
@@ -43,6 +50,14 @@ async function run(seed: number, steps: number): Promise<void> {
 	const insertAt = (text: string, t: string) => { const parts = text ? text.split(" ") : []; parts.splice(Math.floor(random() * (parts.length + 1)), 0, t); return parts.join(" "); };
 	const closedFiles = (d: Device) => [...d.files.keys()].filter((p) => { const id = d.engine?.noteAt(p); return !id || !d.editors.has(id); });
 	const tokensIn = (content: Content) => latin1(content).match(/<[^>]+>/g) ?? [];
+	const remove = (d: Device, path: string) => {
+		for (const t of tokensIn(d.files.get(path)!.content)) {
+			fate.set(t, "may");
+			restored.delete(t);
+			removedBy.get(d)!.add(t);
+		}
+		d.remove(path);
+	};
 	// Bytes that are no token's, with runs of zeros, so equal chunks turn up across files.
 	const noise = () => String.fromCharCode(...Array.from({ length: Math.floor(random() * 7) }, () => pick([0, 0, 0, 0, 1, 10, 61, 128, 255])!));
 	const create = (d: Device, path: string): Content => {
@@ -100,11 +115,11 @@ async function run(seed: number, steps: number): Promise<void> {
 			else if (r < 45) { const p = toEdit([...d.files.keys()]); if (p) { log.push(`${d.name} (app closed) edits ${p}`); d.write(p, edit(d, p)); } }
 			else if (r < 52) { const p = pick(POOL.filter((x) => !d.files.has(x))); if (p) { log.push(`${d.name} (app closed) creates ${p}`); d.write(p, create(d, p)); } }
 			else if (r < 58) { const p = pick([...d.files.keys()].filter((x) => !isCopy(x))), to = p && renameTo(d, p); if (p && to) { log.push(`${d.name} (app closed) renames ${p} → ${to}`); d.rename(p, to); } }
-			else if (r < 62) { const p = pick([...d.files.keys()]); if (p) { log.push(`${d.name} (app closed) deletes ${p}`); for (const t of tokensIn(d.files.get(p)!.content)) fate.set(t, "may"); d.remove(p); } }
+			else if (r < 62) { const p = pick([...d.files.keys()]); if (p) { log.push(`${d.name} (app closed) deletes ${p}`); remove(d, p); } }
 		} else if (r < 8) { const p = pick(POOL.filter((x) => !d.files.has(x))); if (p) { log.push(`${d.name} creates ${p}`); d.write(p, create(d, p)); } }
 		else if (r < 20) { const p = toEdit(closedFiles(d)); if (p) { log.push(`${d.name} edits ${p}`); d.write(p, edit(d, p)); } }
 		else if (r < 24) { const p = pick(closedFiles(d).filter((x) => !isCopy(x))), to = p && renameTo(d, p); if (p && to) { log.push(`${d.name} renames ${p} → ${to}`); d.rename(p, to); } }
-		else if (r < 27) { const p = pick(closedFiles(d)); if (p) { log.push(`${d.name} deletes ${p}`); for (const t of tokensIn(d.files.get(p)!.content)) fate.set(t, "may"); d.remove(p); } }
+		else if (r < 27) { const p = pick(closedFiles(d)); if (p) { log.push(`${d.name} deletes ${p}`); remove(d, p); } }
 		else if (r < 32) {
 			const id = pick([...d.files.keys()].filter(isNote).map((p) => d.engine!.noteAt(p)).filter((x): x is string => !!x && !d.editors.has(x)));
 			if (id) { log.push(`${d.name} opens ${d.pathOf(id)}`); closing = id; d.drain(); const doc = await d.engine!.open(id); if (doc && d.alive) d.editors.set(id, doc); }
@@ -112,6 +127,32 @@ async function run(seed: number, steps: number): Promise<void> {
 		else if (r < 53) { const id = pick([...d.editors.keys()]); if (id) { log.push(`${d.name} autosaves ${d.pathOf(id)}`); autosave(d, id); } }
 		else if (r < 57) { const id = pick([...d.editors.keys()]); if (id) { log.push(`${d.name} closes ${d.pathOf(id)}`); autosave(d, id); const engine = d.engine!; d.editors.delete(id); closing = id; d.drain(); void engine.close(id); } }
 		else if (r < 68) { const e = d.events.shift(); if (e) e(); }
+		else if (r < 71 && exerciseRestores) {
+			const engine = d.engine!;
+			d.drain();
+			const deleted = await engine.deletedNotes();
+			const note = deleted[Math.floor(restoreRandom() * deleted.length)];
+			if (note && d.alive) {
+				const target = restoreRandom() < 0.5 ? undefined : NOTE_PATHS[Math.floor(restoreRandom() * NOTE_PATHS.length)];
+				const path = isCopy(note.path) ? undefined : target; // as with renames, keep recovery copies named as copies
+				log.push(`${d.name} restores ${note.path}${path ? ` → ${path}` : ""} (${note.id.slice(0, 6)})`);
+				await engine.restoreDeleted(note.id, path);
+				// A peer that still sees the old live note can reconcile an unprocessed delete and recreate
+				// as a text replacement. Its legitimate CRDT text deletion can merge after this restore.
+				const livePeers = devs.filter((peer) => {
+					if (peer === d) return false;
+					const entry = peer.storedIndex().get(note.id);
+					return entry && entry.d === undefined;
+				}).map((peer) => {
+					const path = (peer.data.get(`note:${note.id}`) as NoteMeta | undefined)?.diskPath;
+					const content = path ? peer.files.get(path)?.content : undefined;
+					return { peer, text: typeof content === "string" ? content : "" };
+				});
+				for (const t of tokensIn(note.text)) {
+					if (!livePeers.some(({ peer, text }) => removedBy.get(peer)!.has(t) && !text.includes(t))) restored.set(t, note.id);
+				}
+			}
+		}
 		else if (r < 80) d.pumpUp();
 		else if (r < 92) d.pumpDown();
 		// Time passes: whatever is online catches up. Edits after this start from shared versions, so they
@@ -157,8 +198,8 @@ async function run(seed: number, steps: number): Promise<void> {
 	}
 	for (const d of devs) if (d.problems.length) fail(`errors on ${d.name}:\n${d.problems.join("\n")}`);
 	const sync = devs.map((d) => `${d.name}: cursor ${(d.data.get("meta") as { cursor: number } | undefined)?.cursor}, unsent ${[...d.data.keys()].filter((k) => k.startsWith("out:")).join(",") || "none"}, online ${d.online}`).join("; ");
-	const indexOf = (d: Device) => { const doc = new Y.Doc(); const state = d.data.get("index") as Uint8Array | undefined; if (state) Y.applyUpdate(doc, state); return new Map([...doc.getMap<{ p: string; d?: string }>("notes")].map(([id, v]) => [id.slice(0, 6), `${v.p}${v.d === undefined ? "" : " (deleted)"}`])); };
-	const indexes = devs.map(indexOf);
+	const index = devs[0]!.storedIndex();
+	const indexes = [index, ...devs.slice(1).map((d) => d.storedIndex())].map((entries) => new Map([...entries].map(([id, v]) => [id.slice(0, 6), `${v.p}${v.d === undefined ? "" : " (deleted)"}`])));
 	const indexDiff = [...new Set(indexes.flatMap((m) => [...m.keys()]))].filter((id) => new Set(indexes.map((m) => m.get(id))).size > 1).map((id) => `${id}: ${indexes.map((m) => m.get(id) ?? "-").join(" | ")}`);
 	if (process.env.FUZZ_LOG) log.push(`index waiting for missing updates: ${devs.map((d) => { const doc = new Y.Doc(); const st = d.data.get("index") as Uint8Array | undefined; if (st) Y.applyUpdate(doc, st); const p = (doc.store as unknown as { pendingStructs: { missing: Map<number, number> } | null }).pendingStructs; return `${d.name}: ${p ? JSON.stringify([...p.missing]) : "no"}`; }).join("; ")}`);
 	if (process.env.FUZZ_LOG) log.push(`index differences: ${indexDiff.join("; ") || "none"}`, `server rows: ${server.rows.map((r) => `${r.seq}:${r.entry.doc.slice(0, 6)}${r.entry.kind === "snapshot" ? "S" : ""}`).join(" ")}`);
@@ -174,6 +215,10 @@ async function run(seed: number, steps: number): Promise<void> {
 		const count = main.split(t).length - 1;
 		if (count > 1) fail(`${t} is duplicated (${count} times)\n${disks[0]}`);
 		if (f === "must" && !all.includes(t)) fail(`${t} was lost\n${disks[0]}`);
+	}
+	for (const [t, id] of restored) {
+		if (index.get(id)?.d !== undefined) continue; // a deletion can still win
+		if (!all.includes(t)) fail(`${t} was lost from restored note ${id}\n${disks[0]}`);
 	}
 }
 

@@ -4,6 +4,15 @@
 /** "index" (the map from note ID to path) or a note's or attachment's ID. */
 export type DocId = string;
 
+/** A deleted markdown note whose text is stored on this device. */
+export interface DeletedNote {
+	id: string;
+	path: string;
+	/** Milliseconds since the epoch on the deleting device. Older tombstones have no timestamp. */
+	deletedAt?: number;
+	text: string;
+}
+
 /** A Yjs update for one document. A snapshot is the whole document; the server may drop what it replaces. */
 export interface Entry {
 	doc: DocId;
@@ -43,7 +52,7 @@ export interface Disk {
 
 export type ClientMsg =
 	| { t: "subscribe"; after: number }
-	/** Store this update. It may carry several edits to one document; `id` comes back in the ack. */
+	/** Store and relay this entry without replacing older rows. `id` comes back in the ack. */
 	| { t: "publish"; id: number; entry: Entry }
 	/** `base`: the sender has applied every entry up to this seq, so the snapshot contains them. */
 	| { t: "snapshot"; doc: DocId; base: number; data: Uint8Array }

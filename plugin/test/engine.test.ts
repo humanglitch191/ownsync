@@ -96,6 +96,50 @@ test("deleting a note doesn't destroy an edit the deleter never saw", async () =
 	noProblems([a!, b!]);
 });
 
+test("another device can list and restore a deleted note with a full snapshot", async () => {
+	const server = new Server(), random = rng(1);
+	const a = new Device("a", server, random), b = new Device("b", server, random), c = new Device("c", server, random);
+	const deletedAt = 1_800_000_000_000;
+	a.overrides.now = () => deletedAt;
+	b.overrides.now = () => deletedAt + 60_000;
+	const devs = [a, b, c];
+	for (const d of devs) { d.boot(); d.connect(); }
+	const path = "Note.md", text = "the original text";
+	a.write(path, text);
+	await quiesce(devs);
+	const id = a.engine!.noteAt(path)!;
+	a.remove(path);
+	await quiesce(devs);
+	assert.deepEqual(disk(a), {});
+	assert.deepEqual(disk(b), {});
+	assert.deepEqual(await b.engine!.deletedNotes(), [{ id, path, deletedAt, text }]);
+
+	// C keeps its index and cursor but drops the deleted note's state. It will only read new entries.
+	c.crash();
+	c.data.delete(`state:${id}`);
+	c.boot();
+	assert.deepEqual(await c.engine!.deletedNotes(), []);
+	await c.engine!.restoreDeleted(id);
+	assert.equal(c.storedIndex().get(id)?.d, a.storedIndex().get(id)?.d);
+
+	const beforeRestore = server.head;
+	b.disconnect();
+	await b.engine!.restoreDeleted(id);
+	assert.deepEqual(disk(b), { [path]: text });
+	assert.deepEqual(await b.engine!.deletedNotes(), []);
+	b.crash();
+	b.boot();
+	b.connect();
+	await quiesce([a, b]);
+	assert.deepEqual(disk(a), { [path]: text });
+	assert.deepEqual(disk(b), disk(a));
+	assert.ok(server.rows.some(({ seq, entry }) => seq > beforeRestore && entry.doc === id && entry.kind === "snapshot"));
+	c.connect();
+	await quiesce(devs);
+	assert.deepEqual(disk(c), disk(a));
+	noProblems(devs);
+});
+
 test("typing in an editor reaches the other device's editor and file", async () => {
 	const { devs: [a, b] } = world();
 	a!.write("Note.md", "one");

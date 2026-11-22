@@ -3,7 +3,7 @@
 //
 // Model
 //   - The index: one Yjs map from a permanent note ID to { p: path } or, for a deleted note,
-//     { p, d: the state vector the deleting device had seen }.
+//     { p, d: the state vector the deleting device had seen, t: when it deleted the note (if known) }.
 //   - One Yjs document per note (text "t"). Only notes open in an editor stay loaded.
 //   - Per note, this device remembers where the file is and a hash of the text that file and document last
 //     agreed on. "base:<id>" holds the note's state at that agreement for as long as the document is ahead
@@ -45,11 +45,11 @@
 
 import * as Y from "yjs";
 import { applyText } from "./text";
-import type { ClientMsg, Disk, DiskFile, DocId, Entry, Link, Meta, NoteMeta, Ref, ServerMsg, Store, Upload } from "./ports";
+import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, Meta, NoteMeta, Ref, ServerMsg, Store, Upload } from "./ports";
 
 const INDEX: DocId = "index";
 const REMOTE = "ownsync-remote"; // transaction origin for changes that didn't start on this device
-type IndexValue = { p: string; d?: string };
+type IndexValue = { p: string; d?: string; t?: number };
 /** Chunks in flight each way: enough to keep the line busy, few enough that memory holds one file plus these. */
 const WINDOW = 4;
 
@@ -77,6 +77,8 @@ export interface EngineOptions {
 	onClosed?(id: string): void;
 	/** Source of Yjs client IDs; tests pass a seeded one. */
 	random?(): number;
+	/** Clock used for deletion timestamps. Defaults to Date.now. */
+	now?(): number;
 	/** When to start handling a file event. Tests delay it to model a busy engine; by default, at once. */
 	defer?(start: () => void): void;
 }
@@ -287,6 +289,33 @@ export class Engine {
 		});
 	}
 
+	/** Deleted markdown notes this device can preview, most recent first. */
+	deletedNotes(): Promise<DeletedNote[]> {
+		const deleted: DeletedNote[] = [];
+		return this.run("list deleted notes", async () => {
+			for (const [id, v] of this.notes) {
+				if (v.d === undefined || !isNote(v.p)) continue;
+				const text = await this.storedText(id);
+				if (text !== undefined) deleted.push({ id, path: v.p, deletedAt: Number.isSafeInteger(v.t) ? v.t : undefined, text }); // another device's claim
+			}
+		}).then(() => deleted.sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity)));
+	}
+
+	/** Bring a deleted markdown note back at its old path or another markdown path. */
+	restoreDeleted(id: string, path?: string): Promise<void> {
+		return this.run(`restore ${id}`, async () => {
+			const v = this.notes.get(id);
+			if (v?.d === undefined || !isNote(v.p) || (path !== undefined && !isNote(path))) return;
+			const state = await this.state(id);
+			if (!state) return;
+			// Publish the full state with an ack: live devices may no longer hold it, and an offline
+			// restore must keep it in the outbox. Compaction snapshots don't reach live devices.
+			this.send(id, state, "snapshot");
+			this.notes.set(id, { p: path ?? v.p });
+			await this.settle(id);
+		});
+	}
+
 	connected(link: Link): Promise<void> {
 		return this.run("connected", async () => {
 			this.link = link;
@@ -445,8 +474,8 @@ export class Engine {
 		await this.store.commit(puts, dels);
 	}
 
-	private send(doc: DocId, data: Uint8Array): void {
-		const item = { id: this.meta.nextOut++, entry: { doc, kind: "update" as const, data } };
+	private send(doc: DocId, data: Uint8Array, kind: Entry["kind"] = "update"): void {
+		const item = { id: this.meta.nextOut++, entry: { doc, kind, data } };
 		this.outbox.push(item);
 		this.liveOut.push(item.entry);
 		this.put("meta", this.meta);
@@ -472,16 +501,19 @@ export class Engine {
 			}, wait);
 			return;
 		}
-		const groups = new Map<DocId, { id: number; data: Uint8Array[] }>();
+		const groups = new Map<DocId, { id: number; kind: Entry["kind"]; data: Uint8Array[] }>();
 		for (const o of this.outbox) {
 			if (o.id <= this.sent) continue;
 			const g = groups.get(o.entry.doc);
-			if (g) { g.id = o.id; g.data.push(o.entry.data); }
-			else groups.set(o.entry.doc, { id: o.id, data: [o.entry.data] });
+			if (g) {
+				g.id = o.id;
+				if (o.entry.kind === "snapshot") g.kind = "snapshot";
+				g.data.push(o.entry.data);
+			} else groups.set(o.entry.doc, { id: o.id, kind: o.entry.kind, data: [o.entry.data] });
 			this.sent = o.id;
 		}
 		for (const [doc, g] of groups) {
-			this.link.send({ t: "publish", id: g.id, entry: { doc, kind: "update", data: g.data.length === 1 ? g.data[0]! : Y.mergeUpdates(g.data) } });
+			this.link.send({ t: "publish", id: g.id, entry: { doc, kind: g.kind, data: g.data.length === 1 ? g.data[0]! : Y.mergeUpdates(g.data) } });
 			this.lastPublish = Date.now();
 		}
 	}
@@ -520,6 +552,10 @@ export class Engine {
 	private async text(id: string): Promise<string | undefined> {
 		const open = this.opened.get(id);
 		if (open) return open.getText("t").toString();
+		return this.storedText(id);
+	}
+
+	private async storedText(id: string): Promise<string | undefined> {
 		const state = await this.state(id);
 		if (!state) return undefined;
 		const doc = this.load(state);
@@ -1115,7 +1151,7 @@ export class Engine {
 	private async tombstone(id: string): Promise<void> {
 		const v = this.notes.get(id);
 		if (!v || v.d !== undefined) return;
-		this.notes.set(id, { p: v.p, d: b64(await this.stateVector(id)) });
+		this.notes.set(id, { p: v.p, d: b64(await this.stateVector(id)), t: this.opts.now?.() ?? Date.now() });
 	}
 
 	/** A deleted note that this device holds edits for which the deleter never saw is not deleted. */

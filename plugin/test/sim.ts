@@ -112,6 +112,14 @@ export class Device {
 		if (state) Y.applyUpdate(doc, state);
 		return doc.getText("t").toString();
 	}
+	storedIndex(): Map<string, { p: string; d?: string }> {
+		const state = this.data.get("index") as Uint8Array | undefined;
+		const doc = new Y.Doc();
+		if (state) Y.applyUpdate(doc, state);
+		const index = new Map(doc.getMap<{ p: string; d?: string }>("notes"));
+		doc.destroy();
+		return index;
+	}
 
 	// --- the app's life ---
 	boot(): void {
@@ -184,6 +192,7 @@ export class Device {
 			chunkSize: 4, // so most attachments are several chunks
 			newId: () => Array.from({ length: 4 }, () => Math.floor(this.random() * 0x10000).toString(16).padStart(4, "0")).join(""),
 			random: this.random,
+			now: () => this.clock,
 			snapshotAfter: 4,
 			onProblem: (what, err) => { if (!(err instanceof Crashed)) this.problems.push(`${this.name} ${what}: ${err instanceof Error ? err.stack : String(err)}`); },
 			onClosed: (id) => this.editors.delete(id),
