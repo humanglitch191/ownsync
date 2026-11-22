@@ -157,7 +157,9 @@ export class Vault extends DurableObject<Env> {
 				if (typeof n.vault === "string") this.write("INSERT OR REPLACE INTO vault_name (id, name) VALUES (0, ?)", clean(n.vault));
 				// And in reply, which Ownsync this Worker runs and the newest release, so the plugin can say when either is behind.
 				const latest = await (owner(this.env) as unknown as { latest(): Promise<string | null> }).latest().catch(() => null);
-				return Response.json({ ok: true, worker: VERSION, latest });
+				// And the names the vault's devices gave themselves, for each device's list (they were sent readable anyway).
+				const names = Object.fromEntries(this.sql.exec<{ id: string; name: string }>("SELECT id, name FROM devices WHERE name != ''").toArray().map((r) => [r.id, r.name]));
+				return Response.json({ ok: true, worker: VERSION, latest, names });
 			}
 			await this.erase();
 			return Response.json({ deleted: true });

@@ -68,3 +68,14 @@ export function applyPresence(aw: Awareness, update: Uint8Array): boolean {
 	applyAwarenessUpdate(aw, encoding.toUint8Array(e), "remote");
 	return appeared;
 }
+
+/** The Worker's list of device names, by short ID: untrusted, so only 8-hex IDs and cleaned names. */
+export function deviceNames(raw: unknown): Map<string, string> {
+	const names = new Map<string, string>();
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return names;
+	for (const [id, name] of Object.entries(raw).slice(0, 1000)) {
+		const clean = cleanName(name);
+		if (/^[0-9A-F]{8}$/.test(id) && clean) names.set(id, clean);
+	}
+	return names;
+}

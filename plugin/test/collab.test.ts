@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import { Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
-import { applyPresence, localUndo } from "../src/collab";
+import { applyPresence, deviceNames, localUndo } from "../src/collab";
 
 test("undo takes back only this editor's typing, not another device's or the engine's", () => {
 	const doc = new Y.Doc(), text = doc.getText("t"), undo = localUndo(text);
@@ -62,4 +62,9 @@ test("presence from another device is cleaned before the editor sees it", () => 
 	applyPresence(mine, encodeAwarenessUpdate(fake, [fake.clientID]));
 	assert.equal(mine.getLocalState()!.user.name, "Me");
 	for (const a of [mine, theirs, again, fake]) a.destroy();
+});
+
+test("device names from the Worker: only 8-hex IDs and cleaned names", () => {
+	assert.deepEqual([...deviceNames({ ABCD0063: " Anna's iPhone 17 Pro\u0007", "bad id": "x", ABCD0064: "", ABCD0065: 7 })], [["ABCD0063", "Anna's iPhone 17 Pro"]]);
+	for (const raw of [null, "x", [], 5]) assert.equal(deviceNames(raw).size, 0);
 });

@@ -1,5 +1,5 @@
 import { type App, type EventRef, Events, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, apiVersion, normalizePath, requestUrl, setIcon } from "obsidian";
-import { cleanName } from "./collab";
+import { cleanName, deviceNames } from "./collab";
 import { docTag, hex, randomBytes, sha256 } from "../../protocol/ownsync";
 import { Engine } from "./core/engine";
 import { RecoverModal, chooseFork, createVault, removeDevice, replaceRecovery } from "./devices";
@@ -198,7 +198,20 @@ export default class OwnsyncPlugin extends Plugin {
 		const res = await requestUrl({ url: `${this.settings.host}/vault/${hex(keys.vaultId)}/names`, method: "POST", body: body.buffer, throw: false }).catch(() => null);
 		if (res?.status !== 200) return;
 		this.sentNames = json;
-		this.offerUpdate(res.json as { latest?: unknown; worker?: unknown });
+		const reply = res.json as { latest?: unknown; worker?: unknown; names?: unknown };
+		this.deviceNames = deviceNames(reply.names);
+		this.offerUpdate(reply);
+	}
+
+	/** Names the devices gave themselves, by short ID, as the Worker last reported them (unverified, like "paired by"). */
+	deviceNames = new Map<string, string>();
+
+	/** Asks the Worker again, for the Devices list. True if a name changed. */
+	async refreshNames(): Promise<boolean> {
+		const before = JSON.stringify([...this.deviceNames]);
+		this.sentNames = "";
+		await this.reportNames().catch(() => {});
+		return JSON.stringify([...this.deviceNames]) !== before;
 	}
 
 	/**
@@ -519,8 +532,11 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
+	private namesAsked = false; // the Worker is asked for device names once per opening of the settings
+
 	hide(): void {
 		this.plugin.onStatusChange = null;
+		this.namesAsked = false;
 	}
 
 	display(): void {
@@ -708,11 +724,16 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		const keys = plugin.session?.keys, head = keys?.state.head;
 		if (!keys || !head) return;
 		const me = hex(keys.me.id);
-		const name = (id: Uint8Array) => (hex(id) === me ? "this device" : shortId(id));
+		const label = (id: Uint8Array) => { const short = shortId(id), given = plugin.deviceNames.get(short); return given ? `${given} (${short})` : short; };
+		const name = (id: Uint8Array) => (hex(id) === me ? "this device" : label(id));
+		if (!this.namesAsked) {
+			this.namesAsked = true;
+			void plugin.refreshNames().then((changed) => { if (changed) this.display(); });
+		}
 		new Setting(containerEl).setName("Devices").setDesc("When and by which device each was paired is what the pairing device reported; it isn't verified. A stolen device can pair others before you remove it.").setHeading();
 		for (const m of head.members) {
 			const row = new Setting(containerEl)
-				.setName(`${shortId(m.id)}${hex(m.id) === me ? " (this device)" : ""}`)
+				.setName(`${label(m.id)}${hex(m.id) === me ? " (this device)" : ""}`)
 				.setDesc(`Paired ${new Date(m.pairedAt).toLocaleString()} by ${hex(m.pairedBy) === hex(m.id) ? "itself" : name(m.pairedBy)}.`);
 			if (hex(m.id) !== me) row.addButton((b) => b.setButtonText("Remove").setWarning().onClick(async () => { await removeDevice(plugin, m.id); this.display(); }));
 		}

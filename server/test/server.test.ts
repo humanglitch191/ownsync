@@ -307,7 +307,8 @@ test("devices report a status: one short ID per connection, last online from the
 	const named = await names(tok, { device: "ABCD0063", name: "  Kish's iPhone\u0007 ", vault: "Personal" });
 	assert.equal(named.status, 200);
 	// The reply says which Ownsync the Worker runs, and the newest release when it can be looked up (or null), for the plugin's update notice.
-	const reply = (await named.json()) as { worker?: string; latest?: string | null };
+	const reply = (await named.json()) as { worker?: string; latest?: string | null; names?: Record<string, string> };
+	assert.deepEqual(reply.names, { ABCD0063: "Kish's iPhone" }); // what each device shows in its list of devices
 	assert.match(reply.worker ?? "", /^\d+\.\d+\.\d+$/);
 	assert.ok(reply.latest === null || /^\d+\.\d+\.\d+$/.test(reply.latest ?? ""));
 	phone.send(status(99, 1, "0.1.1 mobile notes-only"));
