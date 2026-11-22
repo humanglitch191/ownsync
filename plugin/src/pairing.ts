@@ -21,6 +21,9 @@ export interface PairingHost {
 	/** Whether this device syncs attachments too, or notes only. */
 	attachments: boolean;
 	setAttachments(on: boolean): Promise<void>;
+	/** This device's name, given while pairing. */
+	deviceName: string;
+	setDeviceName(name: string): Promise<void>;
 }
 
 // A phone's camera opens web links, not obsidian:// ones, so the QR code goes through the server's own
@@ -70,8 +73,14 @@ export async function handlePairLink(host: PairingHost, params: Record<string, s
 		new Notice("This device already syncs a vault, so the pairing link was ignored. To pair it again, use Settings → Ownsync → Leave this vault first.", 12000);
 		return false;
 	}
-	let attachments = host.attachments;
-	const ok = await confirm(host.app, "Pair this device?", `Worker: ${server}. The notes in this Obsidian vault will be encrypted and synced with the vault on that Worker. Only continue if you just scanned or copied this code from your own device.`, "Pair", (el) => attachmentsToggle(el, attachments, (on) => (attachments = on)));
+	let attachments = host.attachments, name = "";
+	const ok = await confirm(host.app, "Pair this device?", `Worker: ${server}. The notes in this Obsidian vault will be encrypted and synced with the vault on that Worker. Only continue if you got this code just now, from your own device or from the person whose vault this is.`, "Pair", (el) => {
+		new Setting(el)
+			.setName("Device name")
+			.setDesc("Shown next to this device's cursor, and on the Worker's dashboard. For example: iPhone 17 Pro, or Anna's iPhone 17 Pro.")
+			.addText((t) => t.setPlaceholder(host.deviceName).onChange((v) => (name = v)));
+		attachmentsToggle(el, attachments, (on) => (attachments = on));
+	});
 	if (!ok) {
 		new Notice("Pairing cancelled. Nothing changed.", 6000);
 		return false;
@@ -95,6 +104,7 @@ export async function handlePairLink(host: PairingHost, params: Record<string, s
 		return false;
 	}
 	await host.setAttachments(attachments);
+	if (name.trim()) await host.setDeviceName(name);
 	await host.setUp(server, vaultId, new Map([[p.epoch, p.vmk]]), undefined, { number: p.number, hash: p.hash, pairedBy: p.pairerId });
 	const me = host.session?.keys.me.id;
 	new Notice(`Paired, and syncing.${me ? ` This device is ${shortId(me)}: your other device should show the same.` : ""}`, 15000);

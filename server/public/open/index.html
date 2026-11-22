@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- A note's link: which vault and note are in this page's address after "#", which the browser never sends
+     anywhere. The policy below allows only this page's own script, like the add-device page. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; form-action 'none'; base-uri 'none'">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta name="referrer" content="no-referrer">
+<title>Open note · Ownsync</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 0; font: 15px/1.6 system-ui, sans-serif; }
+main { max-width: 34rem; margin: 0 auto; padding: 3.5rem 1.25rem; }
+</style>
+<main>
+<p><a id="open" href="#">Open this in Obsidian</a> with Ownsync installed.</p>
+</main>
+<script src="open.js"></script>
+</html>

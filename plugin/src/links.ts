@@ -48,3 +48,14 @@ export function parseVaultCode(text: string): { host: string; owner: string } | 
 	const host = m ? trimHost(m[1]!) : "";
 	return m && isOrigin(host) ? { host, owner: m[2]!.toLowerCase() } : null;
 }
+
+/** A note's web link: a page on the Worker that hands the fragment, which never reaches the Worker, to Obsidian.
+ * The note ID, not its path, so the link survives renames. */
+export const noteUrl = (host: string, vaultId: string, noteId: string) => `${trimHost(host)}/open/#${vaultId}/${noteId}`;
+
+/** `obsidian://ownsync-open?vaultId=…&note=…` from that page: exactly a vault ID and a note ID, or null. (Not
+ * `vault=`: Obsidian itself reads that one, as a vault name.) */
+export function parseOpenLink(params: Record<string, string | undefined>): { vaultId: string; noteId: string } | null {
+	const { vaultId = "", note = "" } = params;
+	return /^[0-9a-f]{32}$/.test(vaultId) && /^[0-9a-f]{16}$/.test(note) ? { vaultId, noteId: note } : null;
+}

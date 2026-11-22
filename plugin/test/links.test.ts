@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { paramsOfPairLink, parsePairLink, parseSetupLink, parseVaultCode } from "../src/links";
+import { noteUrl, paramsOfPairLink, parseOpenLink, parsePairLink, parseSetupLink, parseVaultCode } from "../src/links";
 
 test("a setup link is a vault code: a bare secure server address and a 64-hex owner code", () => {
 	const code = "ab".repeat(32);
@@ -40,5 +40,15 @@ test("a vault code: a bare secure server address, #, and a 64-hex owner code", (
 	assert.deepEqual(parseVaultCode(`https://ownsync.me.workers.dev/#${owner}`), { host: "https://ownsync.me.workers.dev", owner });
 	for (const bad of [owner, `http://evil.example#${owner}`, `https://a.example/x#${owner}`, `https://a.example#${owner}0`, "correct horse battery staple", ""]) {
 		assert.equal(parseVaultCode(bad), null, bad);
+	}
+});
+
+test("a note's link: built from the Worker, vault ID and note ID; only exact hex IDs open", () => {
+	const vaultId = "0123456789abcdef0123456789abcdef", noteId = "fedcba9876543210";
+	assert.equal(noteUrl("https://ownsync.me.workers.dev/", vaultId, noteId), `https://ownsync.me.workers.dev/open/#${vaultId}/${noteId}`);
+	assert.deepEqual(parseOpenLink({ vaultId, note: noteId }), { vaultId, noteId });
+	for (const bad of [{ vaultId: vaultId.toUpperCase(), note: noteId }, { vaultId: vaultId.slice(1), note: noteId }, { vaultId: `${vaultId}0`, note: noteId },
+		{ vaultId, note: `${noteId}0` }, { vaultId, note: "../../etc/passwd" }, { vaultId, note: ` ${noteId}` }, { vault: vaultId, note: noteId }, { vaultId }, {}]) {
+		assert.equal(parseOpenLink(bad), null, JSON.stringify(bad));
 	}
 });

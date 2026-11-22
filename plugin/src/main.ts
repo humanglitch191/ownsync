@@ -10,7 +10,7 @@ import { redactProblem } from "./diagnostics";
 import { Editors, editorBinding } from "./editors";
 import { IdbStore } from "./idbStore";
 import { type KeyPorts, type KeyState, VaultKeys, shortId } from "./keys";
-import { parseSetupLink, trimHost } from "./links";
+import { noteUrl, parseOpenLink, parseSetupLink, trimHost } from "./links";
 import { handlePairLink, showPairingCode } from "./pairing";
 import { SetupModal, openDashboard } from "./setup";
 import { createSnapshots } from "./snapshots";
@@ -83,6 +83,14 @@ export default class OwnsyncPlugin extends Plugin {
 	}
 
 	/** Shown next to this device's cursor on the others. It travels encrypted, like the notes. */
+	/** Named while pairing ("Anna's iPhone 17 Pro"): shown next to its cursor and on the Worker's dashboard. */
+	async setDeviceName(name: string): Promise<void> {
+		this.settings.deviceName = name;
+		await this.saveData(this.settings);
+		this.session?.editors.setName(this.deviceName);
+		this.namesChanged();
+	}
+
 	get deviceName(): string {
 		const os = Platform.isIosApp ? "iOS" : Platform.isAndroidApp ? "Android" : Platform.isMacOS ? "macOS" : Platform.isWin ? "Windows" : Platform.isLinux ? "Linux" : "";
 		return cleanName(this.settings.deviceName) || (os ? `Obsidian on ${os}` : "Obsidian");
@@ -113,6 +121,16 @@ export default class OwnsyncPlugin extends Plugin {
 		this.addCommand({ id: "copy-diagnostics", name: "Copy diagnostics", callback: () => this.showDiagnostics() });
 		this.registerEditorExtension(editorBinding.of([]));
 		this.registerObsidianProtocolHandler("ownsync-pair", (params) => void handlePairLink(this, params));
+		// Any web page can open this link: it only ever opens a note of this vault.
+		this.registerObsidianProtocolHandler("ownsync-open", (params) => void this.openNoteLink(params));
+		this.addCommand({ id: "copy-url", name: "Copy URL", checkCallback: (checking) => {
+			const file = this.app.workspace.getActiveFile(), id = file && this.noteAt(file.path);
+			return !!id && (checking || this.copyUrl(id), true);
+		} });
+		this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+			const id = this.noteAt(file.path);
+			if (id) menu.addItem((item) => item.setTitle("Copy URL").setIcon("link").onClick(() => this.copyUrl(id)));
+		}));
 		this.registerObsidianProtocolHandler("ownsync-setup", (params) => {
 			if (this.hasKey()) return void new Notice("This vault already syncs with Ownsync, so the setup link was ignored.", 8000);
 			this.openSetup(parseSetupLink(params) ?? "");
@@ -204,6 +222,22 @@ export default class OwnsyncPlugin extends Plugin {
 				notice.hide();
 			});
 		}), 0);
+	}
+
+	/** A note's web link, for anyone who syncs this vault. */
+	private copyUrl(noteId: string): void {
+		const url = noteUrl(this.settings.host, this.settings.vaultId, noteId);
+		void navigator.clipboard.writeText(url).then(() => new Notice("Link copied. It opens this note for anyone in this vault."), () => new Notice("Failed to copy the link.", 6000));
+	}
+
+	private async openNoteLink(params: Record<string, string>): Promise<void> {
+		const link = parseOpenLink(params);
+		if (!link) return void new Notice("This Ownsync link is incomplete.", 6000);
+		if (!this.hasKey() || link.vaultId !== this.settings.vaultId) return void new Notice("This link is for another vault.", 6000);
+		if (!this.session) return void new Notice("Ownsync is still starting. Open the link again in a moment.", 6000);
+		const path = this.pathOf(link.noteId), file = path ? this.app.vault.getFileByPath(path) : null;
+		if (!file) return void new Notice("That note was deleted. Look in Recently deleted.", 8000);
+		await this.app.workspace.getLeaf().openFile(file);
 	}
 
 	openSetup(code = ""): void {
@@ -514,7 +548,11 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		plugin.onStatusChange = showStatus;
 		new Setting(containerEl)
 			.setName("Add a device")
-			.setDesc("Your phone, tablet or another computer: shows a one-time code to scan.")
+			.setDesc(createFragment((f) => {
+				f.appendText("Your phone, tablet or another computer: shows a one-time code to scan.");
+				f.createEl("br");
+				f.appendText("Someone else's device joins the same way, and can read and change every note.");
+			}))
 			.addButton((b) => b.setButtonText("Add a device").setCta().onClick(() => void showPairingCode(plugin)));
 		new Setting(containerEl)
 			.setName("Dashboard")
