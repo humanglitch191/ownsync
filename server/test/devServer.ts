@@ -1,7 +1,7 @@
 // Starts `wrangler dev` for this Worker (with its test-only stats route) on a random port with fresh local storage.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setUpDashboard } from "./passkey.ts";
@@ -44,7 +44,10 @@ export async function startDev() {
 		dev.stderr.on("data", onData);
 		dev.on("exit", (code) => reject(new Error(`wrangler dev exited ${code}`)));
 	});
-	const stop = () => { try { process.kill(-dev.pid!, "SIGTERM"); } catch { /* already gone */ } };
+	const stop = () => {
+		try { process.kill(-dev.pid!, "SIGTERM"); } catch { /* already gone */ }
+		rmSync(persistDir, { recursive: true, force: true }); // each run gets a fresh one; /tmp is often in memory
+	};
 	process.once("exit", stop);
 	return { port, persistDir, stop };
 }
