@@ -43,6 +43,7 @@
 .ownsync-history-list { display: flex; flex-direction: column; gap: var(--size-2-1); width: 38%; overflow-y: auto; }
 .ownsync-history-item { text-align: left; justify-content: flex-start; background: transparent; box-shadow: none; height: auto; padding: var(--size-2-3) var(--size-4-2); overflow-wrap: anywhere; }
 .ownsync-history-item:hover { background: var(--background-modifier-hover); }
+.ownsync-history-item .ownsync-quiet { margin-inline-start: var(--size-2-2); }
 .ownsync-history-item.is-active { background: var(--background-modifier-active-hover); }
 .ownsync-history-right { display: flex; flex-direction: column; gap: var(--size-4-2); flex: 1; min-width: 0; }
 .ownsync-history-preview {

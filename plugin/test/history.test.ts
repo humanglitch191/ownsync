@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deletedWhenLabel, diffLines, keepCopies, mergeCopies, whenLabel, type Copy } from "../src/historyRules";
+import { deletedWhenLabel, diffLines, keepCopies, mergeCopies, restoreDeletedPrompt, restorePath, whenLabel, whenLabels, type Copy } from "../src/historyRules";
 
 const HOUR = 60 * 60_000;
 const now = new Date(2026, 10, 22, 15, 0).getTime();
@@ -36,6 +36,24 @@ test("time labels use the local calendar, including across months and years", ()
 	assert.equal(whenLabel(new Date(2026, 10, 21, 9, 5).getTime(), now), "Yesterday 09:05");
 	assert.equal(whenLabel(new Date(2026, 9, 1, 18, 30).getTime(), now), "2026-10-01 18:30");
 	assert.equal(whenLabel(new Date(2025, 11, 31, 23, 55).getTime(), new Date(2026, 0, 1, 0, 5).getTime()), "Yesterday 23:55");
+});
+
+test("copies that share a minute with a neighbour show seconds, the rest don't", () => {
+	const at = (h: number, m: number, sec: number) => new Date(2026, 10, 22, h, m, sec).getTime();
+	assert.deepEqual(whenLabels([at(21, 21, 50), at(21, 21, 30), at(21, 21, 5), at(21, 20, 59), at(9, 5, 0)], now),
+		["Today 21:21:50", "Today 21:21:30", "Today 21:21:05", "Today 21:20", "Today 09:05"]);
+	assert.deepEqual(whenLabels([new Date(2026, 10, 21, 9, 5, 7).getTime(), new Date(2026, 10, 21, 9, 5, 1).getTime()], now),
+		["Yesterday 09:05:07", "Yesterday 09:05:01"]);
+	assert.deepEqual(whenLabels([], now), []);
+});
+
+test("a deleted note comes back at its old path, or under a new name when another note has it", async () => {
+	assert.equal(await restorePath("Notes/Plan.md", () => false), "Notes/Plan.md");
+	const taken = new Set(["Notes/Plan.md", "Notes/Plan (restored).md"]);
+	assert.equal(await restorePath("Notes/Plan.md", async (path) => taken.has(path)), "Notes/Plan (restored 2).md");
+	assert.equal(restoreDeletedPrompt("Notes/Plan.md", "Notes/Plan.md"), "Restore Notes/Plan.md to the vault?");
+	assert.equal(restoreDeletedPrompt("Notes/Plan.md", "Notes/Plan (restored).md"),
+		'Restore Notes/Plan.md to the vault? A note already has this name, so this one comes back as "Plan (restored)".');
 });
 
 test("deleted notes show elapsed time or an unknown time", () => {

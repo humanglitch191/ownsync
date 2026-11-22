@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { differingSnapshotNotes, restoreFolderName, safeSnapshotPath, snapshotTree } from "../src/snapshotsView";
+import { differingSnapshotNotes, restoreFolderName, safeSnapshotPath, snapshotDate, snapshotTree } from "../src/snapshotsView";
 
 const note = (path: string, text = path) => ({ id: path, path, text });
 
@@ -41,4 +41,11 @@ test("in-place restore selects only changed and missing notes", () => {
 	const missing = { note: note("Missing.md", ""), current: undefined };
 	const empty = { note: note("Empty.md", ""), current: "" };
 	assert.deepEqual(differingSnapshotNotes([same, changed, missing, empty]), [changed, missing]);
+});
+
+test("a snapshot shows the local date it was taken, not its UTC day", () => {
+	const takenAt = new Date(2026, 10, 22, 0, 30).getTime();
+	const utcDay = Math.floor(takenAt / 86_400_000);
+	assert.equal(snapshotDate(utcDay, takenAt), "2026-11-22");
+	assert.equal(snapshotDate(utcDay), new Date(utcDay * 86_400_000).toISOString().slice(0, 10));
 });

@@ -175,6 +175,7 @@ export default class OwnsyncPlugin extends Plugin {
 	/** The running engine, for the history screens (undefined while the vault isn't set up). */
 	engine = () => this.session?.engine;
 	snapshots = () => this.session?.snapshots;
+	pairedAt = () => { const keys = this.session?.keys; return keys?.state.head?.members.find((m) => hex(m.id) === hex(keys.me.id))?.pairedAt; };
 	snapshotsSynced = () => this.status === "synced" && this.session?.transport.status === "synced";
 	onSnapshotSyncChange = (callback: () => void) => this.snapshotSyncEvents.on("change", callback);
 	noteAt = (path: string) => this.session?.engine.noteAt(path);
@@ -646,7 +647,7 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		const { plugin } = this;
 		const modal = new Modal(this.app);
 		modal.titleEl.setText("Delete history backups?");
-		modal.contentEl.createEl("p", { text: "This deletes this vault's history backups from your Worker, including copies uploaded by other devices." });
+		modal.contentEl.createEl("p", { text: "Also delete the history backups on your Worker? That removes the copies from all your devices." });
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Keep backups" }).onclick = () => modal.close();
 		buttons.createEl("button", { text: "Delete backups", cls: "mod-warning" }).onclick = async () => {

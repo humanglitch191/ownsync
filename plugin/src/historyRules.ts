@@ -101,15 +101,35 @@ export function diffLines(current: string, copy: string): { added: number; remov
 	return { added, removed, changes };
 }
 
-export function whenLabel(time: number, now: number): string {
+export function whenLabel(time: number, now: number, seconds = false): string {
 	const date = new Date(time), today = new Date(now);
 	const pad = (number: number) => String(number).padStart(2, "0");
-	const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+	const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}${seconds ? `:${pad(date.getSeconds())}` : ""}`;
 	const day = localDay(date);
 	if (day === localDay(today)) return `Today ${clock}`;
 	today.setDate(today.getDate() - 1);
 	if (day === localDay(today)) return `Yesterday ${clock}`;
 	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${clock}`;
+}
+
+/** Labels for copies listed newest first. Seconds only where a neighbouring copy shares the minute. */
+export function whenLabels(times: readonly number[], now: number): string[] {
+	const minute = (time: number | undefined) => time === undefined ? NaN : Math.floor(time / 60_000);
+	return times.map((time, i) => whenLabel(time, now, minute(times[i - 1]) === minute(time) || minute(times[i + 1]) === minute(time)));
+}
+
+/** Where a restored deleted note goes: its old path, or "<name> (restored).md" when another note has that name. */
+export async function restorePath(path: string, taken: (path: string) => boolean | Promise<boolean>): Promise<string> {
+	const base = path.replace(/\.md$/i, "");
+	let to = path;
+	for (let n = 1; await taken(to); n++) to = `${base} (restored${n === 1 ? "" : ` ${n}`}).md`;
+	return to;
+}
+
+export function restoreDeletedPrompt(path: string, to: string): string {
+	if (to === path) return `Restore ${path} to the vault?`;
+	const name = to.slice(to.lastIndexOf("/") + 1).replace(/\.md$/i, "");
+	return `Restore ${path} to the vault? A note already has this name, so this one comes back as "${name}".`;
 }
 
 const relativeTime = new Intl.RelativeTimeFormat("en");

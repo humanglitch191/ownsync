@@ -13,6 +13,8 @@ export interface SnapshotsHost {
 	settings: { snapshots: boolean; snapshotsOffered: boolean };
 	saveData(data: unknown): Promise<void>;
 	snapshots(): SnapshotsApi | undefined;
+	/** When this device was set up or paired. */
+	pairedAt?(): number | undefined;
 	/** True when the vault is set up, caught up, and sync is running. */
 	snapshotsSynced(): boolean;
 	/** Fires after the session or its sync status changes. */
@@ -22,6 +24,7 @@ export interface SnapshotsHost {
 }
 
 const HOUR = 60 * 60_000;
+const OFFER_AFTER = 10 * 60_000;
 const description = "Once a day, an encrypted copy of your whole vault on your Worker. Kept 7 daily and 4 weekly. Uses more of your Worker's storage.";
 
 export function restoreFolderName(date: string, exists: (path: string) => boolean): string {
@@ -66,8 +69,11 @@ export function differingSnapshotNotes<T extends { note: SnapshotNote; current: 
 	return notes.filter(({ note, current }) => current !== note.text);
 }
 
-function snapshotDate(day: number): string | undefined {
-	return new Date(day * 24 * HOUR).toJSON()?.match(/^\d{4}-\d{2}-\d{2}/)?.[0];
+/** The local date the snapshot was taken; the UTC day it is filed under when that time isn't known. */
+export function snapshotDate(day: number, takenAt?: number): string | undefined {
+	if (takenAt === undefined) return new Date(day * 24 * HOUR).toJSON()?.match(/^\d{4}-\d{2}-\d{2}/)?.[0];
+	const date = new Date(takenAt), pad = (n: number) => String(n).padStart(2, "0");
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 function sizeLabel(bytes: number): string {
@@ -150,7 +156,7 @@ async function copyIntoFolder(vault: Vault, date: string, notes: readonly Snapsh
 			written++;
 		} catch { /* A blocked path doesn't prevent other notes from being restored. */ }
 	}
-	new Notice(`Restored ${noteCount(written)} to ${root}.${skippedNotice(notes.length - written, occupied)}`);
+	new Notice(`Restored ${noteCount(written)} into the folder "${root}".${skippedNotice(notes.length - written, occupied)}`);
 }
 
 function skippedNotice(skipped: number, occupied: number): string {
@@ -271,7 +277,7 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 			status.remove();
 			const rows = this.contentEl.createDiv({ cls: "ownsync-snapshot-list" });
 			for (const info of [...list].sort((a, b) => b.day - a.day)) {
-				const flags = [snapshotDate(info.day) ?? "Date unknown", info.missingOnServer ? "Size unknown" : sizeLabel(info.size)];
+				const flags = [snapshotDate(info.day, info.takenAt) ?? "Date unknown", info.missingOnServer ? "Size unknown" : sizeLabel(info.size)];
 				if (info.notesOnly) flags.push("Notes only");
 				if (!info.verified) flags.push("Can't be verified");
 				if (info.missingOnServer) flags.push("Missing on Worker");
@@ -292,7 +298,7 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 			const snapshot = await this.api.open(info.id);
 			if (!this.showing) return;
 			if (!this.active()) return status.setText("The sync session changed. Reopen Vault snapshots.");
-			const date = snapshotDate(snapshot.day);
+			const date = snapshotDate(snapshot.day, snapshot.takenAt);
 			if (!date) throw new Error("Invalid snapshot date");
 			this.showSnapshot(snapshot, date);
 		} catch {
@@ -507,7 +513,9 @@ export function installSnapshots(plugin: SnapshotsHost): void {
 		if (running || stopped || !api || !plugin.snapshotsSynced()) return;
 		running = true;
 		try {
-			if (!plugin.settings.snapshotsOffered) {
+			// Not in a device's first minutes after setup or pairing, and not over an open dialog.
+			const settled = Date.now() - (plugin.pairedAt?.() ?? 0) >= OFFER_AFTER && !document.querySelector(".modal-container");
+			if (!plugin.settings.snapshotsOffered && settled) {
 				plugin.settings.snapshotsOffered = true;
 				try {
 					await plugin.saveData(plugin.settings);
@@ -603,7 +611,7 @@ export function snapshotSettings(containerEl: HTMLElement, plugin: SnapshotsHost
 			}
 		}));
 	new Setting(containerEl).setName("Delete all snapshots")
-		.setDesc("Deleting a note's history doesn't remove it from snapshots.")
+		.setDesc("Removes every vault snapshot from your Worker.")
 		.addButton((button) => button.setButtonText("Delete all snapshots").setWarning().onClick(() => {
 			const api = plugin.snapshots();
 			if (!api) return void new Notice("Connect to your Worker to delete snapshots.");

@@ -6,7 +6,7 @@ import { type EditorView, ViewPlugin } from "@codemirror/view";
 import { ySyncAnnotation, ySyncFacet } from "y-codemirror.next";
 import { type Doc, type Transaction as YTransaction, UndoManager } from "yjs";
 import type { createHistoryBackup } from "./historyBackup";
-import { MAX_BYTES, type Copy, deletedWhenLabel, diffLines, keepCopies, mergeCopies, whenLabel } from "./historyRules";
+import { MAX_BYTES, type Copy, deletedWhenLabel, diffLines, keepCopies, mergeCopies, restoreDeletedPrompt, restorePath, whenLabels } from "./historyRules";
 
 interface DeletedNotesEngine {
 	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number }[]>;
@@ -454,9 +454,10 @@ function isNote(file: unknown): file is TFile {
 }
 
 interface RestoreAction {
-	prompt: string;
-	comparePrompt?: string;
-	compare(): Promise<string | undefined>;
+	title?: string;
+	prompt(): string | Promise<string>;
+	/** The text the restore replaces, for a line comparison. Restoring a deleted note replaces nothing. */
+	compare?(): Promise<string | undefined>;
 	apply(copy: string, current: string | undefined): Promise<void>;
 }
 
@@ -467,11 +468,10 @@ interface HistoryRow {
 	restore?: RestoreAction;
 }
 
-function showComparison(preview: HTMLElement, current: string, copy: string, context?: string): string {
+function showComparison(preview: HTMLElement, current: string, copy: string): string {
 	const diff = diffLines(current, copy);
 	const summary = diff ? `${diff.added} ${diff.added === 1 ? "line" : "lines"} added, ${diff.removed} removed.` : "Too long to compare.";
 	preview.setText("");
-	if (context) preview.createEl("span", { text: context, cls: "ownsync-history-diff-summary" });
 	preview.createEl("span", { text: summary, cls: "ownsync-history-diff-summary" });
 	if (!diff) {
 		preview.createEl("span", { text: copy.length > 8_000 ? `${copy.slice(0, 8_000)}…` : copy });
@@ -512,17 +512,11 @@ class HistoryModal extends Modal {
 				rows = [...entries].sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity)).map((entry) => ({
 					label: `${entry.path} (${deletedWhenLabel(entry.deletedAt, now)})`,
 					read: () => engine.deletedText(entry.id),
-					restore: {
-						prompt: `Restore ${entry.path} to the vault?`,
-						comparePrompt: "A note already uses this path. The restored note will get a new name.",
-						compare: () => this.readAtPath(entry.path),
-						apply: async (_, current) => {
-							if (await this.readAtPath(entry.path) !== current) throw new Error("The note at this path changed. Select the copy again to review it.");
-							if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
-							const path = await engine.restoreDeleted(entry.id);
-							new Notice(path ? `Restored ${path}.` : "Note restored.");
-						},
-					},
+					restore: this.deletedRestore(entry.path, async () => {
+						if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
+						const path = await engine.restoreDeleted(entry.id);
+						new Notice(path ? `Restored ${path}.` : "Note restored.");
+					}),
 				}));
 			} else {
 				const entries = await this.history.list();
@@ -568,7 +562,7 @@ class HistoryModal extends Modal {
 		const local = await this.history.list(path).then((entries) => Promise.all(entries.map(async (entry) => {
 			const read = () => this.history.text(entry);
 			const text = await read();
-			if (text !== undefined) return { takenAt: entry.time, text, row: this.noteRow(file, entry.time, now, read) };
+			if (text !== undefined) return { takenAt: entry.time, text, row: this.noteRow(file, read) };
 		}))).then((copies) => {
 			status.remove();
 			return copies.filter((copy) => copy !== undefined);
@@ -577,23 +571,27 @@ class HistoryModal extends Modal {
 			return [];
 		});
 		if (!this.showing) return;
-		show([current, ...mergeCopies(local, []).map(({ row }) => row)]);
+		const labelled = (copies: { takenAt: number; row: HistoryRow }[]) => {
+			const labels = whenLabels(copies.map(({ takenAt }) => takenAt), now);
+			return copies.map(({ row }, i) => Object.assign(row, { label: labels[i]! }));
+		};
+		show([current, ...labelled(mergeCopies(local, []))]);
 
 		const copies = await fetching;
 		if (!this.showing || !copies?.length) return;
 		const active = this.history.backupFor(file.path);
 		if (!active || active.client !== target?.client || active.noteId !== target.noteId) return;
-		const backedUp = copies.map(({ takenAt, text }) => ({ takenAt, text, row: this.noteRow(file, takenAt, now, async () => text, true) }));
-		show([current, ...mergeCopies(local, backedUp).map(({ row }) => row)]);
+		const backedUp = copies.map(({ takenAt, text }) => ({ takenAt, text, row: this.noteRow(file, async () => text, true) }));
+		show([current, ...labelled(mergeCopies(local, backedUp))]);
 	}
 
-	private noteRow(file: TFile, takenAt: number, now: number, read: HistoryRow["read"], backup = false): HistoryRow {
+	private noteRow(file: TFile, read: HistoryRow["read"], backup = false): HistoryRow {
 		return {
-			label: whenLabel(takenAt, now),
+			label: "",
 			backup,
 			read,
 			restore: {
-				prompt: "This replaces the current text of the note.",
+				prompt: () => "This replaces the current text of the note.",
 				compare: () => this.app.vault.read(file),
 				apply: async (text, current) => {
 					const { vault } = this.app;
@@ -612,18 +610,22 @@ class HistoryModal extends Modal {
 		return {
 			label: `${entry.path} (${deletedWhenLabel(entry.time, now)})`,
 			read,
-			restore: {
-				prompt: `Restore ${entry.path} to the vault?`,
-				comparePrompt: "A note already uses this path. The restored note will get a new name.",
-				compare: () => this.readAtPath(entry.path),
-				apply: (text) => this.restoreLocalDeleted(entry, text),
-			},
+			restore: this.deletedRestore(entry.path, (text) => this.restoreLocalDeleted(entry, text)),
 		};
 	}
 
-	private async readAtPath(path: string): Promise<string | undefined> {
-		const file = this.app.vault.getFileByPath(path);
-		if (isNote(file)) return this.app.vault.read(file);
+	// A deleted note never replaces the note now at its path, so there is nothing to compare: say where it goes instead.
+	private deletedRestore(path: string, apply: (text: string) => Promise<void>): RestoreAction {
+		const target = () => restorePath(path, (to) => this.app.vault.adapter.exists(to));
+		let shown: string | undefined;
+		return {
+			title: "Restore this note?",
+			prompt: async () => restoreDeletedPrompt(path, shown = await target()),
+			apply: async (text) => {
+				if (await target() !== shown) throw new Error("Another note took this name. Select the note again to review it.");
+				await apply(text);
+			},
+		};
 	}
 
 	private showEntries(): (entries: HistoryRow[]) => void {
@@ -651,18 +653,15 @@ class HistoryModal extends Modal {
 			try {
 				const text = await entry.read();
 				if (!this.showing || selection !== version) return;
-				const current = text === undefined ? undefined : await action?.compare();
+				const current = text === undefined ? undefined : await action?.compare?.();
+				let prompt = action ? await action.prompt() : "";
 				if (!this.showing || selection !== version) return;
-				let prompt = action?.prompt ?? "";
-				if (current !== undefined && text !== undefined) {
-					const summary = showComparison(preview, current, text, action?.comparePrompt);
-					if (action?.comparePrompt) prompt += ` ${action.comparePrompt}`;
-					prompt += ` ${summary}`;
-				} else preview.setText(text ?? "This copy is no longer available.");
+				if (current !== undefined && text !== undefined) prompt += ` ${showComparison(preview, current, text)}`;
+				else preview.setText(text ?? "This copy is no longer available.");
 				preview.scrollTop = 0;
 				if (action && text !== undefined) {
 					restore.disabled = false;
-					restore.onclick = () => this.confirm(restore, "Restore this copy?", "Restore", prompt, () => this.restore(async () => {
+					restore.onclick = () => this.confirm(restore, action.title ?? "Restore this copy?", "Restore", prompt, () => this.restore(async () => {
 						if (await entry.read() !== text) throw new Error("This copy is no longer available.");
 						await action.apply(text, current);
 					}), !!this.file);
@@ -676,16 +675,15 @@ class HistoryModal extends Modal {
 			entries.forEach((entry, index) => {
 				let button = buttons.get(entry);
 				if (!button) {
-					button = list.createEl("button", {
-						text: entry.label,
-						cls: "ownsync-history-item",
-						attr: { "aria-pressed": "false" },
-					});
-					if (entry.backup) button.createSpan({ text: " (from backup)", cls: "ownsync-quiet" });
+					button = list.createEl("button", { cls: "ownsync-history-item", attr: { "aria-pressed": "false" } });
+					button.createSpan();
+					if (entry.backup) button.createSpan({ text: "(from backup)", cls: "ownsync-quiet" });
 					const rowButton = button;
 					button.onclick = () => void select(entry, rowButton);
 					buttons.set(entry, button);
 				}
+				// A backup copy in the same minute adds seconds to a label already shown.
+				button.firstElementChild!.setText(entry.label);
 				if (list.children[index] !== button) list.insertBefore(button, list.children[index] ?? null);
 				if (!selected) void select(entry, button);
 			});
@@ -728,12 +726,7 @@ class HistoryModal extends Modal {
 		if (folder && !vault.getFolderByPath(folder)) {
 			await vault.createFolder(folder).catch((err) => { if (!vault.getFolderByPath(folder)) throw err; });
 		}
-		const base = entry.path.replace(/\.md$/i, "");
-		let path = entry.path, n = 1;
-		while (await vault.adapter.exists(path)) {
-			path = `${base} (restored${n === 1 ? "" : ` ${n}`}).md`;
-			n++;
-		}
+		const path = await restorePath(entry.path, (to) => vault.adapter.exists(to));
 		await vault.create(path, text);
 		await this.history.forget(entry);
 		new Notice(`Restored ${path}.`);

@@ -52,6 +52,7 @@ interface Upload {
 	envelope?: Uint8Array;
 }
 
+// UTC on purpose: the Worker keeps one snapshot per UTC day, so devices in any time zone agree on "today"; only labels use local dates.
 const dayOf = (at: number) => Math.floor(at / 86_400_000);
 const isId = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
 const isHash = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
