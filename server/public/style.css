@@ -125,6 +125,8 @@ a:hover { color: var(--ink); }
 .section input.rename { font-weight: 600; }
 .vault { margin-bottom: 1.4rem; }
 .vault .card { overflow: hidden; }
+.vault .card.settings { margin-top: .6rem; }
+.devrow .seg { margin-bottom: 0; }
 .devrow { display: grid; grid-template-columns: 34px 1fr auto; gap: .9rem; align-items: center; padding: .85rem 1.1rem; border-top: 1px solid var(--line-2); }
 .devrow:first-child { border-top: 0; }
 .devrow .ic { width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--line); display: grid; place-items: center; color: var(--ink-2); }

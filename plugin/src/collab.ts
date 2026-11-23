@@ -89,3 +89,27 @@ export function deviceNames(raw: unknown): Map<string, string> {
 	}
 	return names;
 }
+
+/** The vault's settings from the Worker's names reply (DESIGN.md sections 8 and 9). Null: not chosen yet. */
+export type VaultSettings = { snapshots: boolean | null; historyBackup: boolean | null };
+
+/** Undefined from a Worker older than 0.2.2, which has no vault settings. */
+export function vaultSettings(raw: unknown): VaultSettings | undefined {
+	const { snapshots, historyBackup } = (raw ?? {}) as Record<string, unknown>;
+	const ok = (v: unknown) => v === null || typeof v === "boolean";
+	return ok(snapshots) && ok(historyBackup) ? { snapshots: snapshots as boolean | null, historyBackup: historyBackup as boolean | null } : undefined;
+}
+
+/** This device's 0.2.x choices, in its own settings. */
+type Local = { snapshots: boolean; backUpHistoryToWorker: boolean };
+
+/** What this device does: the vault's setting once chosen; until then (or with an older Worker), its own earlier one. */
+export function followedSettings(vault: VaultSettings | undefined, local: Local): { snapshots: boolean; historyBackup: boolean } {
+	return { snapshots: vault?.snapshots ?? local.snapshots, historyBackup: vault?.historyBackup ?? local.backUpHistoryToWorker };
+}
+
+/** Sent to the Worker, which keeps it only while the vault has no value: snapshots on, or history backup off. */
+export function carryOver(local: Local): { snapshots?: true; historyBackup?: false } | undefined {
+	if (!local.snapshots && local.backUpHistoryToWorker) return undefined;
+	return { ...(local.snapshots && { snapshots: true as const }), ...(!local.backUpHistoryToWorker && { historyBackup: false as const }) };
+}

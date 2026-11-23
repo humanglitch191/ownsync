@@ -437,6 +437,30 @@ const snapshotPart = (id: Uint8Array, index: number, count: number, envelope: Ui
 	header.writeUInt16BE(count, 2);
 	return Buffer.concat([id, header, envelope]);
 };
+// A device's names report, with its earlier choice to carry over; the reply says the vault's settings.
+const settingsOf = async (v: string, tok: Uint8Array, settings?: unknown) => ((await (await snapshotPost(v, "names", tok, bytes(JSON.stringify({ settings })))).json()) as { settings: unknown }).settings;
+
+test("vault settings: unset takes uploads as 0.2.1 did; carry-over turns snapshots on and backup off; off refuses uploads", async () => {
+	const v = vault(), tok = token(), a = await connect(v, tok);
+	await a.catchUp(0);
+	const post = (path: string, ...parts: Uint8Array[]) => snapshotPost(v, path, tok, ...parts);
+	assert.deepEqual(await settingsOf(v, tok), { snapshots: null, historyBackup: null });
+	assert.deepEqual((await stats(`http://localhost:${PORT}`, v)).settings, { snapshots: null, historyBackup: null });
+	// Unset: a 0.2.1 device (no carry-over) keeps uploading both.
+	assert.equal((await post("snapshot", snapshotPart(doc(1), 0, 1, Uint8Array.of(1)))).status, 200);
+	assert.equal((await post("history", doc(1), Uint8Array.of(1))).status, 200);
+	// Two devices disagree: snapshots off and backup on change nothing; snapshots on and backup off win, and stay.
+	assert.deepEqual(await settingsOf(v, tok, { snapshots: false, historyBackup: true }), { snapshots: null, historyBackup: null });
+	assert.deepEqual(await settingsOf(v, tok, { snapshots: true, historyBackup: false }), { snapshots: true, historyBackup: false });
+	assert.deepEqual(await settingsOf(v, tok, { snapshots: false, historyBackup: true }), { snapshots: true, historyBackup: false });
+	assert.deepEqual(await settingsOf(v, tok, { snapshots: "no", historyBackup: 1 }), { snapshots: true, historyBackup: false });
+	const off = await post("history", doc(1), Uint8Array.of(2));
+	assert.deepEqual([off.status, await off.json()], [403, { error: "off" }]);
+	// Off deletes nothing: the copy made before is still listed, and can still be cleared.
+	assert.deepEqual([...new Uint8Array(await (await post("history/list", doc(1))).arrayBuffer())], [0, 0, 0, 1, 1]);
+	assert.equal((await post("snapshot/list")).status, 200);
+	a.ws.close();
+});
 
 test("sealed vault snapshots authenticate, complete out of order, stream in order, and can be erased", async () => {
 	const v = vault(), tok = token(), a = await connect(v, tok);
@@ -837,7 +861,7 @@ test("deleting a vault takes its token; then its devices are told 4004, it can't
 	assert.equal(await bare.closed, CLOSE.deleted);
 	assert.equal(await post("delete", tok), 410);
 	assert.equal(await post("names", new Uint8Array([...tok, ...bytes("{}")])), 410);
-	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: true, devices: [] });
+	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: true, devices: [], settings: { snapshots: null, historyBackup: null } });
 });
 
 test("history expiry has an index on its time, so it doesn't scan the table", async () => {

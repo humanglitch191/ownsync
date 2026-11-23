@@ -1,4 +1,4 @@
-import { type App, type Command, type EventRef, type Vault, Modal, Notice, Setting, normalizePath } from "obsidian";
+import { type App, type Command, type EventRef, type Vault, Modal, Setting, normalizePath } from "obsidian";
 import { say } from "./notice";
 import { diffLines } from "./historyRules";
 import type { createSnapshots, SnapshotContent, SnapshotInfo, SnapshotNote } from "./snapshots";
@@ -11,11 +11,9 @@ export interface SnapshotsHost {
 	registerInterval(id: number): unknown;
 	registerEvent(ref: EventRef): void;
 	register(cleanup: () => void): void;
-	settings: { snapshots: boolean; snapshotsOffered: boolean };
-	saveData(data: unknown): Promise<void>;
+	/** Whether this device takes daily snapshots: the vault's setting, from the Worker (DESIGN.md section 9). */
+	snapshotsOn(): boolean;
 	snapshots(): SnapshotsApi | undefined;
-	/** When this device was set up or paired. */
-	pairedAt?(): number | undefined;
 	/** True when the vault is set up, caught up, and sync is running. */
 	snapshotsSynced(): boolean;
 	/** Fires after the session or its sync status changes. */
@@ -25,8 +23,6 @@ export interface SnapshotsHost {
 }
 
 const HOUR = 60 * 60_000;
-const OFFER_AFTER = 10 * 60_000;
-const description = "Once a day, an encrypted copy of your whole vault on your Worker. Kept 7 daily and 4 weekly. Uses more of your Worker's storage.";
 
 export function restoreFolderName(date: string, exists: (path: string) => boolean): string {
 	const base = `Restored ${date}`;
@@ -274,7 +270,7 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 			const list = await this.api.list();
 			if (!this.showing) return;
 			if (!this.active()) return status.setText("The sync session changed. Reopen Vault snapshots.");
-			if (!list.length) return status.setText(this.plugin.settings.snapshots ? "No vault snapshots yet. Ownsync takes one a day while this device syncs." : "No vault snapshots yet. Turn them on in Settings → Ownsync → Snapshots.");
+			if (!list.length) return status.setText(this.plugin.snapshotsOn() ? "No vault snapshots yet. Ownsync takes one a day while this device syncs." : "No vault snapshots yet. Turn them on in your Worker's dashboard.");
 			status.setText("Encrypted copies of the whole vault, on your Worker. Pick one to see its notes.");
 			status.addClass("ownsync-lead");
 			const rows = this.contentEl.createDiv({ cls: "ownsync-snapshot-list" });
@@ -504,30 +500,14 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 	}
 };
 
-const snapshotTicks = new WeakMap<SnapshotsHost, () => void>();
-
 export function installSnapshots(plugin: SnapshotsHost): void {
 	let running = false, stopped = false, tooLarge = false;
-	let offer: Notice | undefined;
 	let modal: InstanceType<ReturnType<typeof snapshotsModal>> | undefined;
 	const tick = async () => {
 		const api = plugin.snapshots();
-		if (running || stopped || !api || !plugin.snapshotsSynced()) return;
+		if (running || stopped || !api || !plugin.snapshotsSynced() || !plugin.snapshotsOn()) return;
 		running = true;
 		try {
-			// Not in a device's first minutes after setup or pairing, and not over an open dialog or another offer.
-			const settled = Date.now() - (plugin.pairedAt?.() ?? 0) >= OFFER_AFTER && !document.querySelector(".modal-container, .notice .ownsync-notice-actions");
-			if (!plugin.settings.snapshotsOffered && settled) {
-				plugin.settings.snapshotsOffered = true;
-				try {
-					await plugin.saveData(plugin.settings);
-				} catch {
-					plugin.settings.snapshotsOffered = false;
-					return;
-				}
-				if (!stopped && !plugin.settings.snapshots) offer = offerSnapshots(plugin, () => void tick());
-			}
-			if (stopped || api !== plugin.snapshots() || !plugin.snapshotsSynced() || !plugin.settings.snapshots) return;
 			if (await api.takeIfDue() === "too large" && !tooLarge && !stopped && api === plugin.snapshots()) {
 				tooLarge = true;
 				say("This vault exceeds the daily snapshot size limit.", 8000);
@@ -539,14 +519,11 @@ export function installSnapshots(plugin: SnapshotsHost): void {
 		}
 	};
 	const update = () => { modal?.updateSync(); void tick(); };
-	snapshotTicks.set(plugin, () => { offer?.hide(); void tick(); });
 	plugin.registerEvent(plugin.onSnapshotSyncChange(update));
 	plugin.app.workspace.onLayoutReady(update);
 	plugin.registerInterval(window.setInterval(update, HOUR));
 	plugin.register(() => {
 		stopped = true;
-		snapshotTicks.delete(plugin);
-		offer?.hide();
 		modal?.close();
 	});
 	plugin.addCommand({
@@ -563,55 +540,7 @@ export function installSnapshots(plugin: SnapshotsHost): void {
 	});
 }
 
-function offerSnapshots(plugin: SnapshotsHost, enabled: () => void): Notice {
-	const notice = new Notice(createFragment((fragment) => {
-		fragment.createDiv({ text: "Turn on daily vault snapshots?" });
-		fragment.createDiv({ text: description });
-		const actions = fragment.createDiv({ cls: "ownsync-notice-actions" });
-		const turnOn = actions.createEl("button", { text: "Turn on", cls: "mod-cta" });
-		const decline = actions.createEl("button", { text: "Not now" });
-		turnOn.onclick = async (event) => {
-			event.stopPropagation();
-			turnOn.disabled = decline.disabled = true;
-			try {
-				await saveSnapshotSetting(plugin, true);
-				notice.hide();
-				enabled();
-			} catch {
-				turnOn.disabled = decline.disabled = false;
-			}
-		};
-		decline.onclick = (event) => { event.stopPropagation(); notice.hide(); };
-	}), 0);
-	return notice;
-}
-
-async function saveSnapshotSetting(plugin: SnapshotsHost, enabled: boolean): Promise<void> {
-	const previous = { snapshots: plugin.settings.snapshots, snapshotsOffered: plugin.settings.snapshotsOffered };
-	plugin.settings.snapshots = enabled;
-	plugin.settings.snapshotsOffered = true;
-	try {
-		await plugin.saveData(plugin.settings);
-	} catch (err) {
-		Object.assign(plugin.settings, previous);
-		say("Couldn't save the snapshot setting.");
-		throw err;
-	}
-}
-
 export function snapshotSettings(containerEl: HTMLElement, plugin: SnapshotsHost): void {
-	new Setting(containerEl).setName("Daily vault snapshots").setDesc(description)
-		.addToggle((toggle) => toggle.setValue(plugin.settings.snapshots === true).onChange(async (enabled) => {
-			toggle.setDisabled(true);
-			try {
-				await saveSnapshotSetting(plugin, enabled);
-				snapshotTicks.get(plugin)?.();
-			} catch {
-				toggle.setValue(plugin.settings.snapshots);
-			} finally {
-				toggle.setDisabled(false);
-			}
-		}));
 	new Setting(containerEl).setName("Delete all snapshots")
 		.setDesc("Removes every vault snapshot from your Worker.")
 		.addButton((button) => button.setButtonText("Delete all snapshots").onClick(() => {

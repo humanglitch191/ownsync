@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import { Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
-import { applyPresence, deviceNames, localUndo, presenceGoes } from "../src/collab";
+import { applyPresence, carryOver, deviceNames, followedSettings, localUndo, presenceGoes, vaultSettings } from "../src/collab";
 
 test("undo takes back only this editor's typing, not another device's or the engine's", () => {
 	const doc = new Y.Doc(), text = doc.getText("t"), undo = localUndo(text);
@@ -67,6 +67,24 @@ test("presence from another device is cleaned before the editor sees it", () => 
 test("device names from the Worker: only 8-hex IDs and cleaned names", () => {
 	assert.deepEqual([...deviceNames({ ABCD0063: " Anna's iPhone 17 Pro\u0007", "bad id": "x", ABCD0064: "", ABCD0065: 7 })], [["ABCD0063", "Anna's iPhone 17 Pro"]]);
 	for (const raw of [null, "x", [], 5]) assert.equal(deviceNames(raw).size, 0);
+});
+
+test("vault settings: a device follows the vault's once chosen, its own 0.2.x one until then, and carries over only snapshots on or backup off", () => {
+	assert.deepEqual(vaultSettings({ snapshots: true, historyBackup: null }), { snapshots: true, historyBackup: null });
+	for (const raw of [undefined, null, "x", 5, {}, { snapshots: "on", historyBackup: true }]) assert.equal(vaultSettings(raw), undefined); // an older Worker
+	const old = { snapshots: true, backUpHistoryToWorker: false }, fresh = { snapshots: false, backUpHistoryToWorker: true };
+	// Not chosen yet, or an older Worker: each device as before.
+	assert.deepEqual(followedSettings({ snapshots: null, historyBackup: null }, old), { snapshots: true, historyBackup: false });
+	assert.deepEqual(followedSettings(undefined, fresh), { snapshots: false, historyBackup: true });
+	// Chosen: every device follows the vault, whatever it had.
+	assert.deepEqual(followedSettings({ snapshots: false, historyBackup: true }, old), { snapshots: false, historyBackup: true });
+	assert.deepEqual(followedSettings({ snapshots: true, historyBackup: false }, fresh), { snapshots: true, historyBackup: false });
+	assert.deepEqual(followedSettings({ snapshots: null, historyBackup: false }, fresh), { snapshots: false, historyBackup: false });
+	// Only a choice that differs from the default is sent (a declined offer left snapshots off: nothing to carry).
+	assert.deepEqual(carryOver(old), { snapshots: true, historyBackup: false });
+	assert.deepEqual(carryOver({ snapshots: true, backUpHistoryToWorker: true }), { snapshots: true });
+	assert.deepEqual(carryOver({ snapshots: false, backUpHistoryToWorker: false }), { historyBackup: false });
+	assert.equal(carryOver(fresh), undefined);
 });
 
 test("presence goes only while in view and someone else is in the note; an announce goes regardless; leaving goes to whoever is there", () => {

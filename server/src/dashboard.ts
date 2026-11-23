@@ -27,6 +27,16 @@ export interface VaultStats {
 	name: string;
 	deleted: boolean;
 	devices: { id: string; name: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
+	settings: VaultSettings;
+}
+
+/**
+ * Per vault, set on the dashboard (or carried over from a device's earlier setting); every device of the vault follows
+ * them, and the Vault refuses uploads they turn off. Null: not chosen yet, each device follows its own earlier setting.
+ */
+export interface VaultSettings {
+	snapshots: boolean | null;
+	historyBackup: boolean | null;
 }
 
 /** What the dashboard asks a Vault over RPC. */
@@ -34,6 +44,7 @@ export interface VaultRpc {
 	stats(): Promise<VaultStats>;
 	cleanupSizes(): Promise<{ at: number; old: number; deleted: number }[]>;
 	cleanUp(ranges: unknown, zone: unknown, months: unknown): Promise<{ removed: number; more: boolean } | { error: string }>;
+	setSettings(settings: unknown): Promise<{ ok: true } | { error: string }>;
 }
 
 /** The server's version, shown on the dashboard. */
@@ -203,6 +214,13 @@ export class Dashboard {
 			const vault = this.vault(cleanup[1]!);
 			if (cleanup[2]) return json(await vault.cleanupSizes());
 			const result = await vault.cleanUp(body.ranges, body.zone, body.months);
+			return "error" in result ? fail(400, result.error) : json(result);
+		}
+		// Daily vault snapshots and history backup, for every device of the vault. Turning one off deletes nothing.
+		const settings = path.match(/^\/api\/vaults\/([0-9a-f]{32})\/settings$/);
+		if (settings) {
+			if (!this.vaults().some((v) => v.id === settings[1])) return fail(404, "no such vault");
+			const result = await this.vault(settings[1]!).setSettings(body);
 			return "error" in result ? fail(400, result.error) : json(result);
 		}
 		if (path === "/api/vault-code") {
@@ -423,6 +441,7 @@ export class Dashboard {
 				bytes: v.stats!.bytes,
 				lastActivity: v.stats!.lastActivity,
 				conflicts: Math.max(0, ...v.stats!.devices.map((d) => d.conflicts)),
+				settings: v.stats!.settings,
 				devices: v.stats!.devices.map((d) => ({ ...d, label: labels.get(`${v.id}/${d.id}`) ?? "", behind: !!newest && d.version !== newest && d.version.localeCompare(newest, undefined, { numeric: true }) < 0, lost: !d.online && now - d.lastOnline > LOST_AFTER_MS })),
 			})),
 			passkeys: this.sql.exec<{ id: string; created: number }>("SELECT id, created FROM passkeys ORDER BY created").toArray().map((p) => ({ ...p, current: p.id === session.passkey })),

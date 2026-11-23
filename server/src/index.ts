@@ -4,7 +4,7 @@
 // chunks are kept apart, once per name.
 
 import { DurableObject } from "cloudflare:workers";
-import { Dashboard, VERSION, type VaultRpc, type VaultStats } from "./dashboard";
+import { Dashboard, VERSION, type VaultRpc, type VaultSettings, type VaultStats } from "./dashboard";
 import { SNAPSHOT_BUDGET, snapshotsToPrune } from "./snapshots";
 import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_ENVELOPE, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
 
@@ -136,6 +136,7 @@ export class Vault extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS version_chunks (name BLOB PRIMARY KEY, tag BLOB NOT NULL);
 			CREATE INDEX IF NOT EXISTS version_chunks_tag ON version_chunks (tag);
 			CREATE TABLE IF NOT EXISTS lists (device TEXT PRIMARY KEY, at INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 		`);
 		// Added in 0.1.2: a device's name, as Obsidian has it. Vaults made earlier get the column now.
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");
@@ -164,19 +165,23 @@ export class Vault extends DurableObject<Env> {
 			if (action === "snapshot") return this.snapshot(operation, body.subarray(32));
 			if (action === "names") {
 				if (body.length > 32 + 1024) return Response.json({ error: "too large" }, { status: 413 });
-				let n: { device?: unknown; name?: unknown; vault?: unknown };
+				let n: { device?: unknown; name?: unknown; vault?: unknown; settings?: unknown };
 				try { n = JSON.parse(new TextDecoder().decode(body.slice(32))); } catch { return Response.json({ error: "bad names" }, { status: 400 }); }
 				// No control characters: kept to printable text.
 				const clean = (x: unknown) => (typeof x === "string" ? Array.from(x).filter((c) => c >= " " && c !== "\u007f").join("").trim().slice(0, 40) : "");
 				const device = typeof n.device === "string" && /^[0-9A-F]{8}$/.test(n.device) ? n.device : null;
 				if (device) this.write("INSERT INTO devices (id, last_online, version, conflicts, name) VALUES (?, ?, '', 0, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name", device, Date.now(), clean(n.name));
 				if (typeof n.vault === "string") this.write("INSERT OR REPLACE INTO vault_name (id, name) VALUES (0, ?)", clean(n.vault));
+				// A 0.2.x device's own choice carries over while the vault has none: snapshots on, or history backup off. So
+				// any device's snapshots on turns them on, and any device's backup off turns it off; the owner's choice stays.
+				for (const [key, value] of settingsIn(n.settings)) if (value === (key === "snapshots")) this.write("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", key, Number(value));
 				// And in reply, which Ownsync this Worker runs and the newest release, so the plugin can say when either is behind.
 				const latest = await (owner(this.env) as unknown as { latest(): Promise<string | null> }).latest().catch(() => null);
 				// And the names the vault's devices gave themselves, for each device's list (they were sent readable anyway).
 				const names = Object.fromEntries(this.sql.exec<{ id: string; name: string }>("SELECT id, name FROM devices WHERE name != ''").toArray().map((r) => [r.id, r.name]));
 				// And whether every recent device can read version-scoped chunks. A Worker that sends no `scoped` has neither vput nor mark.
-				return Response.json({ ok: true, worker: VERSION, latest, names, scoped: this.scoped(device) });
+				// And the vault's settings, which every device follows.
+				return Response.json({ ok: true, worker: VERSION, latest, names, scoped: this.scoped(device), settings: this.settings() });
 			}
 			await this.erase();
 			return Response.json({ deleted: true });
@@ -245,6 +250,7 @@ export class Vault extends DurableObject<Env> {
 
 		const envelope = body.subarray(DOC_TAG_BYTES);
 		if (!envelope.length || envelope.length > MAX_HISTORY_ENVELOPE) return Response.json({ error: "bad envelope size" }, { status: 413 });
+		if (this.settings().historyBackup === false) return Response.json({ error: "off" }, { status: 403 }); // also for devices older than the setting
 		try {
 			this.ctx.storage.transactionSync(() => {
 				this.historyBytes ??= this.sql.exec<{ size: number }>("SELECT COALESCE(SUM(size), 0) AS size FROM history").one().size;
@@ -282,7 +288,7 @@ export class Vault extends DurableObject<Env> {
 
 	private snapshot(operation: string | undefined, body: Uint8Array, now = Date.now()): Response {
 		this.expireSnapshots(now);
-		if (!operation) return this.uploadSnapshot(body, now);
+		if (!operation) return this.settings().snapshots === false ? Response.json({ error: "off" }, { status: 403 }) : this.uploadSnapshot(body, now);
 		if (operation === "list") {
 			if (body.length) return Response.json({ error: "bad body" }, { status: 400 });
 			const rows = this.sql.exec<{ id: string; day: number; epoch: number; parts: number; received: number; size: number; complete: number; at: number }>(
@@ -654,8 +660,25 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	/** What the owner's dashboard shows of this vault: nothing a key would be needed for. */
+	/**
+	 * The vault's settings (DESIGN.md sections 8 and 9), set on the dashboard or carried over from a device. Null: not
+	 * chosen yet, so uploads are taken as before 0.2.2 and each device follows its own earlier setting.
+	 */
+	private settings(): VaultSettings {
+		const set = new Map(this.sql.exec<{ key: string; value: number }>("SELECT key, value FROM settings").toArray().map((r) => [r.key, !!r.value]));
+		return { snapshots: set.get("snapshots") ?? null, historyBackup: set.get("historyBackup") ?? null };
+	}
+
+	async setSettings(given: unknown): Promise<{ ok: true } | { error: string }> {
+		if (this.token === null || this.deleted) return { error: "no such vault" };
+		const changes = settingsIn(given);
+		if (!changes.length) return { error: "bad settings" };
+		for (const [key, value] of changes) this.write("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, Number(value));
+		return { ok: true };
+	}
+
 	async stats(): Promise<VaultStats> {
-		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [] };
+		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [], settings: { snapshots: null, historyBackup: null } };
 		const online = new Set(this.ctx.getWebSockets().map((ws) => (ws.deserializeAttachment() as Session).device));
 		const fresh = this.usage.day === today();
 		const devices = this.sql.exec<{ id: string; last_online: number; version: string; conflicts: number; name: string }>("SELECT id, last_online, version, conflicts, name FROM devices ORDER BY last_online DESC").toArray();
@@ -670,6 +693,7 @@ export class Vault extends DurableObject<Env> {
 			lastActivity: this.usage.lastActivity,
 			name: this.sql.exec<{ name: string }>("SELECT name FROM vault_name").toArray()[0]?.name ?? "",
 			deleted: this.deleted,
+			settings: this.settings(),
 			devices: devices.map((d) => {
 				// A device reports "<version> mobile notes-only": its plugin version, then what kind of device it is.
 				const [version = "", ...flags] = d.version.split(" ");
@@ -681,7 +705,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async erase(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists", "settings"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;
@@ -744,6 +768,11 @@ export class Vault extends DurableObject<Env> {
 
 const owner = (env: Env) => env.OWNER.get(env.OWNER.idFromName("owner"));
 const today = () => Math.floor(Date.now() / DAY_MS); // days since the epoch, so a new one starts at 00:00 UTC
+/** The known vault settings in `given` that are booleans; anything else is ignored. */
+const settingsIn = (given: unknown) => (["snapshots", "historyBackup"] as const).flatMap((key) => {
+	const value = (given as Record<string, unknown> | null | undefined)?.[key];
+	return typeof value === "boolean" ? [[key, value] as const] : [];
+});
 /** Whether release `version` ("1.2.3") is `than` or later; anything else (a pre-release, nothing) counts as older. */
 function newer(version: string, than: string): boolean {
 	const a = /^(\d+)\.(\d+)\.(\d+)$/.exec(version), b = than.split(".").map(Number);

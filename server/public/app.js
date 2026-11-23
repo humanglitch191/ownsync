@@ -292,15 +292,27 @@ function rename(el, current, placeholder, path) {
 // Named here first, then as Obsidian calls it; else its short ID.
 const vaultName = (v) => v.label || v.name || `Vault ${shortId(v.id)}`;
 
+// One of the vault's settings (DESIGN.md sections 8 and 9): every device of the vault follows it. Null: not chosen yet.
+function settingRow(v, key, title, detail) {
+	const on = v.settings?.[key] ?? null;
+	const set = async (value) => { await api(`/api/vaults/${v.id}/settings`, { [key]: value }).catch(() => {}); await dashboard(v.id); };
+	return h("div", { class: "devrow" }, h("span"), h("div", {}, h("div", {}, title), h("div", { class: "meta" }, on === null ? `Not chosen yet — each device uses its own setting. ${detail}` : detail)),
+		h("div", { class: "seg", role: "group", "aria-label": title }, [["Off", false], ["On", true]].map(([label, value]) =>
+			h("button", { class: value === on ? "on" : "", "aria-pressed": String(value === on), onclick: () => void set(value) }, label))));
+}
+
 function vaultSection(v) {
 	const title = h("h3", { title: "Click to rename" }, vaultName(v));
 	title.addEventListener("click", () => rename(title, v.label, v.name || "e.g. Personal", `/api/vaults/${v.id}/label`));
-	return h("div", { class: "vault" },
+	return h("div", { class: "vault", id: `vault-${v.id}` },
 		h("div", { class: "section" }, title, h("span", { class: "label" }, [size(v.bytes), v.lastActivity ? `changed ${ago(v.lastActivity)}` : null].filter(Boolean).join(" · "), " · ",
 			h("button", { class: "link label", onclick: () => void cleanup(v.id) }, "Clean up"))),
 		h("div", { class: "card" },
 			v.devices.length ? v.devices.map((d) => deviceRow(d, "", v.id)) : h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", { class: "meta" }, "No device has reported in yet."), h("span")),
-			v.conflicts > 0 ? h("div", { class: "devrow flag" }, h("span", { class: "ic" }, "!"), h("div", {}, h("div", {}, `${plural(v.conflicts, "note")} ${v.conflicts === 1 ? "has" : "have"} a conflict copy`), h("div", { class: "meta" }, "Search for “(conflict” in Obsidian and keep what you want")), h("span")) : null));
+			v.conflicts > 0 ? h("div", { class: "devrow flag" }, h("span", { class: "ic" }, "!"), h("div", {}, h("div", {}, `${plural(v.conflicts, "note")} ${v.conflicts === 1 ? "has" : "have"} a conflict copy`), h("div", { class: "meta" }, "Search for “(conflict” in Obsidian and keep what you want")), h("span")) : null),
+		h("div", { class: "card settings" },
+			settingRow(v, "snapshots", "Daily vault snapshots", "Once a day, an encrypted copy of the whole vault, kept 7 daily and 4 weekly. Uses more storage."),
+			settingRow(v, "historyBackup", "History backup", "Encrypted copies of the notes each device edits, kept 30 days. Turning it off keeps the copies already here.")));
 }
 
 function meterTile(title, used, limit, fmt, ctx, history) {
@@ -352,7 +364,8 @@ function topBar(current) {
 
 const NOTICE = "ownsync-notice-0.1.1";
 
-async function dashboard() {
+// `focus`: a vault whose card is scrolled into view (Obsidian's "Snapshots and history backup" opens it).
+async function dashboard(focus) {
 	let o;
 	try { o = await api("/api/overview"); } catch (err) { return err.status === 401 ? welcome() : show(h("p", { class: "error" }, failure(err))); }
 	const devices = o.vaults.reduce((n, v) => n + v.devices.length, 0);
@@ -382,6 +395,7 @@ async function dashboard() {
 			connectPanel()),
 		h("footer", { class: "foot" }, h("span", {}, `Ownsync ${o.version}${o.deployed ? `, updated ${new Date(o.deployed).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}` : ""} · your Worker`,
 			flow ? [h("br"), h("a", { href: flow }, "Stay on this version"), " (turn off automatic updates: on GitHub, ⋯ → Disable workflow)"] : null), h("span", {}, "Workers Free plan · ", h("a", { href: "https://github.com/humanglitch191/ownsync/blob/main/docs/cost-and-limits.md" }, "what Paid adds")))));
+	if (focus) document.getElementById(`vault-${focus}`)?.querySelector(".settings")?.scrollIntoView({ block: "center" });
 }
 
 async function passkeys() {
@@ -482,15 +496,16 @@ async function cleanup(id, months = 12) {
 }
 
 // Obsidian's "Add another vault" opens /#connect: straight into the steps, once signed in. Its "Clean up storage…"
-// opens /#cleanup/<vault>: that vault's Clean up.
-let pending = location.hash === "#connect" ? "connect" : /^#cleanup\/([0-9a-f]{32})$/.exec(location.hash)?.[1] ?? null;
+// opens /#cleanup/<vault>: that vault's Clean up; its "Snapshots and history backup", /#settings/<vault>: that vault's settings.
+let pending = /^#(connect|(?:cleanup|settings)\/[0-9a-f]{32})$/.exec(location.hash)?.[1] ?? null;
 if (location.hash) history.replaceState(null, "", location.pathname);
 async function home() {
 	if (!pending) return dashboard();
 	try { await api("/api/overview"); } catch (err) { return err.status === 401 ? welcome() : show(h("p", { class: "error" }, failure(err))); }
 	const start = pending;
 	pending = null;
-	return start === "connect" ? setup(null) : cleanup(start);
+	const [page, id] = start.split("/");
+	return page === "connect" ? setup(null) : page === "cleanup" ? cleanup(id) : dashboard(id);
 }
 
 if (!window.PublicKeyCredential) show(h("main", { class: "welcome" }, brand(), h("p", { class: "error" }, "This browser doesn't support passkeys. Open this page in a current Safari, Chrome, Edge or Firefox.")));

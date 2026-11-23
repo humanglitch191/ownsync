@@ -157,6 +157,8 @@ Uploads wait a random 30 seconds to 5 minutes. On session stop, the plugin drops
 
 After a key rotation, the plugin lists copies from the new epoch. It can clear copies for a note's current tag or for the whole vault. An older Worker leaves local history available. The Worker keeps copies for 30 days and at most 50 MiB per vault, dropping the oldest first; that counts toward the vault's Durable Object storage. A restore writes the selected text as an ordinary edit, which the sync engine handles like any other edit.
 
+**Per vault (0.2.2).** History backup is on, off or not chosen yet per vault, in the Vault's storage; only the dashboard changes it, and devices learn it from the names reply (hourly, and on connecting). Not chosen: the Worker takes uploads as before and each device follows its own 0.2.x setting (on for a new device); a device whose own setting was off turns the vault's off once it is caught up, but never a value the owner chose. Off: the Worker refuses uploads, and keeps the copies it has; deleting them stays the separate Delete history backups. A 0.2.1 device still uses its own setting until it is updated; once the vault's is off, the Worker refuses its uploads too.
+
 ## 9. Encrypted whole-vault snapshots
 
 Once a device is connected and caught up, it can take a daily snapshot of Markdown text and the current attachment references. If references are unavailable, it can take a notes-only snapshot. The Worker assigns the UTC day and stores individually encrypted parts. The device checks the Worker's list before collecting files and records the ordered hashes in the encrypted synced index after the Worker acknowledges the complete upload. It remembers the successful day in local storage so a restart after deletion won't recreate the day's snapshot.
@@ -166,6 +168,8 @@ The Worker keeps seven UTC days and the newest snapshot in each of the four ISO 
 The synced index determines which snapshots a device can open. The Worker can supply ciphertext and report availability. Devices verify each envelope against the ledger before decrypting it, including when using an older key from the key ring. After validating every part and the bounded gzip stream, the plugin checks all file paths against the vault's path rules. The snapshot client exposes note text and attachment paths to the caller. File restores are handled by the caller.
 
 The list shows ledger entries whose data is absent from the Worker. Removing a snapshot asks the Worker to delete it and then removes the ledger entry. Upload and deletion are serialized within each vault session.
+
+**Per vault (0.2.2).** Daily snapshots are on, off or not chosen yet per vault, like history backup (section 8), and the plugin no longer offers them. Not chosen: the Worker takes uploads as before and each device follows its own 0.2.x setting (off for a new device); a device whose own setting was on turns the vault's on once it is caught up, but never a value the owner chose. Off: the Worker refuses uploads; the snapshots it has expire by the rules above. A 0.2.1 device still uses its own setting (and its offer) until it is updated; once the vault's is off, the Worker refuses its uploads too.
 
 ## 10. Clean up, and version-scoped attachment chunks (0.2.0)
 
