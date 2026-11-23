@@ -79,7 +79,8 @@ jobs:
             git -C "$src" -c gpg.program=false -c gpg.x509.program=false -c gpg.ssh.allowedSignersFile="$signers" verify-tag "refs/tags/$t" \
               || fail "Ownsync $t isn't signed with the author's release key. Nothing installed."
             commit_of[$t]=$(sed -n 's/^object //p' <<<"$head")
-            git -C "$src" show "${commit_of[$t]}:server/src/dashboard.ts" | grep -qx "export const VERSION = \"$t\";" \
+            # Read the file first: `git show | grep -q` fails now and then under pipefail, when grep stops before git is done writing.
+            [ "$(git -C "$src" show "${commit_of[$t]}:server/src/dashboard.ts" | sed -n 's/^export const VERSION = "\(.*\)";$/\1/p')" = "$t" ] \
               || fail "Ownsync $t's files say another version. Nothing installed."
           done
 
