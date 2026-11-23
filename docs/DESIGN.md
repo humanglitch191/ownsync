@@ -2,7 +2,7 @@
 
 End-to-end encrypted, real-time collaborative sync for Obsidian. A Cloudflare Worker (one Durable Object per vault) relays and stores only ciphertext, while devices still see each other's edits live, in real time.
 
-Status: started as a design draft on 2026-11-13; kept up to date with what's built (0.2.0). Section 8 onwards covers note history, Recently deleted and vault snapshots.
+Status: started as a design draft on 2026-11-13; kept up to date with what's built (0.2.0). Section 8 onwards covers note history, Recently deleted, vault snapshots and Clean up.
 
 ## Goal
 
@@ -161,95 +161,80 @@ After a key rotation, the plugin lists copies from the new epoch. It can clear c
 
 Once a device is connected and caught up, it can take a daily snapshot of Markdown text and the current attachment references. If references are unavailable, it can take a notes-only snapshot. The Worker assigns the UTC day and stores individually encrypted parts. The device checks the Worker's list before collecting files and records the ordered hashes in the encrypted synced index after the Worker acknowledges the complete upload. It remembers the successful day in local storage so a restart after deletion won't recreate the day's snapshot.
 
-The Worker keeps seven UTC days and the newest snapshot in each of the four ISO weeks entirely before that window. It can prune older complete snapshots as uploads arrive to stay within 150 MiB, and always protects the newest complete copy.
+The Worker keeps seven UTC days and the newest snapshot in each of the four ISO weeks entirely before that window, and nothing older than 30 days, also when no device uploads any more (it prunes when a device connects). It can prune older complete snapshots as uploads arrive to stay within 150 MiB in all (one snapshot is at most 50 MiB), and always keeps the two newest complete ones, however old.
 
 The synced index determines which snapshots a device can open. The Worker can supply ciphertext and report availability. Devices verify each envelope against the ledger before decrypting it, including when using an older key from the key ring. After validating every part and the bounded gzip stream, the plugin checks all file paths against the vault's path rules. The snapshot client exposes note text and attachment paths to the caller. File restores are handled by the caller.
 
 The list shows ledger entries whose data is absent from the Worker. Removing a snapshot asks the Worker to delete it and then removes the ledger entry. Upload and deletion are serialized within each vault session.
 
-## 10. Storage window (design for 0.2.0, not built)
+## 10. Clean up, and version-scoped attachment chunks (0.2.0)
 
-One per-vault setting on the Worker, chosen in the dashboard: 30 days (default), 90 days, 6 months, 1 year. The Worker keeps **history** only inside that window, a hard limit on its own clock. No device clock and no device's view of what references what decides an erasure.
+**What is kept.** Nothing in history is removed automatically, except vault snapshots, which keep the last 30 days (section 9), and history backups, which keep 30 days and at most 50 MiB (section 8). Replaced attachment versions and deleted attachments stay until the owner removes them on the dashboard. Notes, deleted notes included, and the current version of every live attachment are never removed. Nothing is added to the index.
 
-**What the window covers.**
+**Clean up, on the dashboard.** One screen per vault, "Clean up · <vault name>", reached from the vault on the dashboard or from the plugin (Settings → History → "Clean up storage…", which opens `/#cleanup/<vault>`; the dashboard goes there after the passkey sign-in). It lists what can be removed by calendar period: months, quarters (Jan–Mar …), half-years (Jan–Jun, Jul–Dec) or years, worked out in the browser's local time from the Worker's timestamps. Each row has its size and what it holds (old attachment versions, deleted attachments). The current period is shown and can't be selected. The owner picks past periods, presses "Remove X of history" and confirms; removal is immediate. Vault snapshots aren't listed.
 
-- *Never windowed:* every note's state, deleted notes included (they are small, and stay as today), and the current version of every live attachment.
-- *Windowed, from the moment it stopped being current:* an attachment version that was replaced, and the versions of a deleted attachment.
-- *Windowed, from when it was made:* history backup copies (the fixed 30 days becomes the window; the 50 MiB cap stays) and vault snapshots.
+- Two RPC methods on the vault's object, reached only through the Owner object, which checks the session and the Origin as for every dashboard write; no `/vault/` route. `cleanupSizes()` gives the removable bytes by quarter hour of `retired_at` (every time zone's midnight falls on a quarter hour), split into replaced and deleted. `cleanUp(ranges, zone, months)` takes explicit `[from, to)` ranges in ms.
+- The Worker refuses the request unless every range ends at or before the start of the current period, which it works out on its own clock in the browser's time zone (`zone`, an IANA name) for the view (`months`: 1, 3, 6 or 12). A browser clock that runs ahead can't reach into the current period.
+- At most 2,000 chunks a request; the reply says `more`, and the dashboard asks again until it's done.
 
-There is no note purge, and nothing is added to the index.
+**Version-scoped chunks.** From 0.2.0 a chunk belongs to exactly one version, so removing a version needs no analysis of who else uses its chunks.
 
-**Version-scoped chunks.** From 0.2.0 a chunk belongs to exactly one version, so erasing an expired version needs no analysis of who else uses its chunks.
-
-- A version already has a unique ID (`Ref.u`). Its *tag* is `HMAC(name key, "version" | u)`; its chunks are named `HMAC(name key, u | index | SHA-256(plaintext))`. Both use the first epoch's name key, as `chunkName` does, so a rotation changes neither. The plaintext hash stays in the name, so a device still checks each chunk against its name; `Ref.h` stays the content's keyed hash, so matching files by content is unchanged. `Ref` gains `s: 1` to say its chunks are scoped.
+- A version already has a unique ID (`Ref.u`). Its *tag* is `HMAC(name key, "version" | u)`; its chunks are named `HMAC(name key, len(u) | u | index | SHA-256(plaintext))`. Both use the first epoch's name key, as `chunkName` does, so a rotation changes neither. The plaintext hash stays in the name, so a device still checks each chunk against its name; `Ref.h` stays the content's keyed hash, so matching files by content is unchanged. `Ref` gains `s: 1` to say its chunks are scoped.
 - The scope is the version, not the attachment ID: a version that loses a conflict becomes an attachment of its own (`split`) and keeps its chunks.
-- The cost: identical content is stored once per version, not once per vault. A copied file uploads again. The gain, besides erasure: a removed device can no longer test whether a file is in the vault.
-- Chunks written before 0.2.0 are content-addressed and may be shared. They have no tag and are never erased.
+- The cost: identical content is stored once per version, not once per vault. A copied file uploads again. The gain, besides removal: a removed device can no longer test whether a file is in the vault.
+- Chunks written before 0.2.0 are content-addressed and may be shared. They have no tag and are never removed.
 
-**Retirement, on the Worker.** Tables `versions(tag PRIMARY KEY, retired_at)` and `version_chunks(name PRIMARY KEY, tag)`, indexed on `tag`, both added to `erase`; `chunks` itself is unchanged. Neither holds an envelope, so nothing below reads one.
+**Retirement, on the Worker.** Tables `versions(tag PRIMARY KEY, retired_at, deleted)`, `version_chunks(name PRIMARY KEY, tag)` indexed on `tag`, and `lists(device PRIMARY KEY, at)`, all three in `erase`; `chunks` itself is unchanged. None holds an envelope.
 
-- `vput tag(32) | name(32) | envelope`: stores the chunk as `put` does (the first writer's envelope is kept). The name is recorded under the tag only if this `vput` inserted the chunk, or the name is already recorded under the same tag; otherwise the reply is `missing` and nothing changes. A name belongs to one tag for good, so no device can claim an old-style chunk, or another version's, and have it erased. At most 1,024 chunks a tag. A recorded `vput` clears the tag's `retired_at`. Reply `stored`.
-- `mark id(4) | flags(1) | n × tag(32)`, n ≤ 1024. Flag *retired*: set `retired_at` to the Worker's now where it is empty. Flag *current*: clear it. Flag *last*: this ends a device's full list of what is current. Reply `marked id(4) | n × tag(32)`: every tag it called current that has a recorded chunk missing from `chunks`. That is computed from what is stored, every time; there is no "erased" flag to go stale after a half-finished erasure or a half-finished re-upload.
-- Erasure: after a `mark` flagged *last*, and only then, the Worker deletes chunks of versions with `retired_at + window < now`, a bounded number per pass. The `version_chunks` rows stay (about 65 bytes a chunk), which is how a missing chunk is known later.
+- `vput tag(32) | name(32) | envelope`: stores the chunk as `put` does (the first writer's envelope is kept). The name is recorded under the tag only if this `vput` inserted the chunk, or the name is already recorded under the same tag; otherwise the reply is `missing` and nothing changes. A name belongs to one tag for good, so no device can claim an old-style chunk, or another version's, and have it removed. At most 1,024 chunks a tag. A recorded `vput` clears the tag's `retired_at`. Reply `stored`.
+- `mark id(4) | flags(1) | n × tag(32)`, n ≤ 1024. Flag *retired* (1): set `retired_at` to the Worker's now where it is empty, with flag *deleted* (8) when the attachment was deleted rather than replaced. Flag *current* (2): clear it. Flag *last* (4): this ends a device's full list of what is current. Reply `marked id(4) | n × tag(32)`: every tag it called current that has a recorded chunk missing from `chunks`. That is computed from what is stored, every time; there is no "removed" flag to go stale after a half-finished removal or a half-finished re-upload.
+- A full list counts only from a caught-up connection that has said which device it is (its `status` frame goes first), and it dates from its first frame: a version another device retires while the list is under way isn't confirmed by it. `lists` keeps, per device, when its latest list began.
+- A retirement is *confirmed* once every device seen in the last 30 days has a list that began after it (with no device seen that long, the latest list). Clean up counts and removes only versions whose `retired_at` is in a selected range and confirmed; others simply aren't counted yet. Nothing is removed otherwise, and never anything current. The `version_chunks` rows stay (about 65 bytes a chunk), which is how a missing chunk is known later.
+- Why every device's list: one device's list isn't enough. A device away while an attachment is deleted can come back with its own edit to it, made offline; the deletion then doesn't hold against it (section 4), and the attachment comes back with the deleted version as its head, the edit as a conflict copy. If that version's chunks were removed and no device has its file, nothing could put them back. The device's list, once it is back, makes that version current again first. (The fuzz test found this.)
 - Both frames need the vault's token like every frame. Tags are opaque to the Worker.
 
-**Devices.** Every 0.2.0 device that holds the attachment documents reports; none decides.
+**Devices.** Every 0.2.0 device that holds the attachment documents reports, notes-only devices included; none decides.
 
-- A device's *current set* is every `u` in `v` of every live attachment, not only the head: `split` moves a version to a copy under the same `u`, and keeps same-content entries with different ones. After each input the device reports the difference: what left the set is *retired*, what joined is *current*. That one rule covers a replaced version, a deletion, a conflict copy, a restore and a note brought back.
-- An upload dropped before it was published (replaced by a newer save, or its file gone) is marked *retired*. `publish` marks nothing itself; the set difference does.
-- Reports are kept locally as `mark:<tag>`, the latest state per tag, written in the same commit as the change that causes them, sent after `synced`, deleted on `marked`. A device catching up sends only where each version ended.
-- Once a day, after `synced`, each device sends its whole current set as *current*, the last frame flagged *last*. That repairs a lost or misordered report, long before a window passes.
-- If `marked` names a version with missing chunks and the device's file matches it, the device uploads the chunks again, after checking that the names it computes equal `Ref.c`. This is how an attachment deleted on one device and renamed offline on another, past the window, gets its content back when the rename wins.
+- A device's *current set* is every `u` (scoped versions only) in `v` of every live attachment, not only the head: `split` moves a version to a copy under the same `u`, and keeps same-content entries with different ones. The engine keeps each attachment's set as last counted (`cur:<id>`) and how many attachments hold each version; after each change it reports the difference: what no attachment holds any more is *retired* (*deleted* if its attachment was deleted), what joins is *current*. That one rule covers a replaced version, a deletion, a conflict copy, a restore and a note brought back.
+- An upload dropped before it was published (replaced by a newer save, or its file gone) is reported retired. `publish` reports nothing itself; the set difference does.
+- Reports are kept locally as `mark:<u>`, the latest state per version, written in the same commit as the change that causes them, sent once caught up, deleted on `marked`. A device catching up sends only where each version ended.
+- Once a day, with its first input once caught up, each device counts its whole current set afresh and sends it as *current*, the last frame flagged *last* (an empty list too). That repairs a lost or misordered report, and it is what confirms retirements.
+- If `marked` names a version with missing chunks and the device's file matches it, the device uploads the chunks again, after checking that the names it computes equal `Ref.c`. This is how an attachment deleted on one device and renamed offline on another gets its content back when the rename wins.
 
-**Why it is safe, and where it isn't.** A version is erased only if it stayed retired for the whole window by the Worker's clock, and a device's daily list un-retires anything current. The window never makes a loss faster than the window. But in a vault no honest device opens for longer than the window, a stolen device that hasn't been removed can retire everything and have it erased. Device IDs are chosen by the device on each connection, so the Worker's record doesn't say who did it. The only recovery is a device that still holds the file uploading it again, which the rule above does. That device could already delete the attachments on every device, and a malicious Worker can already delete anything.
+**Recently deleted** lists deleted attachments as well as notes (the same 30 days and 200 entries; not on a notes-only device). A deleted note restores as before. A deleted attachment is restored online only, in this order: its scoped versions are reported current, and the device waits for `marked`. If it names missing chunks, the plugin says "Couldn't restore the attachment. Its file is no longer stored.", restores nothing, and reports the versions retired again (the check made them current). Otherwise the index change is published. Versions from before 0.2.0 restore at once: their chunks are never removed.
 
-**The invariant the tests check:** with every device synced and idle, no live attachment's current version names an erased chunk; nothing current was erased; every erasure came after `retired_at + window` on the Worker's clock.
+**Why it is safe, and where it isn't.** Only the owner removes anything, only from past periods on the Worker's clock, and only versions every recently seen device has confirmed aren't current. The limits:
 
-**Setting, snapshots, dashboard.**
+- A device away for longer than 30 days no longer holds confirmation back. If it comes back with an offline edit to an attachment deleted and cleaned up meanwhile, the attachment comes back without content (the edit itself survives as a conflict copy), unless a device still has the old file.
+- A stolen device that hasn't been removed can report everything retired; the owner's next Clean up then removes it. Device IDs are chosen by the device, so the Worker's record doesn't say who did it. A device that still holds a file uploads it again after its next list. That device could already delete the attachments on every device, and a malicious Worker can already delete anything.
+- While a device older than 0.2.0 is seen within 30 days, it sends no lists, so nothing retired is confirmed and Clean up offers nothing.
 
-- Table `window(id = 0, days, next_days, next_at)` in the vault's object, set through an RPC method like `stats()`, not a `/vault/` route. A longer window applies at once. A shorter one applies 7 days later, to everything it covers; until then the dashboard shows "Changes to 30 days on 3 December · Cancel". The dashboard deletes nothing immediately (section 6).
-- Snapshots are thinned inside the window: every day for 7 days, the newest of each ISO week for 8 weeks (4 at 30 days, as today), then the newest of each 28-day block. That is 11, 16, 20 and 26 snapshots.
-- Snapshot budget: the smaller of a cap per option (150, 250, 350, 500 MiB) and the vault's free space less 100 MB, so snapshots give way before note sync does. Over budget, the snapshot with the smallest (days to its next newer neighbour) ÷ (age in days) goes first; the two newest complete ones never go. A 5 MB vault needs 55, 80, 100 and 130 MB; a 40 MB vault keeps 3, 6, 8 and 12 snapshots under the caps.
-- The dashboard shows, per vault, the window, the snapshot count and size, how much retired attachment content is waiting to expire, and an estimate for each option.
-
-**Recently deleted** lists deleted notes and attachments from within the window; `names` tells the plugin the window, for display only. A deleted note restores as today. A deleted attachment is restored in this order, online only: `mark` its version current, wait for `marked`; if it names missing chunks, show "its file is no longer stored" and restore nothing; otherwise publish the index change. The list is drawn from the deleter's clock and erasure runs on the Worker's, so only the Worker's answer counts.
+**The invariant the tests check:** with the owner cleaning up past ranges at random, once every device is synced and has sent its list, no live attachment's versions refer to a chunk the Worker doesn't hold, and nothing current was removed.
 
 **Mixed versions.**
 
-- An older Worker closes the socket on an unknown frame, so the plugin uses `vput` and `mark` only when `names` reports Worker 0.2.0 or later.
-- A 0.1.5 device checks a chunk against a name made from its content alone, so it cannot download a scoped version: it reports the chunk as damaged and retries. So a 0.2.0 device uploads scoped chunks only when every device the Worker has seen in the last 30 days reports 0.2.0 or later (`names` says so). A device with no version on record counts as old, and so does a full device list (64, the most the Worker keeps), since an old device may have fallen off it. Until then uploads go the old way, and those chunks are never erased.
-- What a 0.1.5 device uploads is never erased. It sends no reports: the versions it replaces are retired by whichever 0.2.0 device applies its change.
+- The `names` reply says `scoped`. A Worker that doesn't send it has neither `vput` nor `mark`, and the plugin then neither scopes uploads nor reports.
+- A 0.1.5 device checks a chunk against a name made from its content alone, so it cannot download a scoped version: it reports the chunk as damaged and retries. So a 0.2.0 device uploads scoped chunks only while `scoped` is true: every device the Worker has seen in the last 30 days, other than the one asking, reports 0.2.0 or later. A device with no version on record counts as old, and so does a full device list (64, the most the Worker keeps), since an old device may have fallen off it. Until then uploads go the old way, and those chunks are never removed. The plugin asks again at most hourly.
+- What a 0.1.5 device uploads is never removed. It sends no reports: the versions it replaces are retired by whichever 0.2.0 device applies its change.
 
-**Tests.** Sim (`plugin/test/engine.test.ts`; the sim server gains the tables, both frames and a clock the test moves):
-
-- A replaced version's chunks are there at window − 1 day and gone after the next daily list past the window; the current version's never go.
-- A deleted attachment brought back inside the window has its content; past the window, a device holding the file uploads it again.
-- A retire report that arrives after the version became current again is undone by the next list.
-- A vault unused for longer than the window loses nothing current on the first connection back.
-- A conflict copy keeps its chunks, and so does a second entry with the same content.
-- A restore of a deleted attachment past the window is refused with the message, and nothing is published.
-- A stolen device retires everything in a vault left unused past the window: the content is erased, and a device that holds the files puts it back on its next list.
-- A report is on record after a crash between the change and the send.
-- Old-style chunks survive everything.
-- No scoped upload while a 0.1.5 device is listed.
-
-Worker (`server/test/server.test.ts`): `vput` un-retires and caps a tag, and refuses a name that exists as an old-style chunk or under another tag; `mark` sets the time once and clears it; erasure only after *last* and only past the window; `marked` names a version half erased or half uploaded again, every time; a lowered window waits 7 days and can be cancelled; history copies follow the window; snapshot counts, eviction order and budget. Fuzz: time jumps beyond the window, with the invariant checked at the end.
+**Tests.** Worker (`server/test/server.test.ts`): `vput` refuses a name that exists as an old-style chunk or under another tag; `scoped` follows the devices' versions; Clean up refuses ranges reaching into the current period or the future (on the Worker's clock, in the browser's time zone), removes only retired, confirmed versions in range, a bounded number at a time, never current versions or old-style chunks; `marked` names a version half removed, every time, until it is uploaded again; snapshots keep 7 days and 4 weeks, nothing older than 30 days, and always the two newest. Dashboard (`server/test/dashboard.test.ts`): Clean up needs the session and the Origin. Simulator (`plugin/test/storage.test.ts`): a replaced version goes only after a list confirms it; conflict copies and same-content copies keep their chunks, and a device starting from nothing gets everything; a cleaned-up deleted attachment isn't restored, one still stored is, and offline says so; a device away through Clean up puts back what it still holds; a notes-only device's list keeps what is current. Fuzz (`plugin/test/engine.fuzz.test.ts`): days pass and the owner cleans up at random, with the invariant checked at the end.
 
 **Left open.**
 
-- No screen restores an older version of an attachment yet; the window only keeps them.
-- A live attachment whose content was erased and whose file no device holds stays without content. It takes a 0.1.5 device winning a rename against a deletion past the window, or the file being deleted everywhere meanwhile.
-- A version put but never published by a device that never returns is never retired, so never erased.
-- The rows of erased versions (about 65 bytes a chunk) and note tombstones stay for good.
+- No screen restores an older version of an attachment; Clean up only keeps or removes them.
+- A version put but never published by a device that never returns is never retired, so never removed.
+- The rows of removed versions (about 65 bytes a chunk) and note tombstones stay for good.
+- A device's last-seen time is set when it connects and disconnects, so one connected without a break for over 30 days stops holding confirmation back.
+- The daily list goes with a device's first input of the day; a device that is connected but gets no input sends none.
 - Old-epoch entries of live documents still stay after a rotation.
-- A snapshot can hold a deleted note for as long as the window.
 
 ## What the server can still see
 
 - the number of documents and log entries, their sizes, and edit times and frequency
 - which device is online when, and roughly from where (IP)
 - when a note is open in an editor and its cursor moves (presence frames), though not where or by whom
-- attachment chunk count and sizes, when chunks are uploaded and which device fetches which; that two files in the vault hold the same content (same chunk names)
+- attachment chunk count and sizes, when chunks are uploaded and which device fetches which; for chunks uploaded before every device ran 0.2.0, that two files in the vault hold the same content (same chunk names)
+- for version-scoped chunks (section 10): which chunks make up one version, when each version stops being current and whether because its attachment was deleted, and when each device last listed the versions it holds
 - which note tags get history copies, the padded sizes and upload times, and which device's connection sends them
 - whole-vault snapshot IDs, upload days and times, epochs, part counts and padded envelope sizes
 - the number and size of membership records, when the epoch changes, whether there is a recovery key, and for each rotation the IDs of the devices it wraps the key to and the rotating device's ID and public key (in clear so a recovering device can open its wrap). Device IDs are also in every envelope header.
@@ -301,7 +286,7 @@ Deferred so far, one line each:
 - Scanning a real pairing QR on iOS is untested; the handler is tested by calling it directly. The QR opens the Worker's own add-device page, which hands the link to Obsidian, because a phone's camera opens web links. That page can read the pairing code, so whoever controls the Worker (or the Cloudflare account) could change it and take the vault key while a device is being added. Accepted (owner decision 2026-11-14: everything on the Worker, no other site); copying the link on a computer skips the page.
 - File names that are invalid on one platform, or differ only by case, are reported per note and not synced there.
 - Sync envelopes use their encoded size.
-- Attachment chunks no longer referenced are never deleted from the Worker (garbage collection), so replaced and deleted attachments keep using its 1 GB (the storage window in section 10 is designed, not built).
+- Replaced and deleted attachments keep using the Worker's 1 GB until the owner removes them with Clean up (section 10). Chunks uploaded before every device ran 0.2.0 are never removed.
 - A chunk reference records no epoch: every chunk is under epoch 0 until rotation exists, which must add it.
 - A file is in memory whole while it is read, hashed or written (Obsidian has no partial reads or writes), so the size limit also bounds memory. A download interrupted by a crash starts over.
 - A device that joins with its own copy of an attachment that differs from the vault's keeps both, and uploads its copy.

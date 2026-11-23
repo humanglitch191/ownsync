@@ -13,6 +13,7 @@ interface DeletedNotesEngine {
 	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number }[]>;
 	deletedText(id: string): Promise<string | undefined>;
 	restoreDeleted(id: string, path?: string): Promise<string | undefined>;
+	restoreAttachment(id: string): Promise<string | "gone" | "offline" | undefined>;
 }
 
 export interface HistoryHost {
@@ -456,6 +457,8 @@ function isNote(file: unknown): file is TFile {
 
 interface RestoreAction {
 	title?: string;
+	/** What is restored, for a failure: "the note" unless said. */
+	what?: string;
 	prompt(): string | Promise<string>;
 	/** The text the restore replaces, for a line comparison. Restoring a deleted note replaces nothing. */
 	compare?(): Promise<string | undefined>;
@@ -510,7 +513,7 @@ class HistoryModal extends Modal {
 			if (engine) {
 				const entries = await engine.deletedNotes();
 				const now = Date.now();
-				rows = [...entries].sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity)).map((entry) => ({
+				rows = [...entries].sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity)).map((entry): HistoryRow => entry.path.endsWith(".md") ? {
 					label: `${entry.path} (${deletedWhenLabel(entry.deletedAt, now)})`,
 					read: () => engine.deletedText(entry.id),
 					restore: this.deletedRestore(entry.path, async () => {
@@ -518,7 +521,18 @@ class HistoryModal extends Modal {
 						const path = await engine.restoreDeleted(entry.id);
 						say(path ? `Restored ${path}.` : "Note restored.");
 					}),
-				}));
+				} : {
+					// An attachment: Clean up may have removed its content, which only the Worker can say.
+					label: `${entry.path} (${deletedWhenLabel(entry.deletedAt, now)})`,
+					read: async () => "An attachment. Restoring brings its file back.",
+					restore: Object.assign(this.deletedRestore(entry.path, async () => {
+						if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
+						const result = await engine.restoreAttachment(entry.id);
+						if (result === "gone") throw new Error("Its file is no longer stored.");
+						if (result === "offline") throw new Error("Ownsync needs to be connected to your Worker for that. Try again once it has synced.");
+						say(result ? `Restored ${result}.` : "Attachment restored.");
+					}), { what: "the attachment" }),
+				});
 			} else {
 				const entries = await this.history.list();
 				const now = Date.now();
@@ -672,7 +686,7 @@ class HistoryModal extends Modal {
 					restore.onclick = () => this.confirm(restore, action.title ?? "Restore this copy?", "Restore", prompt, () => this.restore(async () => {
 						if (await entry.read() !== text) throw new Error("This copy is no longer available.");
 						await action.apply(text, current);
-					}), !!this.file);
+					}, action.what), !!this.file);
 				}
 			} catch {
 				if (this.showing && selection === version) preview.setText("Couldn't load the preview.");
@@ -719,12 +733,12 @@ class HistoryModal extends Modal {
 		modal.open();
 	}
 
-	private async restore(apply: () => Promise<void>): Promise<void> {
+	private async restore(apply: () => Promise<void>, what = "the note"): Promise<void> {
 		try {
 			await apply();
 			this.close();
 		} catch (err) {
-			say(err instanceof Error ? `Couldn't restore the note. ${err.message}` : "Couldn't restore the note.");
+			say(err instanceof Error ? `Couldn't restore ${what}. ${err.message}` : `Couldn't restore ${what}.`);
 		}
 	}
 

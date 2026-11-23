@@ -118,18 +118,17 @@ export function whenLabels(times: readonly number[], now: number): string[] {
 	return times.map((time, i) => whenLabel(time, now, minute(times[i - 1]) === minute(time) || minute(times[i + 1]) === minute(time)));
 }
 
-/** Where a restored deleted note goes: its old path, or "<name> (restored).md" when another note has that name. */
+/** Where a restored deleted note (or attachment) goes: its old path, or "<name> (restored).md" when that name is taken. */
 export async function restorePath(path: string, taken: (path: string) => boolean | Promise<boolean>): Promise<string> {
-	const base = path.replace(/\.md$/i, "");
 	let to = path;
-	for (let n = 1; await taken(to); n++) to = `${base} (restored${n === 1 ? "" : ` ${n}`}).md`;
+	for (let n = 1; await taken(to); n++) to = path.replace(/(\.[^./]*)?$/, ` (restored${n === 1 ? "" : ` ${n}`})$1`);
 	return to;
 }
 
 export function restoreDeletedPrompt(path: string, to: string): string {
 	if (to === path) return `Restore ${path} to the vault?`;
-	const name = to.slice(to.lastIndexOf("/") + 1).replace(/\.md$/i, "");
-	return `Restore ${path} to the vault? A note already has this name, so this one comes back as "${name}".`;
+	const note = /\.md$/i.test(to), name = to.slice(to.lastIndexOf("/") + 1).replace(/\.md$/i, "");
+	return `Restore ${path} to the vault? ${note ? "A note" : "A file"} already has this name, so this one comes back as "${name}".`;
 }
 
 const relativeTime = new Intl.RelativeTimeFormat("en");

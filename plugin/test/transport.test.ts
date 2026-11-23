@@ -25,8 +25,8 @@ after(() => {
 // log by itself. `keys` instead starts it from keys set up some other way (paired, recovered).
 async function device(name: string, vault: string, vaultKey = key, overrides: Device["overrides"] = {}, keys?: VaultKeys, ownerCode?: string) {
 	const d = new Device(name, new Server(), rng(name.length + devices.length * 7919));
-	// Real chunk names and sizes, not the simulator's.
-	d.overrides = { chunkName: (data) => link.chunkName(data), chunkSize: 2 ** 20, ...overrides };
+	// Real chunk names and sizes, not the simulator's. Version-scoped only if the test says the Worker takes them.
+	d.overrides = { chunkName: (data, scope) => link.chunkName(data, scope), versionTag: (u) => link.versionTag(u), chunkSize: 2 ** 20, ...overrides };
 	d.boot();
 	const problems: string[] = [], alerts: string[] = [], presence: [note: string, update: string][] = [];
 	const onProblem = (what: string, err: unknown) => problems.push(`${what}: ${String(err)}`);
@@ -273,6 +273,35 @@ test("once synced a device tells the Worker its short ID, version and conflict c
 	await new Promise((r) => setTimeout(r, 500));
 	assert.deepEqual([a.link.status, b.link.status], ["deleted", "deleted"], "nothing reconnects");
 	assert.deepEqual([...a.problems, ...b.problems, ...a.d.problems, ...b.d.problems], []);
+});
+
+test("version-scoped attachments through the Worker: real names, reports and lists; Clean up removes only the replaced version", async () => {
+	const scoped = { reports: () => true, scoped: () => true, chunkSize: 4 };
+	const a = await device("a8", "vault-eight", key, scoped), b = await device("b8", "vault-eight", key, scoped);
+	await Promise.all([a.link.connect(), b.link.connect()]);
+	await until([a.d, b.d], () => a.link.status === "synced" && b.link.status === "synced");
+	const pic = (s: string) => new TextEncoder().encode(s);
+	a.d.write("p.png", pic("first picture"));
+	await until([a.d, b.d], () => new TextDecoder().decode(disk(b.d)["p.png"] as Uint8Array) === "first picture");
+	a.d.write("p.png", pic("second picture"));
+	await until([a.d, b.d], () => new TextDecoder().decode(disk(b.d)["p.png"] as Uint8Array) === "second picture");
+	// A day later both list what they hold current: the first picture's retirement is confirmed.
+	const vault = hex(a.keys.vaultId), sizes = async () => (await fetch(`${host}/test-cleanup/${vault}/sizes`)).json() as Promise<{ old: number }[]>;
+	assert.deepEqual(await sizes(), []);
+	await new Promise((r) => setTimeout(r, 5));
+	for (const x of [a, b]) { x.d.passTime(86_400_000); x.link.disconnect(); await x.link.connect(); }
+	await until([a.d, b.d], () => a.link.status === "synced" && b.link.status === "synced");
+	let old = 0;
+	await until([a.d, b.d], () => true);
+	for (let i = 0; i < 50 && !old; i++) { old = (await sizes()).reduce((n, s) => n + s.old, 0); await new Promise((r) => setTimeout(r, 50)); }
+	assert.ok(old > 0);
+	// As if a year later, so this year is past.
+	const removed = await (await fetch(`${host}/test-cleanup/${vault}`, { method: "POST", body: JSON.stringify({ ranges: [[0, Date.now() + 1]], zone: "UTC", months: 12, now: Date.now() + 400 * 86_400_000 }) })).json() as { removed: number };
+	assert.equal(removed.removed, 4); // "first picture": four chunks of four bytes
+	const c = await device("c8", "vault-eight", key, scoped);
+	await c.link.connect();
+	await until([a.d, b.d, c.d], () => new TextDecoder().decode(disk(c.d)["p.png"] as Uint8Array) === "second picture");
+	assert.deepEqual([...a.problems, ...b.problems, ...c.problems, ...a.d.problems, ...b.d.problems, ...c.d.problems], []);
 });
 
 test("the Worker's storage holds no note text, attachment content, file names, folder names or vault names", () => {

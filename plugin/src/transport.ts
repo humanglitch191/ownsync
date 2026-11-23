@@ -7,8 +7,8 @@
 import type { Engine } from "./core/engine";
 import type { ClientMsg, Entry } from "./core/ports";
 import type { Stored, VaultKeys } from "./keys";
-import { KIND, chunkName, docTag, hex, openEnvelope, packEntry, parseHeader, sealEnvelope, unhex, unpackEntry } from "../../protocol/ownsync";
-import { CLOSE, MAX_ENVELOPE, MAX_VERSION, SHORT_ID_BYTES, type ClientFrame, decodeServer, encodeClient } from "../../server/src/wire";
+import { KIND, chunkName, docTag, hex, openEnvelope, packEntry, parseHeader, scopedChunkName, sealEnvelope, unhex, unpackEntry, versionTag } from "../../protocol/ownsync";
+import { CLOSE, MARK, MAX_ENVELOPE, MAX_VERSION, SHORT_ID_BYTES, type ClientFrame, decodeServer, encodeClient } from "../../server/src/wire";
 
 export type Status = "connecting" | "catching up" | "synced" | "offline" | "unauthorized" | "needs owner code" | "removed" | "frozen" | "deleted";
 
@@ -120,10 +120,13 @@ export class Transport {
 		ws.send(encodeClient(tokenHash ? { t: "rotate", number, tokenHash, recovery, blob } : { t: "append", number, recovery, blob }));
 	}
 
-	/** Tells the Worker this device's short ID, version and conflict count, once caught up and again when the count changes. */
-	report(): void {
+	/**
+	 * Tells the Worker this device's short ID, version and conflict count, once caught up (`now`: it just has) and again
+	 * when the count changes.
+	 */
+	report(now = false): void {
 		const ws = this.ws, conflicts = this.opts.conflicts?.() ?? 0;
-		if (!ws || ws.readyState !== WebSocket.OPEN || this.status !== "synced" || conflicts === this.reported) return;
+		if (!ws || ws.readyState !== WebSocket.OPEN || (!now && this.status !== "synced") || conflicts === this.reported) return;
 		this.reported = conflicts;
 		ws.send(encodeClient({ t: "status", id: this.keys.me.id.slice(0, SHORT_ID_BYTES), conflicts, version: (this.opts.version ?? "").slice(0, MAX_VERSION) }));
 	}
@@ -153,10 +156,20 @@ export class Transport {
 	 * mustn't change when the key rotates. (A removed device keeps it, and could test, with the server's help,
 	 * whether a file it already has is in the vault; it can't read anything.)
 	 */
-	async chunkName(data: Uint8Array): Promise<string> {
+	async chunkName(data: Uint8Array, scope?: { u: string; i: number }): Promise<string> {
+		const first = this.firstKey();
+		return hex(await (scope ? scopedChunkName(first, this.keys.vaultId, scope.u, scope.i, data) : chunkName(first, this.keys.vaultId, data)));
+	}
+
+	/** A version's tag, which the Worker files its version-scoped chunks under: with the first epoch's key too. */
+	async versionTag(u: string): Promise<string> {
+		return hex(await versionTag(this.firstKey(), this.keys.vaultId, u));
+	}
+
+	private firstKey(): Uint8Array {
 		const first = this.keys.keyFor(0);
 		if (!first) throw new Error("this device doesn't have the vault's first key yet");
-		return hex(await chunkName(first, this.keys.vaultId, data));
+		return first;
 	}
 
 	private tag(epoch: number, vmk: Uint8Array, doc: string): Promise<Uint8Array> {
@@ -170,7 +183,7 @@ export class Transport {
 		// While this device's own key change is waiting, nothing new is sealed under the old key, which a device
 		// being removed (or, when recovering, every other device) can still read. Stored messages wait for the new
 		// key; live ones go, since what they carry follows in the stored ones anyway.
-		if (this.keys.state.pending?.tokenHash && msg.t !== "subscribe" && msg.t !== "get") {
+		if (this.keys.state.pending?.tokenHash && msg.t !== "subscribe" && msg.t !== "get" && msg.t !== "mark") {
 			if (msg.t === "publish" || msg.t === "snapshot" || msg.t === "put") this.held.push(msg);
 			return;
 		}
@@ -185,7 +198,14 @@ export class Transport {
 		const { vaultId, epoch, vmk } = this.keys; // whatever epoch is current when it's sealed
 		// A chunk is sealed with its name as the document: the server can't file it under another one.
 		if (msg.t === "get") return { t: "get", name: unhex(msg.name) };
-		if (msg.t === "put") return { t: "put", name: unhex(msg.name), envelope: await sealEnvelope({ vmk, vaultId, docId: unhex(msg.name), epoch, deviceId: this.keys.me.id, kind: KIND.chunk, plaintext: msg.data }) };
+		if (msg.t === "mark") {
+			const flags = msg.state === "current" ? MARK.current | (msg.last ? MARK.last : 0) : MARK.retired | (msg.state === "deleted" ? MARK.deleted : 0);
+			return { t: "mark", id: msg.id, flags, tags: msg.tags.map(unhex) };
+		}
+		if (msg.t === "put") {
+			const name = unhex(msg.name), envelope = await sealEnvelope({ vmk, vaultId, docId: name, epoch, deviceId: this.keys.me.id, kind: KIND.chunk, plaintext: msg.data });
+			return msg.tag ? { t: "vput", tag: unhex(msg.tag), name, envelope } : { t: "put", name, envelope };
+		}
 		const entry: Entry = msg.t === "snapshot" ? { doc: msg.doc, kind: "snapshot", data: msg.data } : msg.t === "presence" ? { doc: msg.note, kind: "update", data: msg.data } : msg.entry;
 		const doc = await this.tag(epoch, vmk, entry.doc);
 		const envelope = await sealEnvelope({
@@ -209,6 +229,7 @@ export class Transport {
 		if (f.t === "record") return void this.batch.push(f);
 		if (f.t === "records") return this.records(ws);
 		if (f.t === "stored" || f.t === "missing") return this.engine.receive({ t: f.t, name: hex(f.name) });
+		if (f.t === "marked") return this.engine.receive({ t: "marked", id: f.id, tags: f.tags.map(hex) });
 		if (f.t === "chunk") {
 			// The engine checks the content against its name; an envelope that doesn't open counts as missing.
 			// Chunks keep the epoch they were uploaded in (the vault document names them), so any epoch in the key ring opens one.
@@ -217,6 +238,8 @@ export class Transport {
 			return this.engine.receive(opened?.kind === KIND.chunk ? { t: "chunk", name, data: opened.plaintext } : { t: "missing", name });
 		}
 		if (f.t !== "entry" && f.t !== "live") {
+			// Who this is goes before anything the engine sends once caught up: the Worker files its list of current versions under it.
+			if (f.t === "synced") this.report(true);
 			await this.engine.receive(f);
 			if (f.t === "synced") {
 				this.set("synced");

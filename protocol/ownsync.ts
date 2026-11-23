@@ -128,6 +128,15 @@ export async function openEnvelope(envelope: Uint8Array, vaultId: Uint8Array, do
 }
 
 export const chunkName = async (vmk: Uint8Array, vaultId: Uint8Array, plaintext: Uint8Array) => hmac(await nameKey(vmk, vaultId), await sha256(plaintext));
+// From 0.2.0 a chunk belongs to one attachment version (`Ref.u`), so an expired version can be erased without asking
+// who else uses its chunks (DESIGN.md section 10). Both with epoch 0's VMK, as chunkName. Inputs never collide with
+// each other or with chunkName's: "version" first here, a length byte (at most 64, not "v") first below, 32 bytes for chunkName.
+export const versionTag = async (vmk: Uint8Array, vaultId: Uint8Array, u: string) => hmac(await nameKey(vmk, vaultId), concat(te.encode("version"), te.encode(u)));
+export async function scopedChunkName(vmk: Uint8Array, vaultId: Uint8Array, u: string, index: number, plaintext: Uint8Array) {
+	const id = te.encode(u);
+	if (id.length > 64) throw new Error("version ID too long");
+	return hmac(await nameKey(vmk, vaultId), concat(u8(id.length), id, uint(index, 4), await sha256(plaintext)));
+}
 
 // --- documents: the index and each note sync as separate documents ---
 
@@ -138,7 +147,7 @@ export const docTag = async (vmk: Uint8Array, vaultId: Uint8Array, docId: string
 // The plaintext of an update or snapshot envelope: which document, then the Yjs update. u8 length | id | update.
 export function packEntry(docId: string, update: Uint8Array): Uint8Array {
 	const id = te.encode(docId);
-	if (id.length > 255) throw new Error("document ID too long");
+	if (id.length > 64) throw new Error("document ID too long");
 	return concat(u8(id.length), id, update);
 }
 export function unpackEntry(plaintext: Uint8Array): { docId: string; update: Uint8Array } {

@@ -37,6 +37,9 @@
 //     an attachment of its own named "(conflict …)", under an ID the version carries, so every device that
 //     splits them makes the same copy.
 //   - At startup, an attachment is matched to a file by exact content only.
+//   - From 0.2.0 a version's chunks can be its own (Ref.s, DESIGN.md section 10), so the owner can remove old
+//     versions on the dashboard (Clean up). Every device reports which versions stop or start being current, and
+//     once a day all it holds current; only the Worker's clock and its answers decide anything.
 //
 // Not done yet
 //   - Deleted notes keep their state forever (a device may still need it to bring the note back).
@@ -46,7 +49,7 @@
 
 import * as Y from "yjs";
 import { applyText } from "./text";
-import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
+import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, MarkState, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
 
 const INDEX: DocId = "index";
 const REMOTE = "ownsync-remote"; // transaction origin for changes that didn't start on this device
@@ -57,11 +60,22 @@ const PART_HASH = /^[0-9a-f]{64}$/i;
 const MAX_DELETED = 200, DELETED_DAYS = 30, DAY_MS = 24 * 60 * 60 * 1000;
 /** Chunks in flight each way: enough to keep the line busy, few enough that memory holds one file plus these. */
 const WINDOW = 4;
+/** Versions in one report to the Worker. */
+const MAX_MARK = 1024;
 
 export interface EngineOptions {
 	hash(text: string): Promise<string>;
-	/** Names content by a keyed hash (the server can't test guesses): a chunk, and an attachment's version. */
-	chunkName(data: Uint8Array): Promise<string>;
+	/**
+	 * Names content by a keyed hash (the server can't test guesses): a chunk, and an attachment's version. With
+	 * `scope`, chunk `i` of version `u` only: the name of a version-scoped chunk (DESIGN.md section 10).
+	 */
+	chunkName(data: Uint8Array, scope?: { u: string; i: number }): Promise<string>;
+	/** A version's tag, which the Worker files its scoped chunks under. Without it, nothing is scoped or reported. */
+	versionTag?(u: string): Promise<string>;
+	/** Whether the Worker takes reports about versions (it is 0.2.0 or later); until it does, they wait. */
+	reports?(): boolean;
+	/** Whether a new version's chunks may be scoped now: every device lately seen can read them (the Worker says). */
+	scoped?(): boolean;
 	newId(): string;
 	/** Default 1 MiB. */
 	chunkSize?: number;
@@ -176,10 +190,24 @@ export class Engine {
 	// Attachments move one file at a time each way, a few chunks in flight: a file is in memory whole only
 	// while it is read or written (Obsidian has no partial reads or writes).
 	private ups = new Set<string>(); // attachments with an "up:" record
-	private uploading: { id: string; ref: Ref; bytes: Uint8Array; asked: Set<string>; stored: Set<string>; stalled?: boolean } | null = null;
+	private uploading: { id: string; ref: Ref; bytes: Uint8Array; asked: Set<string>; stored: Set<string>; stalled?: boolean; tag?: string } | null = null;
 	private fetching: { id: string; ref: Ref; asked: Set<string>; got: Map<string, Uint8Array> } | null = null;
 	private toFetch = new Set<string>(); // attachments waiting for their turn to download
 	private retry = new Set<string>(); // downloads the server was missing a chunk for: tried again on the next connection
+	// Version-scoped chunks (DESIGN.md section 10): each live attachment's scoped versions as last counted ("cur:"),
+	// how many attachments hold each version, documents whose versions may have changed since, reports the Worker
+	// hasn't answered ("mark:"), what is in flight on this link, and versions the Worker is missing chunks of.
+	private cur = new Map<string, string[]>();
+	private holders = new Map<string, number>();
+	private touched = new Set<string>();
+	private marks = new Map<string, MarkState>();
+	private marking = new Map<string, MarkState>();
+	private markFrames = new Map<number, { u: string; state: MarkState }[]>();
+	private nextMark = 1;
+	private listing = false; // this input sends the daily full list
+	private checks = new Map<number, (missing: boolean | undefined) => void>(); // restores waiting for the Worker's answer
+	private repairs = new Set<string>();
+	private tags = new Map<string, Promise<string>>();
 	// One Yjs client ID per run, so a crash or a copied profile can never reuse an ID with different edits.
 	private clientId: number;
 
@@ -195,6 +223,7 @@ export class Engine {
 		// a path is claimed at all, and recomputing the whole layout for each of 10,000 imported notes is slow.
 		this.notes.observe((e) => {
 			for (const [id, change] of e.changes.keys) {
+				this.touched.add(id);
 				const was = change.oldValue as IndexValue | undefined, now = this.notes.get(id);
 				if (was && was.d === undefined) this.claimed.set(was.p, (this.claimed.get(was.p) ?? 1) - 1);
 				if (now && now.d === undefined) this.claimed.set(now.p, (this.claimed.get(now.p) ?? 0) + 1);
@@ -230,9 +259,14 @@ export class Engine {
 				this.metas.set(key.slice(5), m);
 				if (m.diskPath) this.byPath.set(m.diskPath, key.slice(5));
 			}
-			if (this.notesOnly) for (const [id, m] of this.metas) if (m.diskPath && !isNote(m.diskPath)) this.forget(id);
+			if (this.notesOnly) for (const [id, m] of this.metas) if (m.diskPath && !isNote(m.diskPath)) await this.forget(id);
 			this.outbox = (await this.store.list<Entry>("out:")).map(([key, entry]) => ({ id: Number(key.slice(4)), entry })).sort((a, b) => a.id - b.id);
 			for (const [key] of await this.store.list("up:")) this.ups.add(key.slice(3));
+			for (const [key, us] of await this.store.list<string[]>("cur:")) {
+				this.cur.set(key.slice(4), us);
+				for (const u of us) this.holders.set(u, (this.holders.get(u) ?? 0) + 1);
+			}
+			for (const [key, state] of await this.store.list<MarkState>("mark:")) this.marks.set(key.slice(5), state);
 			// Before the first catch-up, local files can't be told apart from the vault's notes yet.
 			if (this.meta.synced) await this.scan();
 		});
@@ -314,8 +348,9 @@ export class Engine {
 	}
 
 	/**
-	 * Deleted markdown notes this device can preview, most recent first: those of the last 30 days, at most
-	 * 200. Texts are read one at a time with `deletedText`, so a phone never decodes them all at once.
+	 * Deleted notes this device can preview, and deleted attachments (unless it syncs notes only), most recent first:
+	 * those of the last 30 days, at most 200. Texts are read one at a time with `deletedText`, so a phone never
+	 * decodes them all at once.
 	 */
 	deletedNotes(): Promise<DeletedNote[]> {
 		const deleted: DeletedNote[] = [];
@@ -323,7 +358,7 @@ export class Engine {
 			const since = (this.opts.now?.() ?? Date.now()) - DELETED_DAYS * DAY_MS;
 			const candidates: DeletedNote[] = [];
 			for (const [id, v] of this.notes) {
-				if (v.d === undefined || !isNote(v.p)) continue;
+				if (v.d === undefined || (this.notesOnly && !isNote(v.p))) continue;
 				const deletedAt = Number.isSafeInteger(v.t) ? v.t : undefined;
 				if (deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
 			}
@@ -353,20 +388,54 @@ export class Engine {
 		return this.run(`restore ${id}`, async () => {
 			const v = this.notes.get(id);
 			if (v?.d === undefined || !isNote(v.p) || (path !== undefined && !isNote(path))) return;
-			const state = await this.state(id);
-			if (!state) return;
-			let to = path ?? v.p;
-			const base = v.p.replace(/\.md$/i, "");
-			for (let n = 1; path === undefined && (this.claimed.get(to) || this.byPath.has(to) || await this.disk.stat(to)); n++) {
-				to = `${base} (restored${n === 1 ? "" : ` ${n}`}).md`;
-			}
-			// Publish the full state with an ack: live devices may no longer hold it, and an offline
-			// restore must keep it in the outbox. Compaction snapshots don't reach live devices.
-			this.send(id, state, "snapshot");
-			this.notes.set(id, { p: to });
-			restored = to;
-			await this.settle(id);
+			restored = await this.bringBack(id, path);
 		}).then(() => restored);
+	}
+
+	/**
+	 * Bring a deleted attachment back, as restoreDeleted does a note, at its old path or "<name> (restored).<ext>".
+	 * Online only: Clean up may have removed its content, and only the Worker can say. So its versions are reported
+	 * current first, and it comes back only if the answer says nothing is missing. Resolves to the path it was given,
+	 * "gone" (its file is no longer stored: nothing was restored), or "offline".
+	 */
+	async restoreAttachment(id: string): Promise<string | "gone" | "offline" | undefined> {
+		let us: string[] = [], answer: Promise<boolean | undefined> | undefined, offline = false, ours = false;
+		await this.run(`check ${id}`, async () => {
+			const v = this.notes.get(id);
+			if (v?.d === undefined || isNote(v.p) || this.notesOnly) return;
+			ours = true;
+			us = await this.scopedVersions(id);
+			if (!us.length) return; // chunks from before 0.2.0: never removed
+			if (!this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.()) return void (offline = true);
+			const frame = this.nextMark++;
+			answer = new Promise((resolve) => this.checks.set(frame, resolve));
+			this.link.send({ t: "mark", id: frame, state: "current", tags: await Promise.all(us.map((u) => this.tagOf(u))) });
+		});
+		if (!ours) return undefined;
+		if (offline) return "offline";
+		const missing = answer ? await answer : false;
+		let restored: string | undefined;
+		await this.run(`restore ${id}`, async () => {
+			if (missing === false && this.notes.get(id)?.d !== undefined) restored = await this.bringBack(id);
+			// Not back: the check made its versions current on the Worker again, so they are retired again.
+			if (!restored) for (const u of us) if (!this.holders.has(u)) this.report(u, "deleted");
+		});
+		return missing === undefined ? "offline" : missing ? "gone" : restored;
+	}
+
+	private async bringBack(id: string, path?: string): Promise<string | undefined> {
+		const v = this.notes.get(id), state = await this.state(id);
+		if (v?.d === undefined || !state) return undefined;
+		let to = path ?? v.p;
+		for (let n = 1; path === undefined && (this.claimed.get(to) || this.byPath.has(to) || await this.disk.stat(to)); n++) {
+			to = v.p.replace(/(\.[^./]*)?$/, ` (restored${n === 1 ? "" : ` ${n}`})$1`);
+		}
+		// Publish the full state with an ack: live devices may no longer hold it, and an offline
+		// restore must keep it in the outbox. Compaction snapshots don't reach live devices.
+		this.send(id, state, "snapshot");
+		this.notes.set(id, { p: to });
+		await this.settle(id);
+		return to;
 	}
 
 	/** Record the ordered part hashes of an encrypted vault snapshot in the synced index. */
@@ -410,6 +479,7 @@ export class Engine {
 			this.sent = 0;
 			// Whatever was in flight on the old link is asked again; what the server lacked is tried again.
 			if (this.uploading) Object.assign(this.uploading, { asked: new Set(), stalled: false });
+			this.unmark();
 			this.fetching?.asked.clear();
 			for (const id of this.retry) this.toFetch.add(id);
 			this.retry.clear();
@@ -422,6 +492,7 @@ export class Engine {
 		return this.run("disconnected", async () => {
 			this.link = null;
 			this.live = false;
+			this.unmark();
 		});
 	}
 
@@ -433,6 +504,7 @@ export class Engine {
 	receive(msg: ServerMsg): Promise<void> {
 		return this.run(`receive ${msg.t}`, async () => {
 			if (msg.t === "stored" || msg.t === "chunk" || msg.t === "missing") await this.transferred(msg);
+			else if (msg.t === "marked") await this.marked(msg);
 			else if (msg.t === "entry" || msg.t === "live") {
 				// A live update is the same edit that arrives again shortly as a stored entry; only that one moves the cursor.
 				if (msg.t === "entry") {
@@ -527,7 +599,9 @@ export class Engine {
 			}
 			await this.nextTransfers().catch((err) => this.opts.onProblem?.("attachments", err));
 			this.unknown.clear();
+			await this.listDue();
 			await this.flush();
+			await this.sendMarks().catch((err) => this.opts.onProblem?.("reporting attachment versions", err));
 			// An input cut short by a failed commit may not have finished (an editor not shown an edit, a catch-up
 			// page not asked for): read again from what is on record. Merging an entry twice changes nothing.
 			if (this.replayFrom !== undefined && this.link) {
@@ -557,6 +631,7 @@ export class Engine {
 	}
 
 	private async flush(): Promise<void> {
+		await this.track(); // reports go in the same commit as the change that causes them
 		if (this.indexOut.length) {
 			this.send(INDEX, Y.mergeUpdates(this.indexOut));
 			this.indexOut = [];
@@ -690,6 +765,7 @@ export class Engine {
 		Y.applyUpdate(doc, update, REMOTE);
 		const after = Y.encodeStateAsUpdate(doc); // also drops the content of deleted text
 		doc.destroy();
+		this.touched.add(id);
 		if (changed && !fromDisk && before && this.metaOf(id).baseHash !== undefined && !(await this.read(`base:${id}`))) this.put(`base:${id}`, before);
 		this.put(`state:${id}`, after);
 		if (local) return this.send(id, update);
@@ -782,11 +858,11 @@ export class Engine {
 	}
 
 	/** The note has no file on this device any more. */
-	private forget(id: string): void {
+	private async forget(id: string): Promise<void> {
 		Object.assign(this.metaOf(id), { baseHash: undefined, mtime: undefined, size: undefined, owed: undefined, writing: undefined });
 		this.place(id, undefined);
 		this.del(`base:${id}`);
-		this.dropUpload(id); // its content went with the file
+		await this.dropUpload(id); // its content went with the file
 	}
 
 	private agree(id: string, file: DiskFile, hash: string): void {
@@ -897,7 +973,7 @@ export class Engine {
 		for (const id of adrift.keys()) {
 			if (moved.has(id)) continue;
 			const pending = await this.ahead(id);
-			this.forget(id);
+			await this.forget(id);
 			if (!pending) await this.tombstone(id);
 			todo.add(id);
 		}
@@ -957,7 +1033,7 @@ export class Engine {
 				return;
 			}
 			const pending = await this.ahead(id);
-			this.forget(id);
+			await this.forget(id);
 			if (!pending) await this.tombstone(id);
 		} finally {
 			this.losing.delete(id);
@@ -1106,7 +1182,7 @@ export class Engine {
 				// at this path would be taken for this note, rewritten, and its edit would erase a later restore.
 				await this.flush();
 				await this.disk.remove(m.diskPath);
-				this.forget(id);
+				await this.forget(id);
 				if (open) {
 					this.opened.delete(id);
 					open.destroy();
@@ -1168,7 +1244,7 @@ export class Engine {
 		// Last look before writing: if the file changed since step 1 read it, start over and take that in.
 		const now = await this.disk.stat(want);
 		if (fresh ? !!now : !now || now.mtime !== seen!.mtime || now.size !== seen!.size) {
-			if (fresh) this.forget(id); // something else appeared there: it isn't this note's file
+			if (fresh) await this.forget(id); // something else appeared there: it isn't this note's file
 			return false;
 		}
 		this.agree(id, await write(), hash);
@@ -1332,23 +1408,30 @@ export class Engine {
 		}
 		if (h === (await this.head(id))?.h) {
 			// What the vault has: the engine's own write, unrecorded when it stopped, or the user undid their change.
-			this.dropUpload(id);
+			await this.dropUpload(id);
 			return this.agree(id, file, h);
 		}
+		// Scoped once every device lately seen can read it: then its chunks are this version's alone.
+		const scoped = !!this.opts.versionTag && !!this.opts.reports?.() && !!this.opts.scoped?.(), u = scoped ? this.opts.newId() : "";
 		const size = this.opts.chunkSize ?? 2 ** 20, c: string[] = [];
-		for (let at = 0; at < bytes.length; at += size) c.push(await this.opts.chunkName(bytes.subarray(at, at + size)));
-		const ref: Ref = { h, n: bytes.length, c, u: this.opts.newId() };
+		for (let at = 0; at < bytes.length; at += size) c.push(await this.opts.chunkName(bytes.subarray(at, at + size), scoped ? { u, i: c.length } : undefined));
+		const ref: Ref = scoped ? { h, n: bytes.length, c, u, s: 1 } : { h, n: bytes.length, c, u: this.opts.newId() };
 		const up = await this.read<Upload>(`up:${id}`);
-		// It replaces what the file showed before; an earlier version still uploading never reached the vault.
+		// An earlier version still uploading never reached the vault: whatever of it the Worker holds is retired.
+		if (up?.ref.s === 1 && !this.holders.has(up.ref.u)) this.report(up.ref.u, "replaced");
+		// It replaces what the file showed before.
 		this.put(`up:${id}`, { ref, base: up ? up.base : m.baseHash } satisfies Upload);
 		this.ups.add(id);
-		const was = this.uploading;
+		const was = this.uploading, tag = scoped ? await this.tagOf(u) : undefined;
 		// Saved again mid-upload: chunks it shares with the version before are stored, or on their way, already.
-		if (!was || was.id === id) this.uploading = { id, ref, bytes, asked: new Set(c.filter((n) => was?.asked.has(n))), stored: new Set(c.filter((n) => was?.stored.has(n))) };
+		if (!was || was.id === id) this.uploading = { id, ref, bytes, asked: new Set(c.filter((n) => was?.asked.has(n))), stored: new Set(c.filter((n) => was?.stored.has(n))), tag };
 		this.agree(id, file, h);
 	}
 
-	private dropUpload(id: string): void {
+	/** `published`: its version is in the document now; otherwise it never will be, and is retired. */
+	private async dropUpload(id: string, published = false): Promise<void> {
+		const up = published || !this.ups.has(id) ? undefined : await this.read<Upload>(`up:${id}`);
+		if (up?.ref.s === 1 && !this.holders.has(up.ref.u)) this.report(up.ref.u, "replaced");
 		this.del(`up:${id}`);
 		this.ups.delete(id);
 		if (this.uploading?.id === id) this.uploading = null;
@@ -1364,7 +1447,7 @@ export class Engine {
 		});
 		const update = Y.encodeStateAsUpdate(doc, before);
 		doc.destroy();
-		this.dropUpload(id);
+		await this.dropUpload(id, true);
 		await this.merge(id, update, true, true);
 	}
 
@@ -1446,6 +1529,11 @@ export class Engine {
 
 	/** Downloads waiting for their turn, and an upload to start (its file is read again: only one is in memory). */
 	private async nextTransfers(): Promise<void> {
+		await this.nextUpload();
+		if (!this.uploading && this.link && this.live) await this.nextRepair();
+	}
+
+	private async nextUpload(): Promise<void> {
 		while (!this.fetching && this.toFetch.size) {
 			const id = this.toFetch.values().next().value!;
 			this.toFetch.delete(id);
@@ -1459,7 +1547,10 @@ export class Engine {
 			const file = await this.disk.stat(path);
 			if (!file) { this.deferred.add(id); continue; } // gone: its settle says where
 			const bytes = await this.disk.readBinary(path);
-			if ((await this.opts.chunkName(bytes)) === up.ref.h) return void (this.uploading = { id, ref: up.ref, bytes, asked: new Set(), stored: new Set() });
+			if ((await this.opts.chunkName(bytes)) === up.ref.h) {
+				const tag = up.ref.s === 1 ? await this.tagOf(up.ref.u) : undefined;
+				return void (this.uploading = { id, ref: up.ref, bytes, asked: new Set(), stored: new Set(), tag });
+			}
 			await this.stage(id, file, bytes); // changed unannounced: this is its newest version
 			if (this.uploading) return;
 		}
@@ -1471,7 +1562,8 @@ export class Engine {
 		if (up && !up.stalled) up.ref.c.forEach((name, i) => {
 			if (up.asked.size >= WINDOW || up.stored.has(name) || up.asked.has(name)) return;
 			up.asked.add(name);
-			this.link!.send({ t: "put", name, data: up.bytes.subarray(i * size, (i + 1) * size) });
+			const data = up.bytes.subarray(i * size, (i + 1) * size);
+			this.link!.send(up.tag ? { t: "put", name, data, tag: up.tag } : { t: "put", name, data });
 		});
 		if (f) for (const name of f.ref.c) {
 			if (f.asked.size >= WINDOW || f.got.has(name) || f.asked.has(name)) continue;
@@ -1495,7 +1587,8 @@ export class Engine {
 		if (msg.t === "chunk") {
 			if (!wanted) return;
 			// A chunk is checked against its name: neither the server nor a stale reply can slip in other bytes.
-			if ((await this.opts.chunkName(msg.data)) === msg.name) {
+			const ref = f!.ref, scope = ref.s === 1 ? { u: ref.u, i: ref.c.indexOf(msg.name) } : undefined;
+			if ((await this.opts.chunkName(msg.data, scope)) === msg.name) {
 				f!.got.set(msg.name, msg.data);
 				if (f!.ref.c.some((name) => !f!.got.has(name))) return;
 				await this.settle(f!.id);
@@ -1511,5 +1604,143 @@ export class Engine {
 		this.fetching = null;
 		this.retry.add(f!.id);
 		this.opts.onProblem?.(`attachment ${f!.id}`, new Error(`a chunk is ${msg.t === "chunk" ? "damaged" : "missing"} on the server; trying again after reconnecting`));
+	}
+
+	// --- version-scoped chunks: reports for Clean up (DESIGN.md section 10) ---
+
+	/** The attachment's version-scoped versions (their `u`), head first. */
+	private async scopedVersions(id: string): Promise<string[]> {
+		const doc = this.load(await this.state(id));
+		const us = doc.getArray<Ref>("v").toArray().filter((r) => r?.s === 1 && typeof r.u === "string" && r.u.length <= 64).map((r) => r.u);
+		doc.destroy();
+		return [...new Set(us)];
+	}
+
+	/**
+	 * Which versions left or joined the live attachments among the documents changed since the last look (`all`: every
+	 * one). Every `u` in `v` counts, not only the head: split moves a version to a copy under the same `u`. A version
+	 * no attachment holds any more is retired; one that joins any is current again. On record as reports ("mark:").
+	 */
+	private async track(all = false): Promise<void> {
+		const ids = all ? new Set([...this.notes.keys(), ...this.cur.keys()]) : this.touched;
+		this.touched = new Set();
+		for (const id of ids) {
+			const v = this.notes.get(id), was = this.cur.get(id) ?? [];
+			if (!was.length && (!v || isNote(v.p))) continue;
+			const now = v && v.d === undefined && !isNote(v.p) ? await this.scopedVersions(id) : [];
+			if (now.length === was.length && now.every((u, i) => u === was[i])) continue;
+			for (const u of now) if (!was.includes(u)) this.hold(u, 1);
+			for (const u of was) if (!now.includes(u)) this.hold(u, -1, v?.d === undefined ? "replaced" : "deleted");
+			if (now.length) {
+				this.cur.set(id, now);
+				this.put(`cur:${id}`, now);
+			} else {
+				this.cur.delete(id);
+				this.del(`cur:${id}`);
+			}
+		}
+	}
+
+	private hold(u: string, by: 1 | -1, gone: MarkState = "replaced"): void {
+		const n = (this.holders.get(u) ?? 0) + by;
+		if (n > 0) this.holders.set(u, n);
+		else this.holders.delete(u);
+		if (n === (by > 0 ? 1 : 0)) this.report(u, by > 0 ? "current" : gone);
+	}
+
+	/** The latest state per version is what the Worker gets; it is kept until the Worker has answered it. */
+	private report(u: string, state: MarkState): void {
+		this.marks.set(u, state);
+		this.put(`mark:${u}`, state);
+	}
+
+	// shortcut: a version's tag stays in memory for the run once computed; drop old ones if vaults with 100,000s of versions turn up.
+	private tagOf(u: string): Promise<string> {
+		let tag = this.tags.get(u);
+		if (!tag) this.tags.set(u, (tag = this.opts.versionTag!(u)));
+		return tag;
+	}
+
+	/**
+	 * Once a day, caught up, every version this device holds current goes to the Worker, the last report flagged: a
+	 * report lost or overtaken is put right, and the Worker knows which retirements are confirmed. Counted afresh.
+	 */
+	private async listDue(): Promise<void> {
+		const now = this.opts.now?.() ?? Date.now();
+		if (!this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.() || now - (this.meta.listedAt ?? -Infinity) < DAY_MS) return;
+		await this.track(true);
+		this.meta.listedAt = now;
+		this.put("meta", this.meta);
+		this.listing = true;
+	}
+
+	/** Reports not answered yet, then the daily list if it's due. Only once caught up. */
+	private async sendMarks(): Promise<void> {
+		const listing = this.listing;
+		this.listing = false;
+		if (!this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.()) return;
+		const waiting = new Map<MarkState, string[]>();
+		for (const [u, state] of this.marks) {
+			if (this.marking.get(u) === state) continue; // on its way
+			let us = waiting.get(state);
+			if (!us) waiting.set(state, (us = []));
+			us.push(u);
+		}
+		for (const [state, us] of waiting) for (let i = 0; i < us.length; i += MAX_MARK) await this.sendMark(state, us.slice(i, i + MAX_MARK));
+		if (!listing) return;
+		const current = [...this.holders.keys()]; // an empty list still says nothing is current
+		for (let i = 0; i === 0 || i < current.length; i += MAX_MARK) await this.sendMark("current", current.slice(i, i + MAX_MARK), i + MAX_MARK >= current.length);
+	}
+
+	private async sendMark(state: MarkState, us: string[], last = false): Promise<void> {
+		const id = this.nextMark++, tags = await Promise.all(us.map((u) => this.tagOf(u)));
+		this.markFrames.set(id, us.map((u) => ({ u, state })));
+		for (const u of us) this.marking.set(u, state);
+		this.link!.send(last ? { t: "mark", id, state, last, tags } : { t: "mark", id, state, tags });
+	}
+
+	private async marked({ id, tags }: Extract<ServerMsg, { t: "marked" }>): Promise<void> {
+		const check = this.checks.get(id);
+		if (check) return void (this.checks.delete(id), check(tags.length > 0));
+		const frame = this.markFrames.get(id);
+		if (!frame) return;
+		this.markFrames.delete(id);
+		const missing = new Set(tags);
+		for (const { u, state } of frame) {
+			if (this.marking.get(u) === state) this.marking.delete(u);
+			if (this.marks.get(u) === state) {
+				this.marks.delete(u);
+				this.del(`mark:${u}`);
+			}
+			// Current, and missing chunks on the Worker (Clean up removed them): put back from the file, if it's here.
+			if (state === "current" && missing.size && missing.has(await this.tagOf(u))) this.repairs.add(u);
+		}
+	}
+
+	/** A new link, or none: what was in flight goes again, and a restore waiting for an answer gets none. */
+	private unmark(): void {
+		this.marking.clear();
+		this.markFrames.clear();
+		for (const done of this.checks.values()) done(undefined);
+		this.checks.clear();
+	}
+
+	/** A version the Worker is missing chunks of, uploaded again from this device's file if it is exactly that version. */
+	private async nextRepair(): Promise<void> {
+		for (const u of this.repairs) {
+			this.repairs.delete(u);
+			const id = [...this.cur].find(([, us]) => us.includes(u))?.[0], m = id === undefined ? undefined : this.metaOf(id);
+			if (id === undefined || !m?.diskPath || this.ups.has(id) || this.dirty.has(m.diskPath) || !(await this.disk.stat(m.diskPath))) continue;
+			const doc = this.load(await this.state(id)), ref = doc.getArray<Ref>("v").toArray().find((r) => r?.u === u && r.s === 1);
+			doc.destroy();
+			if (!ref || m.baseHash !== ref.h) continue;
+			const bytes = await this.disk.readBinary(m.diskPath);
+			if ((await this.opts.chunkName(bytes)) !== ref.h) continue;
+			const size = this.opts.chunkSize ?? 2 ** 20, c: string[] = [];
+			for (let at = 0; at < bytes.length; at += size) c.push(await this.opts.chunkName(bytes.subarray(at, at + size), { u, i: c.length }));
+			// The names it computes must be exactly the ones the version refers to: never another version's chunks.
+			if (c.length !== ref.c.length || c.some((name, i) => name !== ref.c[i])) continue;
+			return void (this.uploading = { id, ref, bytes, asked: new Set(), stored: new Set(), tag: await this.tagOf(u) });
+		}
 	}
 }

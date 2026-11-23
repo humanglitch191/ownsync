@@ -104,6 +104,7 @@ test("every frame survives encoding and decoding", () => {
 		{ t: "fetch", from: 3 }, { t: "append", number: 2, recovery: bytes("r"), blob: bytes("rec") },
 		{ t: "rotate", number: 5, tokenHash: token(), recovery: new Uint8Array(0), blob: bytes("rot") },
 		{ t: "put", name: name(6), envelope: bytes("c") }, { t: "get", name: name(7) }, { t: "status", id: Uint8Array.of(1, 2, 3, 4), conflicts: 3, version: "0.1.0-beta" },
+		{ t: "vput", tag: name(8), name: name(9), envelope: bytes("v") }, { t: "mark", id: 3, flags: 9, tags: [name(10), name(11)] }, { t: "mark", id: 4, flags: 6, tags: [] },
 	];
 	for (const f of client) assert.deepEqual(decodeClient(encodeClient(f)), f);
 	const server: ServerFrame[] = [
@@ -111,6 +112,7 @@ test("every frame survives encoding and decoding", () => {
 		{ t: "ack", id: 7, seq: 8 }, { t: "live", doc: doc(2), envelope: bytes("l") },
 		{ t: "record", number: 4, blob: bytes("rec") }, { t: "records", recovery: bytes("sealed") },
 		{ t: "stored", name: name(3) }, { t: "chunk", name: name(4), envelope: bytes("k") }, { t: "missing", name: name(5) },
+		{ t: "marked", id: 9, tags: [name(6)] }, { t: "marked", id: 10, tags: [] },
 	];
 	for (const f of server) assert.deepEqual(decodeServer(encodeServer(f)), f);
 	assert.throws(() => decodeClient(Uint8Array.of(3, 0, 0)), RangeError); // a publish cut short
@@ -588,10 +590,11 @@ test("a snapshot part prunes old complete rows for space or is refused without e
 		const today = Math.floor(Date.now() / 86_400_000);
 		const insert = db.prepare("INSERT INTO snapshots (snapshot, day, at, epoch, parts, received, size) VALUES (?, ?, ?, 0, 2, ?, ?)");
 		const size = SNAPSHOT_BUDGET / 8;
-		for (let i = 1; i <= 8; i++) insert.run(doc(i), today - i, Date.now(), i <= 2 ? 2 : 1, size);
+		for (let i = 1; i <= 8; i++) insert.run(doc(i), today - i, Date.now(), i <= 3 ? 2 : 1, size);
 		const upload = (index: number) => snapshotPost(v, "snapshot", tok, snapshotPart(doc(9), index, 3, Uint8Array.of(1)));
 		assert.equal((await upload(0)).status, 200);
-		assert.equal(db.prepare("SELECT 1 FROM snapshots WHERE snapshot = ?").get(doc(2)), undefined);
+		assert.equal(db.prepare("SELECT 1 FROM snapshots WHERE snapshot = ?").get(doc(3)), undefined); // the two newest complete stay
+		assert.ok(db.prepare("SELECT 1 FROM snapshots WHERE snapshot = ?").get(doc(2)));
 		assert.ok(db.prepare("SELECT 1 FROM snapshots WHERE snapshot = ?").get(doc(1)));
 		insert.run(doc(10), today - 9, Date.now(), 1, size - 1);
 		const refused = await upload(1);
@@ -628,10 +631,109 @@ test("vault snapshot retention keeps daily and ISO-weekly representatives and tr
 		const removed = snapshotsToPrune(rows, today);
 		return rows.filter((item) => !removed.includes(item)).map((item) => today - item.day).sort((a, b) => a - b);
 	};
-	assert.deepEqual(retainedAges(Array.from({ length: 45 }, (_, age) => row(age)).reverse()), [0, 1, 2, 3, 4, 5, 6, 11, 18, 25, 32]);
-	assert.deepEqual(retainedAges([row(0, 1, false), row(45), row(46)]), [0, 45]);
+	// Nothing older than 30 days: the weekly one 32 days back goes.
+	assert.deepEqual(retainedAges(Array.from({ length: 45 }, (_, age) => row(age)).reverse()), [0, 1, 2, 3, 4, 5, 6, 11, 18, 25]);
+	// Except the two newest complete ones, however old: a vault that stopped taking snapshots keeps its last two.
+	assert.deepEqual(retainedAges([row(0, 1, false), row(45), row(46), row(47)]), [0, 45, 46]);
 	// Within the 150 MiB budget: three of the largest (50 MiB) snapshots, the newest first.
 	assert.deepEqual(retainedAges([0, 1, 2, 3, 4, 5, 6, 11, 18].map((age) => row(age, 50 * 1024 * 1024))), [0, 1, 2]);
+});
+
+// --- version-scoped chunks and Clean up (DESIGN.md section 10) ---
+
+const cleanupPost = (v: string, body: unknown) => fetch(`http://localhost:${PORT}/test-cleanup/${v}`, { method: "POST", body: JSON.stringify(body) }).then((r) => r.json() as Promise<{ removed?: number; more?: boolean; error?: string }>);
+const cleanupSizes = (v: string) => fetch(`http://localhost:${PORT}/test-cleanup/${v}/sizes`).then((r) => r.json() as Promise<{ at: number; old: number; deleted: number }[]>);
+const hexOf = (b: Uint8Array) => Buffer.from(b).toString("hex");
+
+test("vput: a chunk name belongs to one version for good; an old-style chunk or another version's can't be claimed", async () => {
+	const { v, tok, a, db } = await snapshotVaultWithDb();
+	try {
+		a.send({ t: "put", name: name(1), envelope: bytes("old-style") });
+		assert.deepEqual(await a.next(), { t: "stored", name: name(1) });
+		const vput = async (tag: number, n: number, body = "v") => { a.send({ t: "vput", tag: name(tag), name: name(n), envelope: bytes(body) }); return (await a.next()).t; };
+		assert.equal(await vput(101, 1), "missing"); // there already, and nobody's
+		assert.equal(await vput(101, 2), "stored");
+		assert.equal(await vput(102, 2, "another version's"), "missing");
+		assert.equal(await vput(101, 2, "again"), "stored"); // its own: fine, and the first envelope stays
+		assert.deepEqual(db.prepare("SELECT lower(hex(name)) AS name, lower(hex(tag)) AS tag FROM version_chunks").all().map((r) => ({ ...r })), [{ name: hexOf(name(2)), tag: hexOf(name(101)) }]);
+		assert.equal(Buffer.from(db.prepare("SELECT envelope FROM chunks WHERE name = ?").get(name(2))!.envelope as Uint8Array).toString(), "v");
+		// The names reply says whether every recent device can read these: not while a device reports an older version.
+		const names = async () => (await (await fetch(`http://localhost:${PORT}/vault/${v}/names`, { method: "POST", body: new Uint8Array([...tok, ...bytes(JSON.stringify({ device: "0000AAAA" }))]) })).json() as { scoped: boolean }).scoped;
+		assert.equal(await names(), true);
+		a.send(status(7, 0, "0.1.5"));
+		await statsUntil(v, (s) => s.devices.some((d) => d.version === "0.1.5"));
+		assert.equal(await names(), false);
+		a.send(status(7, 0, "0.2.0 mobile"));
+		await statsUntil(v, (s) => s.devices.some((d) => d.version === "0.2.0"));
+		assert.equal(await names(), true);
+	} finally {
+		db.close();
+		a.ws.close();
+	}
+});
+
+test("Clean up removes only past, retired versions a full list confirmed: never current ones, never old-style chunks", async () => {
+	const { v, a, db } = await snapshotVaultWithDb();
+	try {
+		const vput = async (tag: number, n: number, body: string) => { a.send({ t: "vput", tag: name(tag), name: name(n), envelope: bytes(body) }); assert.equal((await a.next()).t, "stored"); };
+		const mark = async (flags: number, ...tags: number[]) => { a.send({ t: "mark", id: flags, flags, tags: tags.map(name) }); const f = await a.next(); assert.equal(f.t, "marked"); return (f as { tags: Uint8Array[] }).tags.map((t) => t[0]); };
+		a.send({ t: "put", name: name(1), envelope: bytes("old-style") });
+		await a.next();
+		await vput(101, 11, "A, part one"); // A: replaced last January
+		await vput(101, 12, "A, part two");
+		await vput(102, 21, "B is deleted"); // B: deleted last February
+		await vput(103, 31, "C is current");
+		await vput(104, 41, "D retired after the last list");
+		assert.deepEqual(await mark(1, 101, 104), []);
+		assert.deepEqual(await mark(1 | 8, 102), []);
+		await new Promise((r) => setTimeout(r, 5));
+		assert.deepEqual(await mark(2 | 4, 103), []); // a full list from a device that hasn't said who it is: not counted
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM lists").get()!.n, 0);
+		a.send(status(5, 0, "0.2.0"));
+		assert.deepEqual(await mark(2 | 4, 103), []); // now it is: the vault's only device has listed what it holds current
+		// When these happened, as if long ago.
+		const year = new Date().getUTCFullYear() - 1, at = (month: number, day: number) => Date.UTC(year, month, day);
+		const retire = db.prepare("UPDATE versions SET retired_at = ? WHERE tag = ?");
+		retire.run(at(0, 15), name(101));
+		retire.run(at(1, 10), name(102));
+		retire.run(at(3, 5), name(104));
+		db.prepare("UPDATE lists SET at = ?").run(at(2, 1));
+		assert.deepEqual(await cleanupSizes(v), [
+			{ at: at(0, 15), old: "A, part one".length + "A, part two".length, deleted: 0 },
+			{ at: at(1, 10), old: 0, deleted: "B is deleted".length },
+		]);
+
+		// Only ranges that end by the start of the current period, on the Worker's clock, in the browser's time zone.
+		const lastYear = [at(0, 1), Date.UTC(year + 1, 0, 1)];
+		const refused = { error: "Only past periods can be cleaned up." };
+		assert.deepEqual(await cleanupPost(v, { ranges: [[at(0, 1), Date.now() + 86_400_000]], zone: "UTC", months: 1 }), refused);
+		assert.deepEqual(await cleanupPost(v, { ranges: [[at(0, 1), Date.UTC(year + 1, 0, 1) + 1]], zone: "UTC", months: 12 }), refused);
+		assert.deepEqual(await cleanupPost(v, { ranges: [lastYear], zone: "Pacific/Kiritimati", months: 12 }), refused); // its year began 14 hours earlier
+		assert.deepEqual(await cleanupPost(v, { ranges: [lastYear], zone: "Not/AZone", months: 12 }), { error: "bad time zone" });
+		assert.deepEqual(await cleanupPost(v, { ranges: [], zone: "UTC", months: 12 }), refused);
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM chunks").get()!.n, 6);
+
+		// A bounded amount a request: half of A goes, and A is then missing a chunk when a device says it's current again.
+		assert.deepEqual(await cleanupPost(v, { ranges: [[at(0, 1), at(1, 1)]], zone: "UTC", months: 12, limit: 1 }), { removed: 1, more: true });
+		assert.deepEqual(await mark(2, 101, 103), [101]);
+		assert.deepEqual(await mark(2, 101), [101]); // every time, from what is stored
+		// The rest of last year: B goes; A is current now, D unconfirmed, C current, the old-style chunk nobody's.
+		assert.deepEqual(await cleanupPost(v, { ranges: [[at(0, 1), Date.UTC(year + 1, 0, 1) - 14 * 3_600_000]], zone: "Pacific/Kiritimati", months: 12 }), { removed: 1, more: false });
+		const left = db.prepare("SELECT name FROM chunks").all().map((r) => Buffer.from(r.name as Uint8Array)[0]).sort((x, y) => x! - y!);
+		assert.equal(left.length, 4);
+		assert.ok(left.includes(1) && left.includes(31) && left.includes(41) && (left.includes(11) !== left.includes(12)));
+		assert.deepEqual(await cleanupSizes(v), []);
+		a.send({ t: "get", name: name(21) });
+		assert.deepEqual(await a.next(), { t: "missing", name: name(21) });
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM version_chunks").get()!.n, 5); // how a missing chunk is known later
+		// Put back by a device that still has the file: A is whole again.
+		const gone = left.includes(11) ? 12 : 11;
+		await vput(101, gone, "A, again");
+		assert.deepEqual(await mark(2, 101), []);
+	} finally {
+		db.close();
+		a.ws.close();
+	}
 });
 
 test("deleting a vault takes its token; then its devices are told 4004, it can't be created again, and only a tombstone is left", async () => {

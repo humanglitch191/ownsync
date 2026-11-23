@@ -12,6 +12,12 @@ export interface DeletedNote {
 	deletedAt?: number;
 }
 
+/**
+ * What a device tells the Worker about one version-scoped attachment version (DESIGN.md section 10): it is current
+ * (in some live attachment), or it stopped being: replaced by a newer version, or its attachment was deleted.
+ */
+export type MarkState = "current" | "replaced" | "deleted";
+
 /** An encrypted vault snapshot recorded in the synced index. */
 export interface SnapshotLedgerEntry {
 	/** The Worker's UTC day number (days since the epoch). */
@@ -34,7 +40,8 @@ export interface Entry {
 /**
  * The device's local database. `commit` is atomic: all of it is stored or none of it.
  * Keys: "meta", "index", "note:<id>" (NoteMeta), "state:<id>" and "base:<id>" (Yjs state), "out:<n>" (unsent Entry),
- * "up:<id>" (Upload).
+ * "up:<id>" (Upload), "cur:<id>" (an attachment's scoped versions, as last counted) and "mark:<u>" (a MarkState the
+ * Worker hasn't confirmed yet).
  */
 export interface Store {
 	get<T>(key: string): Promise<T | undefined>;
@@ -69,9 +76,14 @@ export type ClientMsg =
 	| { t: "snapshot"; doc: DocId; base: number; data: Uint8Array }
 	/** Relay this edit to the other devices now; it is not stored (a publish follows). */
 	| { t: "live"; entry: Entry }
-	/** Store one chunk of an attachment under its name. A name is stored once, however often it is put. */
-	| { t: "put"; name: string; data: Uint8Array }
-	| { t: "get"; name: string };
+	/**
+	 * Store one chunk of an attachment under its name. A name is stored once, however often it is put. With `tag`, the
+	 * chunk belongs to that version (its scoped name already says so), and the name is recorded under it.
+	 */
+	| { t: "put"; name: string; data: Uint8Array; tag?: string }
+	| { t: "get"; name: string }
+	/** These versions (by tag) are current, or stopped being; `last` ends this device's full list of current ones. */
+	| { t: "mark"; id: number; state: MarkState; last?: boolean; tags: string[] };
 
 export type ServerMsg =
 	| { t: "entry"; seq: number; entry: Entry }
@@ -84,7 +96,9 @@ export type ServerMsg =
 	| { t: "stored"; name: string }
 	| { t: "chunk"; name: string; data: Uint8Array }
 	/** The server has no such chunk (after a get), or couldn't store it (after a put). */
-	| { t: "missing"; name: string };
+	| { t: "missing"; name: string }
+	/** The answer to a mark: each version it called current that is missing a chunk on the server. */
+	| { t: "marked"; id: number; tags: string[] };
 
 /** An open connection to the server. Messages arrive in order or the connection drops. */
 export interface Link {
@@ -101,6 +115,8 @@ export interface Ref {
 	c: string[];
 	/** Unique to this version: the ID it becomes an attachment of its own under, if it loses a conflict. */
 	u: string;
+	/** 1: its chunks are this version's alone, named with `u` and their place (DESIGN.md section 10). */
+	s?: 1;
 }
 
 /** An attachment's new version on this device, published once the server has stored all its chunks. */
@@ -134,4 +150,6 @@ export interface Meta {
 	/** False until the first catch-up finishes: until then, local files are not yet compared with the vault. */
 	synced: boolean;
 	nextOut: number;
+	/** When this device last sent the Worker its full list of current versions (its own clock). */
+	listedAt?: number;
 }

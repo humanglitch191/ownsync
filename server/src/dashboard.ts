@@ -29,6 +29,13 @@ export interface VaultStats {
 	devices: { id: string; name: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
 }
 
+/** What the dashboard asks a Vault over RPC. */
+export interface VaultRpc {
+	stats(): Promise<VaultStats>;
+	cleanupSizes(): Promise<{ at: number; old: number; deleted: number }[]>;
+	cleanUp(ranges: unknown, zone: unknown, months: unknown): Promise<{ removed: number; more: boolean } | { error: string }>;
+}
+
 /** The server's version, shown on the dashboard. */
 export const VERSION = "0.2.0";
 
@@ -78,7 +85,7 @@ export class Dashboard {
 
 	constructor(
 		private readonly sql: SqlStorage,
-		private readonly stats: (vault: string) => Promise<VaultStats | null>,
+		private readonly vault: (id: string) => VaultRpc,
 		private readonly mint: () => Promise<string>,
 		private readonly vaults: () => { id: string; created: number; label: string }[],
 	) {
@@ -188,6 +195,15 @@ export class Dashboard {
 			if (name) this.sql.exec("INSERT OR REPLACE INTO device_labels (vault, device, label) VALUES (?, ?, ?)", device[1]!, device[2]!, name);
 			else this.sql.exec("DELETE FROM device_labels WHERE vault = ? AND device = ?", device[1]!, device[2]!);
 			return json({ ok: true });
+		}
+		// Clean up (DESIGN.md section 10): what can be removed, and removing it. The Vault checks the ranges on its own clock.
+		const cleanup = path.match(/^\/api\/vaults\/([0-9a-f]{32})\/cleanup(\/sizes)?$/);
+		if (cleanup) {
+			if (!this.vaults().some((v) => v.id === cleanup[1])) return fail(404, "no such vault");
+			const vault = this.vault(cleanup[1]!);
+			if (cleanup[2]) return json(await vault.cleanupSizes());
+			const result = await vault.cleanUp(body.ranges, body.zone, body.months);
+			return "error" in result ? fail(400, result.error) : json(result);
 		}
 		if (path === "/api/vault-code") {
 			const owner = await this.mint();
@@ -372,7 +388,7 @@ export class Dashboard {
 
 	private async overview(session: { passkey: string }, site: Site) {
 		const now = Date.now();
-		const vaults = await Promise.all(this.vaults().map(async (v) => ({ ...v, stats: await this.stats(v.id).catch(() => null) })));
+		const vaults = await Promise.all(this.vaults().map(async (v) => ({ ...v, stats: await this.vault(v.id).stats().catch(() => null) })));
 		const live = vaults.filter((v) => v.stats && !v.stats.deleted);
 		const sum = (f: (s: VaultStats) => number) => live.reduce((n, v) => n + f(v.stats!), 0);
 		// Behind the newest version any device of this Worker runs: the closest thing to "an update is out".

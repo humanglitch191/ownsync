@@ -65,6 +65,8 @@ const outputs: Hex = {
 	memberKey: v.hex(await v.memberKey(I.vmk0, I.vaultId)),
 	envelope: v.hex(await v.sealEnvelope({ vmk: I.vmk0, vaultId: I.vaultId, docId: I.docId, kind: v.KIND.update, epoch: 0, deviceId: A.id, plaintext: I.plaintext, nonce: I.nonce })),
 	chunkName: v.hex(await v.chunkName(I.vmk0, I.vaultId, I.plaintext)),
+	versionTag: v.hex(await v.versionTag(I.vmk0, I.vaultId, "3f9a1c0e5b7d2a46")),
+	scopedChunkName: v.hex(await v.scopedChunkName(I.vmk0, I.vaultId, "3f9a1c0e5b7d2a46", 2, I.plaintext)),
 	docTagIndex: v.hex(await v.docTag(I.vmk0, I.vaultId, "index")),
 	docTagNote: v.hex(await v.docTag(I.vmk0, I.vaultId, "3f9a1c0e5b7d2a46")),
 	packedEntry: v.hex(v.packEntry("3f9a1c0e5b7d2a46", I.plaintext)),
@@ -194,6 +196,14 @@ test("document tags are stable per document, differ between documents, and entri
 	assert.notDeepEqual(O.docTagIndex, O.docTagNote);
 	assert.notDeepEqual(await v.docTag(I.vmk1, I.vaultId, "index"), O.docTagIndex); // another epoch's key, another tag
 	assert.deepEqual(v.unpackEntry(O.packedEntry), { docId: "3f9a1c0e5b7d2a46", update: I.plaintext });
+});
+
+test("a scoped chunk name belongs to one version and one place in it; the version tag doesn't change with the epoch", async () => {
+	assert.notDeepEqual(O.scopedChunkName, O.chunkName);
+	assert.notDeepEqual(await v.scopedChunkName(I.vmk0, I.vaultId, "3f9a1c0e5b7d2a46", 3, I.plaintext), O.scopedChunkName);
+	assert.notDeepEqual(await v.scopedChunkName(I.vmk0, I.vaultId, "3f9a1c0e5b7d2a47", 2, I.plaintext), O.scopedChunkName);
+	assert.notDeepEqual(O.versionTag, O.scopedChunkName);
+	assert.equal(O.versionTag.length, 32);
 });
 
 test("setup proof: the setup key bound to the Worker's origin, as the Worker checks it", async () => {

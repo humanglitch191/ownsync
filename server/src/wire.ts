@@ -19,6 +19,12 @@
 //   get        name(32)                        send me that chunk
 //   status     id(4) | conflicts(4) | version  for the owner's dashboard: this device's short ID, how many conflict and
 //                                              recovered copies it sees, its plugin version (utf8, ≤ 32 bytes); one ID per connection
+//   vput       tag(32) | name(32) | envelope   store this chunk of the version tagged `tag` (DESIGN.md section 10). The
+//                                              name is recorded under the tag only if this vput stored the chunk, or it
+//                                              is already recorded under that tag; otherwise the reply is `missing`
+//   mark       id(4) | flags(1) | n × tag(32)  n ≤ 1024: these versions were retired (flag 1; with flag 8, because their
+//                                              attachment was deleted) or are current (flag 2); flag 4 ends this
+//                                              device's full list of what is current
 //
 // Worker → device
 //   entry      seq(8) | doc(16) | snapshot(1) | envelope
@@ -31,7 +37,9 @@
 //                                              recovery key (empty if there is none)
 //   stored     name(32)                        that chunk is stored
 //   chunk      name(32) | envelope
-//   missing    name(32)                        no such chunk (after a get), or it couldn't be stored (after a put)
+//   missing    name(32)                        no such chunk (after a get), or it couldn't be stored (after a put or vput)
+//   marked     id(4) | n × tag(32)             the answer to a mark: each tag it called current that has a recorded
+//                                              chunk missing
 
 export type ClientFrame =
 	| { t: "hello"; token: Uint8Array; owner?: Uint8Array }
@@ -44,7 +52,9 @@ export type ClientFrame =
 	| { t: "rotate"; number: number; tokenHash: Uint8Array; recovery: Uint8Array; blob: Uint8Array }
 	| { t: "put"; name: Uint8Array; envelope: Uint8Array }
 	| { t: "get"; name: Uint8Array }
-	| { t: "status"; id: Uint8Array; conflicts: number; version: string };
+	| { t: "status"; id: Uint8Array; conflicts: number; version: string }
+	| { t: "vput"; tag: Uint8Array; name: Uint8Array; envelope: Uint8Array }
+	| { t: "mark"; id: number; flags: number; tags: Uint8Array[] };
 
 export type ServerFrame =
 	| { t: "entry"; seq: number; doc: Uint8Array; snapshot: boolean; envelope: Uint8Array }
@@ -56,7 +66,8 @@ export type ServerFrame =
 	| { t: "records"; recovery: Uint8Array }
 	| { t: "stored"; name: Uint8Array }
 	| { t: "chunk"; name: Uint8Array; envelope: Uint8Array }
-	| { t: "missing"; name: Uint8Array };
+	| { t: "missing"; name: Uint8Array }
+	| { t: "marked"; id: number; tags: Uint8Array[] };
 
 /** WebSocket close codes the Worker uses. `rekeyed`: a device rotated the vault key; fetch the records and come back.
  * `deleted`: the vault was deleted from the Worker; don't come back. */
@@ -73,9 +84,13 @@ export const MAX_CHUNK = 1024 * 1024;
 export const CHUNK_OVERHEAD = 64;
 export const SHORT_ID_BYTES = 4;
 export const MAX_VERSION = 32;
+/** A version tag's size, the most tags in one mark, the most chunks one version may have, and mark's flags. */
+export const TAG_BYTES = 32;
+export const MAX_MARK = 1024;
+export const MARK = { retired: 1, current: 2, last: 4, deleted: 8 } as const;
 
-const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11 } as const;
-const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26 } as const;
+const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13 } as const;
+const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27 } as const;
 
 function build(type: number, ...fields: (Uint8Array | [bytes: 1 | 2 | 4 | 8, value: number])[]): Uint8Array {
 	const size = fields.reduce((n, f) => n + (f instanceof Uint8Array ? f.length : f[0]), 1);
@@ -123,6 +138,8 @@ export function encodeClient(f: ClientFrame): Uint8Array {
 		case "put": return build(CLIENT.put, f.name, f.envelope);
 		case "get": return build(CLIENT.get, f.name);
 		case "status": return build(CLIENT.status, f.id, [4, f.conflicts], new TextEncoder().encode(f.version));
+		case "vput": return build(CLIENT.vput, f.tag, f.name, f.envelope);
+		case "mark": return build(CLIENT.mark, [4, f.id], [1, f.flags], ...f.tags);
 	}
 }
 
@@ -147,8 +164,15 @@ export function decodeClient(bytes: Uint8Array): ClientFrame {
 			if (version.length > MAX_VERSION) throw new RangeError("version too long");
 			return { t: "status", id, conflicts, version: new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(version) };
 		}
+		case CLIENT.vput: return { t: "vput", tag: r.take(TAG_BYTES), name: r.take(CHUNK_NAME_BYTES), envelope: r.rest() };
+		case CLIENT.mark: return { t: "mark", id: r.u32(), flags: r.u8(), tags: tags(r.rest()) };
 		default: throw new RangeError("unknown frame type");
 	}
+}
+
+function tags(rest: Uint8Array): Uint8Array[] {
+	if (rest.length % TAG_BYTES || rest.length > MAX_MARK * TAG_BYTES) throw new RangeError("bad tag list");
+	return Array.from({ length: rest.length / TAG_BYTES }, (_, i) => rest.subarray(i * TAG_BYTES, (i + 1) * TAG_BYTES));
 }
 
 export function encodeServer(f: ServerFrame): Uint8Array {
@@ -163,6 +187,7 @@ export function encodeServer(f: ServerFrame): Uint8Array {
 		case "stored": return build(SERVER.stored, f.name);
 		case "chunk": return build(SERVER.chunk, f.name, f.envelope);
 		case "missing": return build(SERVER.missing, f.name);
+		case "marked": return build(SERVER.marked, [4, f.id], ...f.tags);
 	}
 }
 
@@ -179,6 +204,7 @@ export function decodeServer(bytes: Uint8Array): ServerFrame {
 		case SERVER.stored: return { t: "stored", name: r.take(CHUNK_NAME_BYTES) };
 		case SERVER.chunk: return { t: "chunk", name: r.take(CHUNK_NAME_BYTES), envelope: r.rest() };
 		case SERVER.missing: return { t: "missing", name: r.take(CHUNK_NAME_BYTES) };
+		case SERVER.marked: return { t: "marked", id: r.u32(), tags: tags(r.rest()) };
 		default: throw new RangeError("unknown frame type");
 	}
 }

@@ -296,7 +296,8 @@ function vaultSection(v) {
 	const title = h("h3", { title: "Click to rename" }, vaultName(v));
 	title.addEventListener("click", () => rename(title, v.label, v.name || "e.g. Personal", `/api/vaults/${v.id}/label`));
 	return h("div", { class: "vault" },
-		h("div", { class: "section" }, title, h("span", { class: "label" }, [size(v.bytes), v.lastActivity ? `changed ${ago(v.lastActivity)}` : null].filter(Boolean).join(" · "))),
+		h("div", { class: "section" }, title, h("span", { class: "label" }, [size(v.bytes), v.lastActivity ? `changed ${ago(v.lastActivity)}` : null].filter(Boolean).join(" · "), " · ",
+			h("button", { class: "link label", onclick: () => void cleanup(v.id) }, "Clean up"))),
 		h("div", { class: "card" },
 			v.devices.length ? v.devices.map((d) => deviceRow(d, "", v.id)) : h("div", { class: "devrow" }, h("span", { class: "ic ghost" }), h("div", { class: "meta" }, "No device has reported in yet."), h("span")),
 			v.conflicts > 0 ? h("div", { class: "devrow flag" }, h("span", { class: "ic" }, "!"), h("div", {}, h("div", {}, `${plural(v.conflicts, "note")} ${v.conflicts === 1 ? "has" : "have"} a conflict copy`), h("div", { class: "meta" }, "Search for “(conflict” in Obsidian and keep what you want")), h("span")) : null));
@@ -406,14 +407,90 @@ async function passkeys() {
 			h("p", { class: "quiet" }, "Lost every passkey? Set a new SETUP_KEY in your Cloudflare dashboard and use it here: that replaces all passkeys."))));
 }
 
-// Obsidian's "Add another vault" opens /#connect: straight into the steps, once signed in.
-let pending = location.hash === "#connect" ? "connect" : null;
+// --- Clean up: removable history by calendar period, in this browser's time zone (DESIGN.md section 10) ---
+const VIEWS = [["Month", 1], ["Quarter", 3], ["Half-year", 6], ["Year", 12]];
+const monthName = new Intl.DateTimeFormat(undefined, { month: "short" });
+const monthYear = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" });
+
+// The month, quarter, half-year or year holding `t` here: its start and end (ms), and its name.
+function period(t, months) {
+	const d = new Date(t), y = d.getFullYear(), m = d.getMonth() - (d.getMonth() % months);
+	const start = new Date(y, m, 1).getTime(), end = new Date(y, m + months, 1).getTime();
+	const label = months === 12 ? String(y) : months === 1 ? monthYear.format(start) : `${monthName.format(start)}–${monthName.format(new Date(y, m + months - 1, 1))} ${y}`;
+	return { start, end, label };
+}
+
+async function cleanup(id, months = 12) {
+	let o, buckets;
+	try { [o, buckets] = await Promise.all([api("/api/overview"), api(`/api/vaults/${id}/cleanup/sizes`, {})]); } catch (err) { return err.status === 401 ? welcome() : show(h("p", { class: "error" }, failure(err))); }
+	const vault = o.vaults.find((v) => v.id === id);
+	if (!vault) return dashboard();
+	// The Worker counts by quarter hour, when each version stopped being current; every time zone's periods start on one.
+	const current = period(Date.now(), months), periods = new Map([[current.start, { ...current, old: 0, deleted: 0 }]]);
+	for (const b of buckets) {
+		const p = period(b.at, months);
+		if (!periods.has(p.start)) periods.set(p.start, { ...p, old: 0, deleted: 0 });
+		const row = periods.get(p.start);
+		row.old += b.old;
+		row.deleted += b.deleted;
+	}
+	const rows = [...periods.values()].sort((a, b) => b.start - a.start), selected = new Set();
+	const total = () => [...selected].reduce((n, r) => n + r.old + r.deleted, 0);
+	const summary = h("span", { class: "quiet" }), remove = h("button", { class: "btn primary" });
+	const update = () => {
+		summary.textContent = `${plural(selected.size, "period")} selected · ${size(total())}`;
+		remove.textContent = `Remove ${size(total())} of history`;
+		remove.disabled = !total();
+	};
+	const list = rows.map((r) => {
+		const past = r.end <= current.start, bytes = r.old + r.deleted; // only past periods can be removed
+		const box = h("input", { type: "checkbox", class: "box", disabled: !past || !bytes });
+		box.addEventListener("change", () => { if (box.checked) selected.add(r); else selected.delete(r); update(); });
+		const parts = [r.old ? `Old attachment versions ${size(r.old)}` : null, r.deleted ? `Deleted attachments ${size(r.deleted)}` : null].filter(Boolean);
+		return h("label", { class: "period" }, box,
+			h("div", {}, h("b", {}, r.label), r.start === current.start ? h("span", { class: "tag" }, "current") : null, h("p", { class: "quiet" }, parts.join(" · ") || "Nothing to remove")),
+			h("span", { class: "size" }, size(bytes)));
+	});
+	remove.addEventListener("click", () => {
+		const chosen = rows.filter((r) => selected.has(r)).reverse(), bytes = total();
+		const kinds = [chosen.some((r) => r.old) ? "old attachment versions" : null, chosen.some((r) => r.deleted) ? "deleted attachments" : null].filter(Boolean).join(" and ");
+		const go = action("Remove", async () => {
+			// Explicit ranges, all before the current period; the Worker checks that on its own clock, and removes a
+			// bounded amount at a time.
+			const body = { ranges: chosen.map((r) => [r.start, r.end]), zone: Intl.DateTimeFormat().resolvedOptions().timeZone, months };
+			for (let more = true; more;) ({ more } = await api(`/api/vaults/${id}/cleanup`, body));
+			dialog.close();
+			await cleanup(id, months);
+		}, "btn danger");
+		const dialog = h("dialog", { class: "card dlg" },
+			h("h3", {}, `Remove history from ${new Intl.ListFormat(undefined, { type: "conjunction" }).format(chosen.map((r) => r.label))}?`),
+			h("p", {}, `${size(bytes)} of ${kinds}. Your notes and current attachments stay. This can't be undone.`),
+			h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => dialog.close() }, "Cancel"), go.button), go.error);
+		dialog.addEventListener("close", () => dialog.remove());
+		document.body.append(dialog);
+		dialog.showModal();
+	});
+	show(h("main", { class: "dash cleanup" }, topBar("overview"),
+		h("div", { class: "card" },
+			h("h2", {}, `Clean up · ${vaultName(vault)}`),
+			h("p", { class: "sub" }, "Removes old history you no longer need. Notes and the current version of every attachment are never touched."),
+			h("div", { class: "seg", role: "group", "aria-label": "Periods" }, VIEWS.map(([label, m]) => h("button", { class: m === months ? "on" : "", "aria-pressed": String(m === months), onclick: () => void cleanup(id, m) }, label))),
+			list,
+			h("div", { class: "total" }, summary, remove),
+			h("p", { class: "note" }, `Vault snapshots keep the last 30 days by themselves and aren't listed here. This vault uses ${size(vault.bytes)} in all.`))));
+	update();
+}
+
+// Obsidian's "Add another vault" opens /#connect: straight into the steps, once signed in. Its "Clean up storage…"
+// opens /#cleanup/<vault>: that vault's Clean up.
+let pending = location.hash === "#connect" ? "connect" : /^#cleanup\/([0-9a-f]{32})$/.exec(location.hash)?.[1] ?? null;
 if (location.hash) history.replaceState(null, "", location.pathname);
 async function home() {
-	if (pending !== "connect") return dashboard();
+	if (!pending) return dashboard();
 	try { await api("/api/overview"); } catch (err) { return err.status === 401 ? welcome() : show(h("p", { class: "error" }, failure(err))); }
+	const start = pending;
 	pending = null;
-	return setup(null);
+	return start === "connect" ? setup(null) : cleanup(start);
 }
 
 if (!window.PublicKeyCredential) show(h("main", { class: "welcome" }, brand(), h("p", { class: "error" }, "This browser doesn't support passkeys. Open this page in a current Safari, Chrome, Edge or Firefox.")));

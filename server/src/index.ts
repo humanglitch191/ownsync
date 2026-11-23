@@ -4,9 +4,9 @@
 // chunks are kept apart, once per name.
 
 import { DurableObject } from "cloudflare:workers";
-import { Dashboard, VERSION, type VaultStats } from "./dashboard";
+import { Dashboard, VERSION, type VaultRpc, type VaultStats } from "./dashboard";
 import { SNAPSHOT_BUDGET, snapshotsToPrune } from "./snapshots";
-import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, DOC_TAG_BYTES, MAX_CHUNK, MAX_ENVELOPE, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
+import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_ENVELOPE, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
 
 interface Env {
 	VAULT: DurableObjectNamespace<Vault>;
@@ -21,7 +21,8 @@ interface Env {
 const MIN_SETUP_KEY = 12;
 
 // token: hex hash of the token this socket said hello with; null before hello. device: the short ID its status gave.
-type Session = { token: string | null; live: boolean; device?: string };
+// listFrom: when this socket's full list of current versions began (DESIGN.md section 10), until its last frame.
+type Session = { token: string | null; live: boolean; device?: string; listFrom?: number };
 const toHex = (b: ArrayBuffer | Uint8Array) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
 type Row = { seq: number; doc: ArrayBuffer; snapshot: number; envelope: ArrayBuffer };
 
@@ -43,6 +44,10 @@ const MAX_SNAPSHOT_PARTS = 512;
 const MAX_SNAPSHOT_ENVELOPE = 1024 * 1024 + 256; // a full 1 MiB part, sealed: its header, the envelope header and the tag (87 bytes today), with room to spare
 const MAX_SNAPSHOT = 50 * 1024 * 1024; // one snapshot; the vault keeps SNAPSHOT_BUDGET of them in all
 const SNAPSHOT_LEASE_MS = 60 * 60 * 1000;
+// Version-scoped chunks (DESIGN.md section 10): devices this recent must all run 0.2.0 or later before any device
+// uploads them, and Clean up removes at most this many chunks a request (the dashboard asks again for the rest).
+const SCOPED_SINCE_MS = 30 * DAY_MS;
+const CLEANUP_PER_REQUEST = 2000;
 type VaultSnapshot = { id: number; day: number; parts: number; received: number; size: number };
 
 export default {
@@ -126,6 +131,11 @@ export class Vault extends DurableObject<Env> {
 			CREATE TABLE IF NOT EXISTS usage_days (day INTEGER PRIMARY KEY, requests REAL NOT NULL, rows INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS tombstone (id INTEGER PRIMARY KEY CHECK (id = 0), at INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS vault_name (id INTEGER PRIMARY KEY CHECK (id = 0), name TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS versions (tag BLOB PRIMARY KEY, retired_at INTEGER, deleted INTEGER NOT NULL DEFAULT 0);
+			CREATE INDEX IF NOT EXISTS versions_retired ON versions (retired_at);
+			CREATE TABLE IF NOT EXISTS version_chunks (name BLOB PRIMARY KEY, tag BLOB NOT NULL);
+			CREATE INDEX IF NOT EXISTS version_chunks_tag ON version_chunks (tag);
+			CREATE TABLE IF NOT EXISTS lists (device TEXT PRIMARY KEY, at INTEGER NOT NULL);
 		`);
 		// Added in 0.1.2: a device's name, as Obsidian has it. Vaults made earlier get the column now.
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");
@@ -165,7 +175,8 @@ export class Vault extends DurableObject<Env> {
 				const latest = await (owner(this.env) as unknown as { latest(): Promise<string | null> }).latest().catch(() => null);
 				// And the names the vault's devices gave themselves, for each device's list (they were sent readable anyway).
 				const names = Object.fromEntries(this.sql.exec<{ id: string; name: string }>("SELECT id, name FROM devices WHERE name != ''").toArray().map((r) => [r.id, r.name]));
-				return Response.json({ ok: true, worker: VERSION, latest, names });
+				// And whether every recent device can read version-scoped chunks. A Worker that sends no `scoped` has neither vput nor mark.
+				return Response.json({ ok: true, worker: VERSION, latest, names, scoped: this.scoped(device) });
 			}
 			await this.erase();
 			return Response.json({ deleted: true });
@@ -264,6 +275,9 @@ export class Vault extends DurableObject<Env> {
 
 	private expireSnapshots(now: number): void {
 		this.write("DELETE FROM snapshots WHERE received < parts AND at <= ?", now - SNAPSHOT_LEASE_MS);
+		// The last 30 days, even when no device uploads any more.
+		const rows = this.sql.exec<{ id: number; day: number; size: number; complete: number }>("SELECT id, day, size, received = parts AS complete FROM snapshots").toArray();
+		for (const row of snapshotsToPrune(rows, Math.floor(now / DAY_MS))) this.write("DELETE FROM snapshots WHERE id = ?", row.id);
 	}
 
 	private snapshot(operation: string | undefined, body: Uint8Array, now = Date.now()): Response {
@@ -395,11 +409,13 @@ export class Vault extends DurableObject<Env> {
 			if (f.t === "hello") return this.expireSnapshots(Date.now());
 			if (f.t === "append" || f.t === "rotate") return this.append(ws, f);
 			if (f.t === "status") return this.status(ws, session, f);
+			if (f.t === "mark") return this.mark(ws, session, f);
 			if (f.t === "get") {
 				const row = this.sql.exec<{ envelope: ArrayBuffer }>("SELECT envelope FROM chunks WHERE name = ?", f.name).toArray()[0];
 				return ws.send(encodeServer(row ? { t: "chunk", name: f.name, envelope: new Uint8Array(row.envelope) } : { t: "missing", name: f.name }));
 			}
 			if (f.envelope.length === 0) return ws.close(CLOSE.badMessage, "empty envelope");
+			if (f.t === "vput") return this.vput(ws, f);
 			if (f.t === "put") {
 				if (f.envelope.length > MAX_CHUNK + CHUNK_OVERHEAD) return ws.close(CLOSE.badMessage, "chunk too large");
 				// The name is a keyed hash of the content, so the same name is the same chunk: stored once.
@@ -496,6 +512,123 @@ export class Vault extends DurableObject<Env> {
 		this.write("DELETE FROM devices WHERE id NOT IN (SELECT id FROM devices ORDER BY last_online DESC LIMIT ?)", MAX_DEVICES);
 	}
 
+	// A chunk of one attachment version (DESIGN.md section 10). Stored as `put` stores it, and its name recorded under
+	// the version's tag, but only if this vput stored it or the name is already that tag's: a name belongs to one tag
+	// for good, so no device can claim an old-style chunk, or another version's, and have it removed.
+	private vput(ws: WebSocket, f: Extract<ClientFrame, { t: "vput" }>): void {
+		if (f.envelope.length > MAX_CHUNK + CHUNK_OVERHEAD) return ws.close(CLOSE.badMessage, "chunk too large");
+		let stored = false;
+		try {
+			this.ctx.storage.transactionSync(() => {
+				const owner = this.sql.exec<{ mine: number }>("SELECT tag = ? AS mine FROM version_chunks WHERE name = ?", f.tag, f.name).toArray()[0];
+				if (owner) {
+					if (!owner.mine) return;
+					this.write("INSERT OR IGNORE INTO chunks (name, envelope) VALUES (?, ?)", f.name, f.envelope); // put back, if it was removed
+				} else {
+					if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM version_chunks WHERE tag = ?", f.tag).one().n >= MAX_MARK) return;
+					const cursor = this.sql.exec("INSERT OR IGNORE INTO chunks (name, envelope) VALUES (?, ?)", f.name, f.envelope);
+					this.count(0, cursor.rowsWritten);
+					if (!cursor.rowsWritten) return; // there already, and nobody's: an old-style chunk, never to be removed
+					this.write("INSERT INTO version_chunks (name, tag) VALUES (?, ?)", f.name, f.tag);
+				}
+				this.write("INSERT INTO versions (tag, retired_at) VALUES (?, NULL) ON CONFLICT(tag) DO UPDATE SET retired_at = NULL, deleted = 0 WHERE retired_at IS NOT NULL", f.tag);
+				stored = true;
+			});
+		} catch {
+			stored = false; // storage full: the device retries later
+		}
+		ws.send(encodeServer({ t: stored ? "stored" : "missing", name: f.name }));
+	}
+
+	// Devices report which versions stopped or started being current; the Worker's clock says when. The answer names
+	// each version called current that has a recorded chunk missing, worked out from what is stored every time.
+	private mark(ws: WebSocket, session: Session, f: Extract<ClientFrame, { t: "mark" }>): void {
+		const now = Date.now(), missing: Uint8Array[] = [];
+		// A full list confirms only retirements from before it began: a version this device listed as current in an
+		// earlier frame, and that another device retired since, isn't confirmed by it.
+		if ((f.flags & MARK.current) && session.listFrom === undefined) session = { ...session, listFrom: now };
+		this.ctx.storage.transactionSync(() => {
+			for (const tag of f.tags) {
+				if (f.flags & MARK.current) {
+					this.write("UPDATE versions SET retired_at = NULL, deleted = 0 WHERE tag = ? AND retired_at IS NOT NULL", tag);
+					if (this.sql.exec("SELECT 1 FROM version_chunks v WHERE v.tag = ? AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.name = v.name) LIMIT 1", tag).toArray().length) missing.push(tag);
+				} else if (f.flags & MARK.retired) this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND retired_at IS NULL", now, f.flags & MARK.deleted ? 1 : 0, tag);
+			}
+			// The end of a caught-up device's full list: as far as it knows, nothing retired before it began is current.
+			if ((f.flags & MARK.last) && session.live && session.device) this.write("INSERT INTO lists (device, at) VALUES (?, ?) ON CONFLICT(device) DO UPDATE SET at = max(at, excluded.at)", session.device, session.listFrom ?? now);
+		});
+		if (f.flags & MARK.last) session = { ...session, listFrom: undefined };
+		ws.serializeAttachment(session);
+		ws.send(encodeServer({ t: "marked", id: f.id, tags: missing }));
+	}
+
+	/**
+	 * Whether a 0.2.0 device may upload version-scoped chunks: a 0.1.5 device can't read them. Every device seen in the
+	 * last 30 days, other than the one asking, must report 0.2.0 or later; no version on record counts as old. The list
+	 * keeps the newest 64: when all of them are that recent, an older device may have fallen off it, so that counts as old too.
+	 */
+	private scoped(asking: string | null): boolean {
+		const since = Date.now() - SCOPED_SINCE_MS;
+		const all = this.sql.exec<{ n: number; oldest: number | null }>("SELECT COUNT(*) AS n, MIN(last_online) AS oldest FROM devices").one();
+		if (all.n >= MAX_DEVICES && (all.oldest ?? 0) >= since) return false;
+		const recent = this.sql.exec<{ version: string }>("SELECT version FROM devices WHERE last_online >= ? AND id != ?", since, asking ?? "").toArray();
+		return recent.every((d) => newer(d.version.split(" ")[0] ?? "", "0.2.0"));
+	}
+
+	/**
+	 * Retirements before this may be cleaned up: every device seen in the last 30 days has listed what it holds current
+	 * since. One device's list isn't enough: a device away meanwhile may bring a deleted attachment back with its own
+	 * offline edit, its deleted version as the head again. (No device seen that long: the latest list.)
+	 */
+	private listedAt(): number {
+		const recent = this.sql.exec<{ at: number | null; n: number }>(
+			"SELECT MIN(COALESCE(l.at, 0)) AS at, COUNT(*) AS n FROM devices d LEFT JOIN lists l ON l.device = d.id WHERE d.last_online >= ?", Date.now() - SCOPED_SINCE_MS,
+		).one();
+		return recent.n ? recent.at ?? 0 : this.sql.exec<{ at: number | null }>("SELECT MAX(at) AS at FROM lists").one().at ?? 0;
+	}
+
+	/**
+	 * For Clean up on the owner's dashboard (an RPC from the Owner object, which checked the session and Origin): the
+	 * history that can be removed, by the quarter hour it stopped being current in. Every time zone's midnight falls
+	 * on a quarter hour, so the browser groups these into its own local months, quarters, half-years and years.
+	 */
+	async cleanupSizes(): Promise<{ at: number; old: number; deleted: number }[]> {
+		if (this.token === null || this.deleted) return [];
+		return this.sql.exec<{ at: number; old: number; deleted: number }>(
+			`SELECT v.retired_at / 900000 * 900000 AS at, SUM(CASE WHEN v.deleted THEN 0 ELSE length(c.envelope) END) AS old, SUM(CASE WHEN v.deleted THEN length(c.envelope) ELSE 0 END) AS deleted
+			FROM versions v JOIN version_chunks vc ON vc.tag = v.tag JOIN chunks c ON c.name = vc.name WHERE v.retired_at < ? GROUP BY 1 ORDER BY 1`, this.listedAt(),
+		).toArray();
+	}
+
+	/**
+	 * Clean up: removes the chunks of versions that stopped being current within `ranges` ([from, to) in ms), all of
+	 * them before the current period (`months` long, in time zone `zone`) began on this Worker's clock, and only where
+	 * a full list since confirmed it. Never a current version, nor an old-style chunk (it has no tag). The
+	 * version_chunks rows stay: that is how a missing chunk is known later. At most `limit` chunks; `more` says ask again.
+	 */
+	async cleanUp(ranges: unknown, zone: unknown, months: unknown, now = Date.now(), limit = CLEANUP_PER_REQUEST): Promise<{ removed: number; more: boolean } | { error: string }> {
+		if (this.token === null || this.deleted) return { error: "no such vault" };
+		if (months !== 1 && months !== 3 && months !== 6 && months !== 12) return { error: "bad period" };
+		let start: number;
+		try { start = periodStart(now, String(zone), months); } catch { return { error: "bad time zone" }; }
+		const ok = (r: unknown): r is [number, number] => Array.isArray(r) && r.length === 2 && Number.isSafeInteger(r[0]) && Number.isSafeInteger(r[1]) && r[0] < r[1] && r[1] <= start;
+		if (!Array.isArray(ranges) || !ranges.length || ranges.length > 1000 || !ranges.every(ok)) return { error: "Only past periods can be cleaned up." };
+		const listed = this.listedAt();
+		let removed = 0;
+		this.ctx.storage.transactionSync(() => {
+			for (const [from, to] of ranges as [number, number][]) {
+				const names = this.sql.exec<{ name: ArrayBuffer }>(
+					"SELECT c.name AS name FROM versions v JOIN version_chunks vc ON vc.tag = v.tag JOIN chunks c ON c.name = vc.name WHERE v.retired_at >= ? AND v.retired_at < ? AND v.retired_at < ? LIMIT ?",
+					from, to, listed, limit - removed,
+				).toArray();
+				for (const { name } of names) this.write("DELETE FROM chunks WHERE name = ?", name);
+				removed += names.length;
+				if (removed >= limit) break;
+			}
+		});
+		return { removed, more: removed >= limit };
+	}
+
 	/** What the owner's dashboard shows of this vault: nothing a key would be needed for. */
 	async stats(): Promise<VaultStats> {
 		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [] };
@@ -524,7 +657,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async erase(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "devices", "usage", "usage_days", "vault_name"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;
@@ -587,6 +720,30 @@ export class Vault extends DurableObject<Env> {
 
 const owner = (env: Env) => env.OWNER.get(env.OWNER.idFromName("owner"));
 const today = () => Math.floor(Date.now() / DAY_MS); // days since the epoch, so a new one starts at 00:00 UTC
+/** Whether release `version` ("1.2.3") is `than` or later; anything else (a pre-release, nothing) counts as older. */
+function newer(version: string, than: string): boolean {
+	const a = /^(\d+)\.(\d+)\.(\d+)$/.exec(version), b = than.split(".").map(Number);
+	if (!a) return false;
+	for (let i = 0; i < 3; i++) if (Number(a[i + 1]) !== b[i]) return Number(a[i + 1]) > b[i]!;
+	return true;
+}
+/**
+ * When the calendar period holding `now` began in time zone `zone` (an IANA name; throws if unknown): local midnight
+ * on the first of its month, quarter (`months` 3), half-year (6) or year (12). Clean up only touches what came before.
+ */
+export function periodStart(now: number, zone: string, months: 1 | 3 | 6 | 12): number {
+	const format = new Intl.DateTimeFormat("en-US", { timeZone: zone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric", hourCycle: "h23" });
+	// An instant's wall-clock time in the zone, written as if it were UTC.
+	const wall = (t: number) => {
+		const p = Object.fromEntries(format.formatToParts(t).map((x) => [x.type, Number(x.value)]));
+		return Date.UTC(p.year!, p.month! - 1, p.day!, p.hour!, p.minute!, p.second!);
+	};
+	const local = new Date(wall(now)), month = local.getUTCMonth();
+	const start = Date.UTC(local.getUTCFullYear(), month - (month % months), 1);
+	// The instant with that wall-clock time: the zone's offset there, found from a first guess.
+	const guess = start - (wall(start) - start);
+	return start - (wall(guess) - guess);
+}
 // How long an owner code from the dashboard works (it's shown on a screen), and how many unused ones are kept.
 const DASHBOARD_CODE_MS = 60 * 60 * 1000, MAX_CODES = 20;
 
@@ -616,7 +773,7 @@ export class Owner extends DurableObject<Env> {
 		`);
 		this.dashboard = new Dashboard(
 			this.sql,
-			(id) => (this.env.VAULT.get(this.env.VAULT.idFromName(id)) as unknown as { stats(): Promise<VaultStats> }).stats(),
+			(id) => this.env.VAULT.get(this.env.VAULT.idFromName(id)) as unknown as VaultRpc,
 			() => this.mint(DASHBOARD_CODE_MS),
 			() => this.listVaults(),
 		);

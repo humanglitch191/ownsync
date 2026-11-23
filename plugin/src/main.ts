@@ -10,7 +10,7 @@ import { createHistoryBackup, type HistoryBackupDeps } from "./historyBackup";
 import { redactProblem } from "./diagnostics";
 import { Editors, editorBinding } from "./editors";
 import { IdbStore } from "./idbStore";
-import { type KeyPorts, type KeyState, VaultKeys, shortId } from "./keys";
+import { type KeyPorts, type KeyState, VaultKeys, shortId, vaultIdOf } from "./keys";
 import { noteUrl, parseOpenLink, parseSetupLink, trimHost } from "./links";
 import { handlePairLink, showPairingCode } from "./pairing";
 import { SetupModal, openDashboard } from "./setup";
@@ -189,7 +189,13 @@ export default class OwnsyncPlugin extends Plugin {
 	pathOf = (id: string) => this.session?.engine.pathOf(id);
 
 	private sentNames = "";
+	private namesAt = 0;
 	readonly namesChanged = debounce(() => void this.reportNames(), 1500, true);
+	/**
+	 * From the Worker's last names reply: undefined, it takes no reports about attachment versions (older than 0.2.0,
+	 * or not asked yet); false, it does, but a device seen lately can't read version-scoped chunks; true, both.
+	 */
+	private workerScoped: boolean | undefined;
 
 	/**
 	 * This device's name and the vault's, as Obsidian has them, for the owner's dashboard. Unlike the name next to
@@ -200,12 +206,14 @@ export default class OwnsyncPlugin extends Plugin {
 		const keys = this.session?.keys;
 		if (!keys) return;
 		const json = JSON.stringify({ device: shortId(keys.me.id), name: cleanName(this.settings.deviceName), vault: this.app.vault.getName() });
-		if (json === this.sentNames) return;
+		if (json === this.sentNames && Date.now() - this.namesAt < 60 * 60 * 1000) return; // and hourly, for `scoped`
 		const body = new Uint8Array([...(await keys.token()), ...new TextEncoder().encode(json)]);
 		const res = await requestUrl({ url: `${this.settings.host}/vault/${hex(keys.vaultId)}/names`, method: "POST", body: body.buffer, throw: false }).catch(() => null);
 		if (res?.status !== 200) return;
 		this.sentNames = json;
-		const reply = res.json as { latest?: unknown; worker?: unknown; names?: unknown };
+		this.namesAt = Date.now();
+		const reply = res.json as { latest?: unknown; worker?: unknown; names?: unknown; scoped?: unknown };
+		this.workerScoped = typeof reply.scoped === "boolean" ? reply.scoped : undefined;
 		this.deviceNames = deviceNames(reply.names);
 		this.offerUpdate(reply);
 	}
@@ -311,7 +319,10 @@ export default class OwnsyncPlugin extends Plugin {
 		const disk = new VaultDisk(this.app);
 		const engine = new Engine(store, disk, {
 			hash: async (text) => hex(await sha256(new TextEncoder().encode(text))),
-			chunkName: (data): Promise<string> => transport.chunkName(data),
+			chunkName: (data, scope): Promise<string> => transport.chunkName(data, scope),
+			versionTag: (u): Promise<string> => transport.versionTag(u),
+			reports: () => this.workerScoped !== undefined,
+			scoped: () => this.workerScoped === true,
 			newId: () => hex(randomBytes(8)),
 			maxFileSize: this.settings.maxFileMB * 2 ** 20,
 			attachments: this.settings.attachments,
@@ -607,6 +618,10 @@ class OwnsyncSettingTab extends PluginSettingTab {
 	private history(containerEl: HTMLElement): void {
 		const { plugin } = this;
 		new Setting(containerEl).setName("History").setHeading();
+		if (plugin.hasKey()) new Setting(containerEl)
+			.setName("Storage on your Worker")
+			.setDesc("Replaced and deleted attachments stay on your Worker until you remove them. Your dashboard shows how much, by month or year.")
+			.addButton((b) => b.setButtonText("Clean up storage…").onClick(async () => openDashboard(plugin, `cleanup/${hex(await vaultIdOf(plugin.settings.vaultId))}`)));
 		new Setting(containerEl)
 			.setName("Back up history to your Worker")
 			.setDesc("Encrypted copies of the notes you edit here, kept 30 days on your Worker. Each device has its own setting.")

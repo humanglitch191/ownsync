@@ -161,7 +161,10 @@ export class SetupModal extends Modal {
 	}
 }
 
-/** "Open dashboard": the server's front page, where the owner signs in with a passkey; "connect" starts adding a vault. */
-export function openDashboard(plugin: SetupHost, start?: "connect"): void {
+/**
+ * "Open dashboard": the server's front page, where the owner signs in with a passkey; "connect" starts adding a vault,
+ * "cleanup/<vault>" opens that vault's Clean up.
+ */
+export function openDashboard(plugin: SetupHost, start?: "connect" | `cleanup/${string}`): void {
 	window.open(`${trimHost(plugin.settings.host)}/${start ? `#${start}` : ""}`);
 }

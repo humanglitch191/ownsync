@@ -108,6 +108,17 @@ test("the setup key adds the first passkey: right key, in the window, once; stra
 	assert.equal((await call(`/api/vaults/${"0".repeat(32)}/devices/3FA9C2E1/label`, { label: "x" }, { cookie: session.cookie! })).status, 404);
 	await rename("  ");
 	assert.equal((await named()).label, "");
+	// Clean up, like every write here: the session and this site's own pages only; the vault checks the ranges.
+	const cleanup = (body: unknown, opts: { cookie: string; origin?: string } = { cookie: session.cookie! }) => call(`/api/vaults/${vault.id}/cleanup`, body, opts);
+	const lastYear = [Date.UTC(new Date().getUTCFullYear() - 1, 0, 1), Date.UTC(new Date().getUTCFullYear(), 0, 1)];
+	assert.equal((await cleanup({ ranges: [lastYear], zone: "UTC", months: 12 }, { cookie: "" })).status, 401);
+	assert.equal((await cleanup({ ranges: [lastYear], zone: "UTC", months: 12 }, { cookie: session.cookie!, origin: "https://evil.example" })).status, 403);
+	assert.equal((await call(`/api/vaults/${vault.id}/cleanup/sizes`, {}, { cookie: "" })).status, 401);
+	assert.deepEqual((await call(`/api/vaults/${vault.id}/cleanup/sizes`, {}, { cookie: session.cookie! })).body, []);
+	assert.deepEqual((await cleanup({ ranges: [lastYear], zone: "UTC", months: 12 })).body, { removed: 0, more: false });
+	const future = await cleanup({ ranges: [[lastYear[0], Date.now() + 1000]], zone: "UTC", months: 12 });
+	assert.deepEqual([future.status, future.body], [400, { error: "Only past periods can be cleaned up." }]);
+	assert.equal((await call(`/api/vaults/${"0".repeat(32)}/cleanup`, { ranges: [lastYear], zone: "UTC", months: 12 }, { cookie: session.cookie! })).status, 404);
 	vault.ws.close();
 	assert.equal((await call("/api/logout", {}, { cookie: session.cookie! })).status, 200);
 	assert.equal((await call("/api/overview", undefined, { cookie: session.cookie! })).status, 401);

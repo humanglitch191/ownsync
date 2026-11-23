@@ -5,7 +5,9 @@
 //      including text brought back by a restore unless deleted again,
 //      and every attachment content a user saved, unless a user who could see it replaced or deleted it,
 //   3. no piece of text or attachment content duplicated,
-//   4. no errors.
+//   4. no errors,
+//   5. and, with the owner cleaning up past history at random (DESIGN.md section 10), no live attachment's
+//      versions referring to a chunk the Worker doesn't hold.
 // Each piece of typed text is a unique token, which is what makes 2 and 3 checkable. An attachment's content
 // is random bytes around one token, split into several chunks.
 //
@@ -16,13 +18,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
-import type { NoteMeta } from "../src/core/ports";
-import { type Content, Device, Server, bytes, latin1, quiesce, rng } from "./sim";
+import type { NoteMeta, Ref } from "../src/core/ports";
+import { type Content, Device, SCOPED, Server, bytes, latin1, quiesce, rng } from "./sim";
 
 const POOL = ["a.md", "b.md", "c.md", "d.md", "x/e.md", "x/f.md", "x/y/g.md", "p.png", "q.bin", "x/r.png"];
 const isCopy = (path: string) => path.includes("(recovered ");
 const isNote = (path: string) => path.endsWith(".md");
 const NOTE_PATHS = POOL.filter(isNote);
+const DAY = 86_400_000;
 
 async function run(seed: number, steps: number): Promise<void> {
 	const random = rng(seed);
@@ -32,6 +35,10 @@ async function run(seed: number, steps: number): Promise<void> {
 	const pick = <T>(items: T[]): T | undefined => items[Math.floor(random() * items.length)];
 	const server = new Server();
 	const devs = [0, 1, 2].map((i) => new Device(`d${i}`, server, random));
+	// Version-scoped chunks and Clean up, except in the seeds kept from before them (their runs stay as they were).
+	// Days pass and the owner cleans up on a generator of their own, so the devices' moves stay those of the seed.
+	const storage = !FIXED.includes(seed), storageRandom = rng(seed ^ 0x2c1b3c6d);
+	if (storage) for (const d of devs) d.overrides = { ...SCOPED };
 	// Every third run, one device syncs notes only: its attachments stay its own, and it must not cost the
 	// others any of theirs.
 	const notesOnly = new Set(seed % 3 === 0 ? [devs[2]!] : []);
@@ -132,7 +139,11 @@ async function run(seed: number, steps: number): Promise<void> {
 			d.drain();
 			const deleted = await engine.deletedNotes();
 			const note = deleted[Math.floor(restoreRandom() * deleted.length)];
-			if (note && d.alive) {
+			if (note && d.alive && !isNote(note.path)) {
+				// An attachment: back only if the Worker still has its content, which takes a round trip.
+				log.push(`${d.name} restores attachment ${note.path} (${note.id.slice(0, 6)})`);
+				void engine.restoreAttachment(note.id);
+			} else if (note && d.alive) {
 				const target = restoreRandom() < 0.5 ? undefined : NOTE_PATHS[Math.floor(restoreRandom() * NOTE_PATHS.length)];
 				const path = isCopy(note.path) ? undefined : target; // as with renames, keep recovery copies named as copies
 				log.push(`${d.name} restores ${note.path}${path ? ` → ${path}` : ""} (${note.id.slice(0, 6)})`);
@@ -163,6 +174,23 @@ async function run(seed: number, steps: number): Promise<void> {
 		else if (r < 98) { log.push(`${d.name} crashes`); if (chance(0.5)) for (const id of d.editors.keys()) autosave(d, id); d.crash(); }
 		else { const fuse = 1 + Math.floor(random() * 12); log.push(`${d.name} will crash after ${fuse} calls`); d.crash(fuse); }
 
+		if (storage) {
+			server.clock++;
+			const s = storageRandom();
+			if (s < 0.02) {
+				// Over a day, whatever is online catches up, and sends its daily list.
+				log.push("a day passes; everything online catches up");
+				server.clock += DAY;
+				for (const x of devs) x.passTime(DAY);
+				await quiesce(devs);
+			} else if (s < 0.05) {
+				// Mostly everything past, as an owner would; sometimes a slice of it.
+				const all = storageRandom() < 0.7, to = all ? server.clock : Math.floor(storageRandom() * server.clock) + 1, from = all ? 0 : Math.floor(storageRandom() * to);
+				const retired = [...server.versions.values()].filter((v) => v.retiredAt !== null).length;
+				log.push(`the owner cleans up [${from}, ${to}): ${server.cleanUp(from, to)} chunks (${retired} of ${server.versions.size} versions retired, last list at ${server.listedAt})`);
+			}
+		}
+
 		for (const x of devs) await x.idle();
 		if (process.env.FUZZ_LOG) for (const x of devs) {
 			const st = x.data.get("index") as Uint8Array | undefined, probe = new Y.Doc();
@@ -185,6 +213,14 @@ async function run(seed: number, steps: number): Promise<void> {
 		d.connect();
 	}
 	await quiesce(devs);
+	// Two more days: every device sends its list (a device holding a version the Worker is missing chunks of puts
+	// them back), then connects again (a download that found them missing is tried again).
+	if (storage) for (let day = 0; day < 2; day++) {
+		log.push("a day passes");
+		server.clock += DAY;
+		for (const d of devs) { d.passTime(DAY); d.disconnect(); d.connect(); }
+		await quiesce(devs);
+	}
 
 	if (process.env.FUZZ_LOG) (await import("node:fs")).writeFileSync(process.env.FUZZ_LOG, log.join("\n") + "\n");
 	const fail = (message: string) => assert.fail(`${message}\nseed ${seed}, last steps:\n  ${log.slice(-40).join("\n  ")}`);
@@ -197,7 +233,21 @@ async function run(seed: number, steps: number): Promise<void> {
 		const own = tokensIn(d.files.get(p)!.content).every((t) => t.startsWith(`<${d.name}.`));
 		if (!own) fail(`${d.name} syncs notes only, but has ${p} from another device`);
 	}
-	for (const d of devs) if (d.problems.length) fail(`errors on ${d.name}:\n${d.problems.join("\n")}`);
+	// A download can find a version's chunks cleaned up (it came back, by a rename winning over a deletion, say)
+	// until a device that has the file puts them back: tried again, so not an error, as long as 5 holds at the end.
+	const expected = (p: string) => server.removed.size > 0 && p.includes("a chunk is missing on the server");
+	for (const d of devs) if (d.problems.some((p) => !expected(p))) fail(`errors on ${d.name}:\n${d.problems.filter((p) => !expected(p)).join("\n")}`);
+	for (const d of devs) {
+		if (notesOnly.has(d)) continue;
+		for (const [id, v] of d.storedIndex()) {
+			if (v.d !== undefined || isNote(v.p)) continue;
+			const doc = new Y.Doc(), state = d.data.get(`state:${id}`) as Uint8Array | undefined;
+			if (state) Y.applyUpdate(doc, state);
+			const refs = doc.getArray<Ref>("v").toArray(), gone = refs.flatMap((r) => r.c).filter((name) => !server.chunks.has(name));
+			doc.destroy();
+			if (gone.length) fail(`${d.name}: live attachment ${v.p} (${id.slice(0, 6)}, versions ${refs.map((r) => r.u.slice(0, 6)).join(", ")}) refers to chunks the Worker doesn't hold (${gone.filter((n) => server.removed.has(n)).length} of ${gone.length} cleaned up)`);
+		}
+	}
 	const sync = devs.map((d) => `${d.name}: cursor ${(d.data.get("meta") as { cursor: number } | undefined)?.cursor}, unsent ${[...d.data.keys()].filter((k) => k.startsWith("out:")).join(",") || "none"}, online ${d.online}`).join("; ");
 	const index = devs[0]!.storedIndex();
 	const indexes = [index, ...devs.slice(1).map((d) => d.storedIndex())].map((entries) => new Map([...entries].map(([id, v]) => [id.slice(0, 6), `${v.p}${v.d === undefined ? "" : " (deleted)"}`])));

@@ -28,15 +28,47 @@ export class Server {
 	rows: { seq: number; entry: Entry }[] = [];
 	head = 0;
 	chunks = new Map<string, Uint8Array>();
-	conns = new Map<Device, { up: ClientMsg[]; down: ServerMsg[]; live: boolean }>();
+	conns = new Map<Device, { up: ClientMsg[]; down: ServerMsg[]; live: boolean; listFrom?: number }>();
+	// Version-scoped chunks and Clean up, as the Worker keeps them (DESIGN.md section 10), on a clock the test moves.
+	clock = 1;
+	versions = new Map<string, { retiredAt: number | null; deleted: boolean }>();
+	versionChunks = new Map<string, string>(); // chunk name → its version's tag
+	lists = new Map<string, number>(); // device → when its latest full list of current versions began
+	seen = new Map<string, number>(); // device → when it was last connected
+	removed = new Set<string>(); // chunks Clean up removed
 
 	handle(from: Device, msg: ClientMsg): void {
 		const conn = this.conns.get(from);
 		if (!conn) return;
+		this.seen.set(from.name, this.clock);
 		const others = (m: ServerMsg) => { for (const [dev, c] of this.conns) if (dev !== from && c.live) c.down.push(m); };
-		if (msg.t === "put") {
+		if (msg.t === "put" && msg.tag) {
+			// A name is recorded under the tag only if this put stored it, or it is that tag's already.
+			const owner = this.versionChunks.get(msg.name), stored = owner === undefined ? !this.chunks.has(msg.name) : owner === msg.tag;
+			if (stored) {
+				if (!this.chunks.has(msg.name)) this.chunks.set(msg.name, msg.data.slice());
+				this.versionChunks.set(msg.name, msg.tag);
+				this.versions.set(msg.tag, { retiredAt: null, deleted: false });
+			}
+			conn.down.push({ t: stored ? "stored" : "missing", name: msg.name });
+		} else if (msg.t === "put") {
 			if (!this.chunks.has(msg.name)) this.chunks.set(msg.name, msg.data.slice());
 			conn.down.push({ t: "stored", name: msg.name });
+		} else if (msg.t === "mark") {
+			const missing: string[] = [];
+			if (msg.state === "current") conn.listFrom ??= this.clock;
+			for (const tag of msg.tags) {
+				const v = this.versions.get(tag);
+				if (msg.state === "current") {
+					if (v) Object.assign(v, { retiredAt: null, deleted: false });
+					if (this.missing(tag)) missing.push(tag);
+				} else if (v && v.retiredAt === null) Object.assign(v, { retiredAt: this.clock, deleted: msg.state === "deleted" });
+			}
+			if (msg.last) {
+				if (conn.live) this.lists.set(from.name, Math.max(this.lists.get(from.name) ?? 0, conn.listFrom ?? this.clock));
+				conn.listFrom = undefined;
+			}
+			conn.down.push({ t: "marked", id: msg.id, tags: missing });
 		} else if (msg.t === "get") {
 			const data = this.chunks.get(msg.name);
 			conn.down.push(data ? { t: "chunk", name: msg.name, data: data.slice() } : { t: "missing", name: msg.name });
@@ -54,13 +86,45 @@ export class Server {
 			conn.down.push({ t: "ack", id: msg.id, seq });
 			others({ t: "entry", seq, entry: msg.entry });
 		} else if (msg.t === "live") others({ t: "live", entry: msg.entry });
-		else if (msg.base <= this.head) {
+		else if (msg.t === "snapshot" && msg.base <= this.head) {
 			// The snapshot contains every entry of its document up to `base`: those can go.
 			this.rows = this.rows.filter((r) => !(r.entry.doc === msg.doc && r.seq <= msg.base));
 			this.rows.push({ seq: ++this.head, entry: { doc: msg.doc, kind: "snapshot", data: msg.data } });
 		}
 	}
+
+	private missing(tag: string): boolean {
+		for (const [name, t] of this.versionChunks) if (t === tag && !this.chunks.has(name)) return true;
+		return false;
+	}
+
+	/** Retirements before this are confirmed: every device seen in the last 30 days has listed what it holds current since. */
+	get listedAt(): number {
+		const recent = [...this.seen].filter(([, at]) => at >= this.clock - 30 * 86_400_000).map(([d]) => this.lists.get(d) ?? 0);
+		return recent.length ? Math.min(...recent) : Math.max(0, ...this.lists.values());
+	}
+
+	/** Clean up, as the Worker does it: chunks of versions retired in [from, to), before now, and confirmed. */
+	cleanUp(from: number, to: number): number {
+		if (to > this.clock) throw new Error("only the past can be cleaned up");
+		let n = 0;
+		for (const [name, tag] of this.versionChunks) {
+			const at = this.versions.get(tag)?.retiredAt ?? null;
+			if (at !== null && at >= from && at < to && at < this.listedAt && this.chunks.delete(name)) {
+				this.removed.add(name);
+				n++;
+			}
+		}
+		return n;
+	}
 }
+
+/** Engine options for devices that upload version-scoped chunks and report versions (Ownsync 0.2.0 on a 0.2.0 Worker). */
+export const SCOPED: Partial<EngineOptions> = {
+	versionTag: async (u) => `tag-${createHash("sha256").update(`version ${u}`).digest("hex").slice(0, 8)}`,
+	reports: () => true,
+	scoped: () => true,
+};
 
 export class Device {
 	files = new Map<string, { content: Content; mtime: number }>();
@@ -191,7 +255,7 @@ export class Device {
 		};
 		const engine = (this.engine = new Engine(store, disk, {
 			hash: async (text) => text, // exact, and readable in failures
-			chunkName: async (data) => createHash("sha256").update(data).digest("hex").slice(0, 12),
+			chunkName: async (data, scope) => createHash("sha256").update(scope ? `${scope.u} ${scope.i} ` : "").update(data).digest("hex").slice(0, 12),
 			chunkSize: 4, // so most attachments are several chunks
 			newId: () => Array.from({ length: 4 }, () => Math.floor(this.random() * 0x10000).toString(16).padStart(4, "0")).join(""),
 			random: this.random,
@@ -204,6 +268,11 @@ export class Device {
 		}));
 		this.trace?.(`${this.name} session client ${(engine as unknown as { clientId: number }).clientId}`);
 		void engine.start();
+	}
+
+	/** This device's clock moves on (a day, say), as its own `now` sees it. */
+	passTime(ms: number): void {
+		this.clock += ms;
 	}
 
 	/** Crash now, or after `fuse` more disk or database calls (in the middle of whatever it's doing then). */
@@ -231,7 +300,7 @@ export class Device {
 	pumpUp(): boolean {
 		const msg = this.server.conns.get(this)?.up.shift();
 		if (msg) {
-			this.trace?.(`${this.name} → server ${msg.t}${msg.t === "subscribe" ? ` after ${msg.after}` : msg.t === "snapshot" ? ` ${msg.doc.slice(0, 6)} base ${msg.base}` : "name" in msg ? ` ${msg.name}` : ` ${msg.entry.doc.slice(0, 6)}`}`);
+			this.trace?.(`${this.name} → server ${msg.t}${msg.t === "subscribe" ? ` after ${msg.after}` : msg.t === "snapshot" ? ` ${msg.doc.slice(0, 6)} base ${msg.base}` : msg.t === "mark" ? ` ${msg.state}${msg.last ? " last" : ""} ${msg.tags.length}` : "name" in msg ? ` ${msg.name}` : ` ${msg.entry.doc.slice(0, 6)}`}`);
 			this.server.handle(this, msg);
 		}
 		return !!msg;
