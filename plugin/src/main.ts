@@ -144,12 +144,12 @@ export default class OwnsyncPlugin extends Plugin {
 		// Phones have no status bar, so the status is also a command.
 		this.addCommand({ id: "show-status", name: "Show sync status", callback: () => say(this.describe(), 10000) });
 		// Phones suspend the app and drop its connection without telling it: reconnect when it comes back.
-		const wake = () => { if (document.visibilityState === "visible" && this.status === "offline") void this.session?.transport.connect().catch(() => {}); };
-		this.registerDomEvent(document, "visibilitychange", wake);
+		const wake = () => { if (activeDocument.visibilityState === "visible" && this.status === "offline") void this.session?.transport.connect().catch(() => {}); };
+		this.registerDomEvent(activeDocument, "visibilitychange", wake);
 		this.registerDomEvent(window, "online", wake);
 		// Presence (cursors, avatars) goes out only while Obsidian is in view: each frame wakes the vault's Durable Object.
 		const viewChanged = () => this.session?.editors.viewChanged();
-		this.registerDomEvent(document, "visibilitychange", viewChanged);
+		this.registerDomEvent(activeDocument, "visibilitychange", viewChanged);
 		this.registerDomEvent(window, "focus", viewChanged);
 		this.registerDomEvent(window, "blur", viewChanged);
 		installHistory(this, () => this.session && {
@@ -644,10 +644,9 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		modal.contentEl.createEl("p", { text: "This device stops syncing and forgets the vault's key. To sync it again, add it from another device. If this is your only device, the copy on your Worker can no longer be opened." });
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
-		buttons.createEl("button", { text: "Leave", cls: "mod-warning" }).addEventListener("click", async () => {
+		buttons.createEl("button", { text: "Leave", cls: "mod-warning" }).addEventListener("click", () => {
 			modal.close();
-			await this.plugin.leave();
-			this.display();
+			void this.plugin.leave().then(() => this.display());
 		});
 		modal.open();
 	}
@@ -708,15 +707,12 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		buttons.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
 		const del = buttons.createEl("button", { text: "Delete from Worker", cls: "mod-warning" });
 		del.disabled = true;
-		del.addEventListener("click", async () => {
+		del.addEventListener("click", () => {
 			modal.close();
-			try {
-				await plugin.deleteFromServer();
-				say("Ownsync: the vault was deleted from the Worker. Your notes stay on this device.", 10000);
-			} catch (err) {
-				say(`Ownsync: couldn't delete the vault: ${err instanceof Error ? err.message : String(err)}`, 10000);
-			}
-			this.display();
+			void plugin.deleteFromServer().then(
+				() => say("Ownsync: the vault was deleted from the Worker. Your notes stay on this device.", 10000),
+				(err: unknown) => say(`Ownsync: couldn't delete the vault: ${err instanceof Error ? err.message : String(err)}`, 10000),
+			).then(() => this.display());
 		});
 		modal.open();
 	}

@@ -203,7 +203,7 @@ class PairDeviceModal extends Modal {
 		if (joined) return void this.joined(joined);
 		if (Date.now() < this.expires) return this.countdown();
 		// Out of time, or nobody is looking: stop handing out codes until the user asks again.
-		if (Date.now() - this.opened >= SCREEN_MS || document.visibilityState !== "visible") return this.stopped();
+		if (Date.now() - this.opened >= SCREEN_MS || activeDocument.visibilityState !== "visible") return this.stopped();
 		this.expires = Infinity; // one renewal at a time
 		try {
 			const link = await createPairingLink(this.host, true);
