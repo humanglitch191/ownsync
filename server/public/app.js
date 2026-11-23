@@ -571,7 +571,7 @@ function review(v, rows, selected) {
 			h("div", { class: "k" }, "Stays"),
 			l("Every note", "as is", true), l("Current attachments", "as is", true),
 			kept.map((r) => l(`${r.label} history`, size(r.old + r.deleted), true))),
-		h("label", { class: "confirm" }, tick, h("span", {}, "I understand old versions from these years can’t be brought back.")),
+		h("label", { class: "confirm" }, tick, h("span", {}, "I understand old versions from these periods can’t be brought back.")),
 		go, h("button", { class: "btn", onclick: () => dialog.remove() }, "Cancel"), error);
 	dialog.addEventListener("close", () => dialog.remove()); // Esc
 	document.body.append(dialog);
