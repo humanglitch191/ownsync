@@ -117,7 +117,7 @@ a:hover { color: var(--ink); }
 .vp small { display: block; font-size: 12px; color: var(--muted); line-height: 16px; }
 .vp svg { margin-left: auto; color: var(--muted); flex: none; }
 .vmenu { position: absolute; left: 0; right: 0; top: calc(100% - 4px); z-index: 20; display: grid; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; min-width: 200px; }
-[hidden] { display: none !important; } /* a hidden element stays hidden, whatever its display (the setup-key box is a grid) */
+.keybox[hidden], .vmenu[hidden], .error[hidden] { display: none; } /* hidden stays hidden, whatever the class sets (the setup-key box is a grid) */
 .vmenu button { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 8px; border: 0; border-radius: 7px; background: none; text-align: left; color: var(--ink-2); }
 .vmenu button:hover { background: var(--hover); }
 .vmenu button.on { color: var(--ink); font-weight: 500; }
@@ -146,7 +146,7 @@ a:hover { color: var(--ink); }
 .split .old, .sw.old { background: repeating-linear-gradient(135deg, var(--c-old) 0 2px, transparent 2px 5px), var(--seg); }
 .sw { width: 9px; height: 9px; border-radius: 3px; display: inline-block; flex: none; }
 .legend { display: flex; gap: 28px; margin: 12px 0 30px; flex-wrap: wrap; }
-.legend div { display: grid; grid-template-columns: 9px auto; column-gap: 8px; align-items: baseline; font-size: 12.5px; color: var(--muted); }
+.legend div { display: grid; grid-template-columns: 9px auto; gap: 0 8px; align-items: baseline; font-size: 12.5px; color: var(--muted); }
 .legend b { grid-column: 2; font-weight: 500; color: var(--ink); font-size: 14px; }
 /* storage cards */
 .ch { display: flex; gap: 16px; align-items: flex-start; padding: 16px 18px 14px; }
