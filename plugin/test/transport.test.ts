@@ -79,9 +79,9 @@ test("notes sync between devices through the Worker: create, edit, rename, delet
 test("typing shows up live in the other device's editor, while the Worker stores it in batches", async () => {
 	const a = await device("a2", "vault-two", key, { pace: 1500 }), b = await device("b2", "vault-two");
 	await Promise.all([a.link.connect(), b.link.connect()]);
-	a.d.write("Live.md", "start");
-	await until([a.d, b.d], () => disk(b.d)["Live.md"] === "start");
-	const ea = (await a.d.engine!.open(a.d.engine!.noteAt("Live.md")!))!, eb = (await b.d.engine!.open(b.d.engine!.noteAt("Live.md")!))!;
+	a.d.write("Live typing.md", "start");
+	await until([a.d, b.d], () => disk(b.d)["Live typing.md"] === "start");
+	const ea = (await a.d.engine!.open(a.d.engine!.noteAt("Live typing.md")!))!, eb = (await b.d.engine!.open(b.d.engine!.noteAt("Live typing.md")!))!;
 	await new Promise((r) => setTimeout(r, 1600)); // let a's pacing window pass, so the burst below starts a fresh one
 	const cursor = () => (a.d.data.get("meta") as { cursor: number }).cursor;
 	const before = cursor(), started = Date.now();
@@ -305,7 +305,7 @@ test("version-scoped attachments through the Worker: real names, reports and lis
 });
 
 test("the Worker's storage holds no note text, attachment content, file names, folder names or vault names", () => {
-	for (const secret of ["launch on", "Tuesday", "Secret plan", "Projects", "word1", "text of note", "Note 1", "vault-one", "vault-three", "Live", "everyone sees", "removed device", "lost laptop", "after recovery", "vault-five", "Kim's laptop", "HOLIDAY-PIXELS", "Holiday", "beach", "vault-four", "vault-attach"]) {
+	for (const secret of ["launch on", "Tuesday", "Secret plan", "Projects", "word1", "text of note", "Note 1", "vault-one", "vault-three", "Live typing", "everyone sees", "removed device", "lost laptop", "after recovery", "vault-five", "Kim's laptop", "HOLIDAY-PIXELS", "Holiday", "beach", "vault-four", "vault-attach"]) {
 		let hits = "";
 		try { hits = execFileSync("grep", ["-rlaF", secret, dev.persistDir], { encoding: "utf8" }).trim(); }
 		catch (e) { if ((e as { status?: number }).status !== 1) throw e; } // 1 = no match

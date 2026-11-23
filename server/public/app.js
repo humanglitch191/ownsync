@@ -528,7 +528,7 @@ function storagePage(v, buckets) {
 			h("section", { class: "card" },
 				h("div", { class: "ch col" }, h("div", {}, h("h3", {}, "Clean up"), h("p", {}, "Old versions of attachments and attachments you deleted, by period. Notes and current attachments are never touched.")),
 					h("div", { class: "seg", role: "group", "aria-label": "Periods" }, VIEWS.map(([label, m]) => h("button", { class: m === months ? "on" : "", "aria-pressed": String(m === months), onclick: () => { months = m; void dashboard("storage"); } }, label)))),
-				list,
+				h("div", { class: "periods" }, list), // compact rows that scroll inside the card once there are many (months over years)
 				h("p", { class: "cnote" }, `The current ${view.toLowerCase()} can be cleaned up once it is over. Past periods only.`),
 				h("div", { class: "cf total" }, summary, remove)),
 			h("div", { class: "stack" },

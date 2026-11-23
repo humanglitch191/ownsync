@@ -170,7 +170,9 @@ a:hover { color: var(--ink); }
 .seg button { border: 0; border-right: 1px solid var(--line); background: none; padding: .3rem .8rem; font-size: 13px; color: var(--muted); }
 .seg button:last-child { border-right: 0; }
 .seg button.on { background: var(--sunk); color: var(--ink); font-weight: 500; }
-.period { display: grid; grid-template-columns: 18px 1fr auto; gap: 12px; align-items: start; padding: 13px 18px; border-top: 1px solid var(--line-2); }
+.periods { max-height: 336px; overflow-y: auto; overscroll-behavior: contain; border-top: 1px solid var(--line-2); }
+.periods .period:first-child { border-top: 0; }
+.period { display: grid; grid-template-columns: 18px 1fr auto; gap: 12px; align-items: start; padding: 10px 18px; border-top: 1px solid var(--line-2); }
 .period b { font-weight: 500; font-size: 14.5px; }
 .period .quiet { margin-top: 2px; font-size: 13px; }
 .period .size { font-weight: 500; font-size: 14.5px; }
