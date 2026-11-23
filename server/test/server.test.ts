@@ -630,7 +630,8 @@ test("vault snapshot retention keeps daily and ISO-weekly representatives and tr
 	};
 	assert.deepEqual(retainedAges(Array.from({ length: 45 }, (_, age) => row(age)).reverse()), [0, 1, 2, 3, 4, 5, 6, 11, 18, 25, 32]);
 	assert.deepEqual(retainedAges([row(0, 1, false), row(45), row(46)]), [0, 45]);
-	assert.deepEqual(retainedAges([0, 1, 2, 3, 4, 5, 6, 11, 18].map((age) => row(age, 50 * 1024 * 1024))), [0, 1, 2, 3, 4, 5, 6, 11]);
+	// Within the 150 MiB budget: three of the largest (50 MiB) snapshots, the newest first.
+	assert.deepEqual(retainedAges([0, 1, 2, 3, 4, 5, 6, 11, 18].map((age) => row(age, 50 * 1024 * 1024))), [0, 1, 2]);
 });
 
 test("deleting a vault takes its token; then its devices are told 4004, it can't be created again, and only a tombstone is left", async () => {

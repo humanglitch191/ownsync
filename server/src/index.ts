@@ -41,7 +41,7 @@ const SNAPSHOT_ID_BYTES = 16;
 const SNAPSHOT_PART_HEADER = SNAPSHOT_ID_BYTES + 4;
 const MAX_SNAPSHOT_PARTS = 512;
 const MAX_SNAPSHOT_ENVELOPE = 1024 * 1024 + 256; // a full 1 MiB part, sealed: its header, the envelope header and the tag (87 bytes today), with room to spare
-const MAX_SNAPSHOT = SNAPSHOT_BUDGET / 8;
+const MAX_SNAPSHOT = 50 * 1024 * 1024; // one snapshot; the vault keeps SNAPSHOT_BUDGET of them in all
 const SNAPSHOT_LEASE_MS = 60 * 60 * 1000;
 type VaultSnapshot = { id: number; day: number; parts: number; received: number; size: number };
 
