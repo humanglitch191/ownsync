@@ -98,8 +98,12 @@ export class Vault extends DurableObject<Env> {
 		const auth = exists ? this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0] : undefined;
 		this.token = auth ? toHex(auth.token_hash) : null;
 		this.deleted = exists && this.sql.exec("SELECT 1 FROM tombstone").toArray().length > 0;
-		const u = exists ? this.sql.exec<{ day: number; requests: number; rows: number; last_activity: number | null }>("SELECT day, requests, rows, last_activity FROM usage").toArray()[0] : undefined;
+		const u = exists ? this.sql.exec<{ day: number; requests: number; rows: number; last_activity: number | null; flushed_at: number }>("SELECT day, requests, rows, last_activity, flushed_at FROM usage").toArray()[0] : undefined;
 		this.usage = u ? { day: u.day, requests: u.requests, rows: u.rows, lastActivity: u.last_activity } : { day: today(), requests: 0, rows: 0, lastActivity: null };
+		// Waking from hibernation would forget when the counters were last written, and every wake wrote them again
+		// (2 rows each: most of a vault's rows when a device wakes it every few seconds). Counts between writes can be
+		// lost when it sleeps again; the dashboard's figures are near enough.
+		this.flushedAt = u?.flushed_at ?? 0;
 	}
 
 	private schema(): void {
@@ -125,6 +129,8 @@ export class Vault extends DurableObject<Env> {
 		`);
 		// Added in 0.1.2: a device's name, as Obsidian has it. Vaults made earlier get the column now.
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");
+		// Added in 0.2.0: when the usage counters were last written, so a wake from hibernation doesn't write them again.
+		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(usage)").toArray().some((c) => c.name === "flushed_at")) this.sql.exec("ALTER TABLE usage ADD COLUMN flushed_at INTEGER NOT NULL DEFAULT 0");
 	}
 
 	async fetch(req: Request): Promise<Response> {
@@ -549,7 +555,7 @@ export class Vault extends DurableObject<Env> {
 		this.flushedAt = Date.now();
 		const u = this.usage;
 		u.rows += 2; // these writes
-		this.sql.exec("INSERT OR REPLACE INTO usage (id, day, requests, rows, last_activity) VALUES (0, ?, ?, ?, ?)", u.day, u.requests, u.rows, u.lastActivity);
+		this.sql.exec("INSERT OR REPLACE INTO usage (id, day, requests, rows, last_activity, flushed_at) VALUES (0, ?, ?, ?, ?, ?)", u.day, u.requests, u.rows, u.lastActivity, this.flushedAt);
 		// The last two weeks, day by day, for the dashboard's activity bars.
 		this.sql.exec("INSERT OR REPLACE INTO usage_days (day, requests, rows) VALUES (?, ?, ?)", u.day, u.requests, u.rows);
 		this.sql.exec("DELETE FROM usage_days WHERE day <= ?", u.day - HISTORY_DAYS);
