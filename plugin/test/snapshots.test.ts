@@ -43,6 +43,7 @@ function fixture(mobile = false) {
 	let dropUploadAck: number | undefined;
 	let frozen = false;
 	let listStatus = 200;
+	let removed = "";
 	const deps: SnapshotDeps = {
 		host: "https://example.test/", vaultId, keys, mobile,
 		token: () => authToken(keys.vmk, vaultId),
@@ -67,7 +68,7 @@ function fixture(mobile = false) {
 			assert.deepEqual(bytes.subarray(0, 32), await deps.token());
 			if (suffix === "/list") {
 				assert.equal(bytes.length, 32);
-				return reply(rows, listStatus);
+				return { ...reply(rows, listStatus), headers: { "Ownsync-Removed": removed } };
 			}
 			if (suffix === "/delete") {
 				assert.ok(bytes.length === 32 || bytes.length === 48);
@@ -114,6 +115,7 @@ function fixture(mobile = false) {
 		expireUpload: () => { uploaded.clear(); rows = []; },
 		freeze: () => { frozen = true; },
 		setListStatus: (status: number) => { listStatus = status; },
+		setRemoved: (ids: string) => { removed = ids; },
 	};
 }
 
@@ -163,11 +165,31 @@ test("multipart upload records sealed hashes, opens out of order and removes bot
 	assert.deepEqual(await f.snapshots.open(info.id), {
 		id: info.id, day, takenAt, notesOnly: false, notes: [largeNote], attachments: [{ id: attachment.id, path: attachment.path }],
 	});
-	await f.snapshots.remove(info.id);
+	// The owner deletes it on the dashboard.
+	f.setRows([]);
+	f.setRemoved(info.id);
+	assert.deepEqual(await f.snapshots.list(), []);
 	assert.equal(f.ledger.size, 0);
 	assert.equal(await f.snapshots.takeIfDue(), "not due");
 	assert.equal(await createSnapshots(f.deps).takeIfDue(), "not due");
-	assert.deepEqual(await f.snapshots.list(), []);
+});
+
+test("a snapshot the Worker removed leaves the ledger, so today's is taken again; any other gap still shows as missing", async () => {
+	const f = fixture();
+	const entry: SnapshotLedgerEntry = { day, epoch: f.keys.epoch, parts: ["aa".repeat(32)], notesOnly: true, takenAt };
+	const lost = "34".repeat(16);
+	f.ledger.set(id, entry); // today's, from another device, deleted on the dashboard
+	f.ledger.set(lost, { ...entry, day: day - 1, takenAt: takenAt - 86_400_000 });
+	f.setRemoved(`${id},${"56".repeat(16)}`);
+	assert.equal(await f.snapshots.takeIfDue(), "taken");
+	assert.ok(!f.ledger.has(id));
+	const [fresh, missing] = await f.snapshots.list();
+	assert.ok(fresh?.verified && !fresh.missingOnServer);
+	assert.deepEqual([missing?.id, missing?.missingOnServer], [lost, true]);
+	// The Worker can't name one it still lists.
+	f.setRemoved(fresh.id);
+	assert.ok((await f.snapshots.list())[0]?.verified);
+	assert.equal(f.ledger.size, 2);
 });
 
 test("a lost acknowledgement retries the same ciphertext before recording the ledger", async () => {

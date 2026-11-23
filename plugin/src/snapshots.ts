@@ -153,7 +153,6 @@ export function createSnapshots(deps: SnapshotDeps): {
 	takeIfDue(): Promise<TakeResult>;
 	list(): Promise<SnapshotInfo[]>;
 	open(id: string): Promise<SnapshotContent>;
-	remove(id?: string): Promise<void>;
 } {
 	// A phone opens snapshots up to 96 MiB but takes them only up to 32 MiB: taking holds the notes, their JSON
 	// and its gzip at once.
@@ -204,7 +203,13 @@ export function createSnapshots(deps: SnapshotDeps): {
 		const response = await post("/list", allowed);
 		if (response?.status !== 200) return;
 		const rows = json(response.arrayBuffer);
-		if (Array.isArray(rows) && rows.every(workerRow)) return rows;
+		if (!Array.isArray(rows) || !rows.every(workerRow)) return;
+		// Snapshots the Worker removed (the owner, or its 30-day rules) leave the ledger; any other gap shows as missing.
+		const header = Object.entries(response.headers ?? {}).find(([name]) => name.toLowerCase() === "ownsync-removed")?.[1];
+		const ledger = header ? await deps.snapshotLedger() : undefined;
+		const removed = header?.split(",").filter((id) => ledger?.has(id) && !rows.some((row) => row.id === id)) ?? [];
+		if (removed.length) await deps.forgetSnapshots(removed);
+		return rows;
 	}
 
 	// Its own function, so the notes and their JSON are gone before the upload starts.
@@ -345,8 +350,8 @@ export function createSnapshots(deps: SnapshotDeps): {
 		takeIfDue: () => mutate(() => take().catch((error: unknown) => error instanceof RangeError ? "too large" : "unavailable")),
 		async list(): Promise<SnapshotInfo[]> {
 			const epoch = keys.epoch;
-			const ledger = await deps.snapshotLedger();
 			const rows = await workerList(() => active(epoch));
+			const ledger = await deps.snapshotLedger();
 			const snapshots = new Map<string, SnapshotInfo>();
 			for (const row of rows ?? []) {
 				const entry = ledger.get(row.id);
@@ -385,13 +390,5 @@ export function createSnapshots(deps: SnapshotDeps): {
 			return { id, day, takenAt, notesOnly, notes: notes.map(({ id, path, text }) => ({ id, path, text })),
 				attachments: attachments.map(({ id, path }) => ({ id, path })) };
 		},
-		remove: (id) => mutate(async () => {
-			if (id !== undefined && !isId(id)) throw new Error("invalid snapshot ID");
-			const epoch = keys.epoch;
-			const response = await post("/delete", () => active(epoch), ...(id === undefined ? [] : [unhex(id)]));
-			if (response?.status !== 200) throw new Error("could not delete snapshot from Worker");
-			if (id === undefined || id === pending?.id) pending = undefined;
-			await deps.forgetSnapshots(id === undefined ? undefined : [id]);
-		}),
 	};
 }

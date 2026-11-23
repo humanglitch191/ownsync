@@ -21,7 +21,7 @@ export interface HistoryBackupDeps {
 		setTimer(callback: () => void, delay: number): () => void;
 	};
 	requestUrl(request: { url: string; method: "POST"; body: ArrayBuffer; contentType: string; throw: false }):
-		Promise<{ status: number; arrayBuffer: ArrayBuffer }>;
+		Promise<{ status: number; arrayBuffer: ArrayBuffer; headers?: Record<string, string> }>;
 }
 
 export interface HistoryBackupCopy {
@@ -54,7 +54,7 @@ const backupTiming: NonNullable<HistoryBackupDeps["timing"]> = {
 
 interface DelayedChange {
 	due: number;
-	noteId: string | undefined;
+	noteId: string;
 	upload: boolean;
 	start(): void;
 	cancel(): void;
@@ -113,7 +113,7 @@ export function createHistoryBackup(deps: HistoryBackupDeps) {
 		armTimer();
 	}
 
-	function later<T>(due: number, noteId: string | undefined, upload: boolean, change: () => Promise<T>, skipped: T): Promise<T> {
+	function later<T>(due: number, noteId: string, upload: boolean, change: () => Promise<T>, skipped: T): Promise<T> {
 		if (due <= timing.now()) {
 			drain(timing.now());
 			return mutate(change);
@@ -124,16 +124,15 @@ export function createHistoryBackup(deps: HistoryBackupDeps) {
 		});
 	}
 
-	function clear(noteId?: string): Promise<boolean> {
+	function clear(noteId: string): Promise<boolean> {
 		if (stopping) return Promise.resolve(false);
 		// Keep the random deadlines. A clear waits only for delayed changes it would clear.
 		const due = delayed.reduce((latest, change) =>
-			noteId === undefined || change.noteId === undefined || change.noteId === noteId ? Math.max(latest, change.due) : latest, timing.now());
+			change.noteId === noteId ? Math.max(latest, change.due) : latest, timing.now());
 		return later(due, noteId, false, async () => {
 			const epoch = keys.epoch;
 			const allowed = () => active(epoch);
 			if (!allowed()) return false;
-			if (noteId === undefined) return !!await post("/clear", allowed);
 			const tags = (await deps.allDocTags?.(noteId)) ?? [await deps.docTag(noteId)];
 			let ok = true;
 			for (const tag of tags) ok = !!(await post("/clear", allowed, tag)) && ok;
@@ -166,7 +165,7 @@ export function createHistoryBackup(deps: HistoryBackupDeps) {
 			const randomDue = timing.now() + 30_000 + Math.floor(timing.random() * 270_001);
 			// A new copy may share a deadline with a pending clear, after the clear itself.
 			const due = delayed.reduce((latest, change) =>
-				!change.upload && (change.noteId === undefined || change.noteId === noteId) ? Math.max(latest, change.due) : latest, randomDue);
+				!change.upload && change.noteId === noteId ? Math.max(latest, change.due) : latest, randomDue);
 			return later(due, noteId, true, async () => {
 				const { epoch, vmk } = keys;
 				const allowed = () => enabled() && revision === atEnqueue && active(epoch);
@@ -203,7 +202,5 @@ export function createHistoryBackup(deps: HistoryBackupDeps) {
 		},
 		/** Clear the current tag for one note. Returns true when the Worker acknowledges. */
 		forget: (noteId: string) => noteId ? clear(noteId) : Promise.resolve(false),
-		/** Clear the vault's backups. Returns true when the Worker acknowledges. */
-		forgetAll: () => clear(),
 	};
 }

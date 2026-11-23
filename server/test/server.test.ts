@@ -608,6 +608,30 @@ test("snapshot leases renew on accepted parts, and expired uploads must restart"
 	}
 });
 
+test("the snapshot list names snapshots removed in the last 30 days", async () => {
+	const { v, tok, a, db } = await snapshotVaultWithDb();
+	try {
+		const removed = async () => (await snapshotPost(v, "snapshot/list", tok)).headers.get("ownsync-removed")?.split(",").filter(Boolean).sort();
+		const id = (n: number) => Buffer.from(doc(n)).toString("hex");
+		assert.deepEqual(await removed(), []);
+		assert.equal((await snapshotPost(v, "snapshot", tok, snapshotPart(doc(1), 0, 1, Uint8Array.of(1)))).status, 200);
+		// One the 30-day rule expires is named too.
+		const today = Math.floor(Date.now() / 86_400_000);
+		const insert = db.prepare("INSERT INTO snapshots (snapshot, day, at, epoch, parts, received, size) VALUES (?, ?, ?, 0, 1, 1, 1)");
+		insert.run(doc(2), today - 1, Date.now());
+		insert.run(doc(3), today - 31, Date.now());
+		assert.deepEqual(await removed(), [id(3)]);
+		assert.equal((await snapshotPost(v, "snapshot/delete", tok)).status, 200);
+		assert.deepEqual(await removed(), [id(1), id(2), id(3)]);
+		db.prepare("UPDATE removed_snapshots SET at = ? WHERE snapshot = ?").run(Date.now() - 30 * 86_400_000, doc(3));
+		assert.deepEqual(await removed(), [id(1), id(2)]);
+		assert.equal(db.prepare("SELECT count(*) AS n FROM removed_snapshots").get()?.n, 2);
+	} finally {
+		db.close();
+		a.ws.close();
+	}
+});
+
 test("a snapshot part prunes old complete rows for space or is refused without erasing uploads", async () => {
 	const { v, tok, a, db } = await snapshotVaultWithDb();
 	try {

@@ -144,22 +144,21 @@ test("the upload and clear calls use the binary Worker contract and preserve mut
 	const backup = createHistoryBackup(deps);
 	assert.equal(backup.supported(), undefined);
 	assert.equal(backup.noteIdForPath(path), note);
-	const operations = Promise.all([backup.upload(note, "text", 123), backup.forget(note), backup.forgetAll()]);
+	const operations = Promise.all([backup.upload(note, "text", 123), backup.forget(note)]);
 	clock.advance(30_000);
-	assert.deepEqual(await operations, [undefined, true, true]);
+	assert.deepEqual(await operations, [undefined, true]);
 	const oversized = backup.upload(note, "x".repeat(1024 * 1024), 123);
 	clock.advance(30_000);
 	await oversized;
 	await backup.list(note);
 	const base = `https://example.test/vault/${hex(vaultId)}/history`;
-	assert.deepEqual(calls.map((call) => call.url), [base, base + "/clear", base + "/clear", base + "/list"]);
+	assert.deepEqual(calls.map((call) => call.url), [base, base + "/clear", base + "/list"]);
 	assert.ok(calls.every((call) => call.method === "POST" && call.contentType === "application/octet-stream" && !call.throw));
-	const [upload, clearOne, clearAll, list] = calls.map((call) => new Uint8Array(call.body));
+	const [upload, clearOne, list] = calls.map((call) => new Uint8Array(call.body));
 	const token = await deps.token();
 	const tag = await deps.docTag(note);
 	assert.deepEqual(upload!.subarray(0, 48), concat(token, tag));
 	assert.deepEqual(clearOne, concat(token, tag));
-	assert.deepEqual(clearAll, token);
 	assert.deepEqual(list, concat(token, tag));
 	const opened = await openEnvelope(upload!.subarray(48), vaultId, tag, (e) => e === keys.epoch ? keys.vmk : undefined);
 	assert.equal(opened.kind, KIND.history);
@@ -167,7 +166,7 @@ test("the upload and clear calls use the binary Worker contract and preserve mut
 	deps.docTag = async () => new Uint8Array(0);
 	assert.equal(await backup.forget(note), false);
 	assert.equal(await backup.forget(backup.noteIdForPath("Missing.md")!), false);
-	assert.equal(calls.length, 4);
+	assert.equal(calls.length, 3);
 });
 
 test("404, 401 and 410 disable the session while a transient error allows another request", async () => {
@@ -183,7 +182,6 @@ test("404, 401 and 410 disable the session while a transient error allows anothe
 		assert.equal(backup.supported(), false);
 		await backup.upload(note, "text", 1);
 		assert.equal(await backup.forget(note), false);
-		assert.equal(await backup.forgetAll(), false);
 		assert.equal(requests, 1);
 	}
 	const { deps } = fixture();
@@ -192,7 +190,7 @@ test("404, 401 and 410 disable the session while a transient error allows anothe
 	assert.deepEqual(await backup.list(note), []);
 	assert.equal(backup.supported(), undefined);
 	deps.requestUrl = async () => ({ status: 200, arrayBuffer: new ArrayBuffer(0) });
-	assert.equal(await backup.forgetAll(), true);
+	assert.equal(await backup.forget(note), true);
 	assert.equal(backup.supported(), true);
 });
 
@@ -280,7 +278,7 @@ test("session stop drops delayed uploads, finishes pending clears and leaves no 
 	assert.equal(clock.next(), Infinity);
 });
 
-test("switching backups off cancels queued uploads, stops lists and still permits a vault-wide clear", async () => {
+test("switching backups off cancels queued uploads, stops lists and still permits a clear", async () => {
 	const { deps, clock } = fixture();
 	let enabled = true;
 	deps.enabled = () => enabled;
@@ -299,7 +297,7 @@ test("switching backups off cancels queued uploads, stops lists and still permit
 	assert.deepEqual(await backup.list(note), []);
 	await backup.upload(note, "disabled", 2);
 	assert.equal(clock.next(), Infinity);
-	assert.equal(await backup.forgetAll(), true);
+	assert.equal(await backup.forget(note), true);
 	enabled = true;
 	clock.advance(300_000);
 	assert.equal(calls.length, 1);

@@ -5,7 +5,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { Dashboard, VERSION, type VaultRpc, type VaultSettings, type VaultStats } from "./dashboard";
-import { SNAPSHOT_BUDGET, snapshotsToPrune } from "./snapshots";
+import { SNAPSHOT_BUDGET, SNAPSHOT_DAYS, snapshotsToPrune } from "./snapshots";
 import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_ENVELOPE, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
 
 interface Env {
@@ -125,6 +125,7 @@ export class Vault extends DurableObject<Env> {
 			CREATE INDEX IF NOT EXISTS history_doc ON history (doc, at);
 			CREATE INDEX IF NOT EXISTS history_at ON history (at);
 			CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, snapshot BLOB NOT NULL UNIQUE, day INTEGER NOT NULL UNIQUE, at INTEGER NOT NULL, epoch INTEGER NOT NULL, parts INTEGER NOT NULL, received INTEGER NOT NULL, size INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS removed_snapshots (snapshot BLOB PRIMARY KEY, at INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS snapshot_parts (snapshot BLOB NOT NULL REFERENCES snapshots(snapshot) ON DELETE CASCADE, part INTEGER NOT NULL, count INTEGER NOT NULL, day INTEGER NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL, envelope BLOB NOT NULL, PRIMARY KEY (snapshot, part));
 			CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, last_online INTEGER NOT NULL, version TEXT NOT NULL, conflicts INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY CHECK (id = 0), day INTEGER NOT NULL, requests INTEGER NOT NULL, rows INTEGER NOT NULL, last_activity INTEGER);
@@ -279,11 +280,21 @@ export class Vault extends DurableObject<Env> {
 		return dropped;
 	}
 
+	// Every snapshot delete goes through here. The list names what was removed for 30 days, so devices drop it from
+	// their ledger and only a snapshot gone some other way shows as missing (DESIGN.md section 9).
+	private dropSnapshots(now: number, where: string, ...args: unknown[]): void {
+		const cursor = this.sql.exec<{ snapshot: ArrayBuffer }>(`DELETE FROM snapshots ${where} RETURNING snapshot`, ...args);
+		const removed = cursor.toArray();
+		this.count(0, cursor.rowsWritten);
+		for (const { snapshot } of removed) this.write("INSERT OR REPLACE INTO removed_snapshots (snapshot, at) VALUES (?, ?)", snapshot, now);
+	}
+
 	private expireSnapshots(now: number): void {
-		this.write("DELETE FROM snapshots WHERE received < parts AND at <= ?", now - SNAPSHOT_LEASE_MS);
+		this.write("DELETE FROM removed_snapshots WHERE at <= ?", now - SNAPSHOT_DAYS * DAY_MS);
+		this.dropSnapshots(now, "WHERE received < parts AND at <= ?", now - SNAPSHOT_LEASE_MS);
 		// The last 30 days, even when no device uploads any more.
 		const rows = this.sql.exec<{ id: number; day: number; size: number; complete: number }>("SELECT id, day, size, received = parts AS complete FROM snapshots").toArray();
-		for (const row of snapshotsToPrune(rows, Math.floor(now / DAY_MS))) this.write("DELETE FROM snapshots WHERE id = ?", row.id);
+		for (const row of snapshotsToPrune(rows, Math.floor(now / DAY_MS))) this.dropSnapshots(now, "WHERE id = ?", row.id);
 	}
 
 	private snapshot(operation: string | undefined, body: Uint8Array, now = Date.now()): Response {
@@ -294,15 +305,17 @@ export class Vault extends DurableObject<Env> {
 			const rows = this.sql.exec<{ id: string; day: number; epoch: number; parts: number; received: number; size: number; complete: number; at: number }>(
 				"SELECT lower(hex(snapshot)) AS id, day, epoch, parts, received, size, received = parts AS complete, at FROM snapshots ORDER BY day DESC",
 			).toArray();
-			return Response.json(rows.map((row) => ({ ...row, complete: !!row.complete })));
+			// In a header, so a 0.2.1 device reads the list as before; 200 IDs keep it small.
+			const removed = this.sql.exec<{ id: string }>("SELECT lower(hex(snapshot)) AS id FROM removed_snapshots ORDER BY at DESC LIMIT 200").toArray();
+			return Response.json(rows.map((row) => ({ ...row, complete: !!row.complete })), { headers: { "ownsync-removed": removed.map((r) => r.id).join(",") } });
 		}
 		if (operation === "delete" && body.length === 0) {
-			this.write("DELETE FROM snapshots");
+			this.dropSnapshots(now, "");
 			return Response.json({ ok: true });
 		}
 		if (body.length !== SNAPSHOT_ID_BYTES) return Response.json({ error: "bad snapshot ID" }, { status: 400 });
 		if (operation === "delete") {
-			this.write("DELETE FROM snapshots WHERE snapshot = ?", body);
+			this.dropSnapshots(now, "WHERE snapshot = ?", body);
 			return Response.json({ ok: true });
 		}
 		const saved = this.storedSnapshot(body);
@@ -356,7 +369,7 @@ export class Vault extends DurableObject<Env> {
 			}
 		}
 		this.ctx.storage.transactionSync(() => {
-			for (const row of prune) this.write("DELETE FROM snapshots WHERE id = ?", row.id);
+			for (const row of prune) this.dropSnapshots(now, "WHERE id = ?", row.id);
 			if (saved) {
 				this.write("UPDATE snapshots SET received = ?, size = ?, at = ? WHERE id = ?", received, size, now, saved.id);
 			} else {
@@ -687,7 +700,7 @@ export class Vault extends DurableObject<Env> {
 	/** Delete all vault snapshots on the dashboard, as a device's snapshot/delete with no ID does. */
 	async clearSnapshots(): Promise<{ ok: true } | { error: string }> {
 		if (this.token === null || this.deleted) return { error: "no such vault" };
-		this.write("DELETE FROM snapshots");
+		this.dropSnapshots(Date.now(), "");
 		return { ok: true };
 	}
 
@@ -719,7 +732,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async erase(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists", "settings"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "removed_snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists", "settings"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;

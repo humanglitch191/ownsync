@@ -167,7 +167,7 @@ The Worker keeps seven UTC days and the newest snapshot in each of the four ISO 
 
 The synced index determines which snapshots a device can open. The Worker can supply ciphertext and report availability. Devices verify each envelope against the ledger before decrypting it, including when using an older key from the key ring. After validating every part and the bounded gzip stream, the plugin checks all file paths against the vault's path rules. The snapshot client exposes note text and attachment paths to the caller. File restores are handled by the caller.
 
-The list shows ledger entries whose data is absent from the Worker. Removing a snapshot asks the Worker to delete it and then removes the ledger entry. Upload and deletion are serialized within each vault session.
+The list shows ledger entries whose data is absent from the Worker. With its list, the Worker names the snapshots it removed in the last 30 days (on the dashboard, by a device, or by the rules above), and devices drop those from the ledger, so only a snapshot gone some other way shows as missing. Upload and deletion are serialized within each vault session.
 
 **Per vault (0.2.2).** Daily snapshots are on, off or not chosen yet per vault, like history backup (section 8), and the plugin no longer offers them. Not chosen: the Worker takes uploads as before and each device follows its own 0.2.x setting (off for a new device); a device whose own setting was on turns the vault's on once it is caught up, but never a value the owner chose. Off: the Worker refuses uploads; the snapshots it has expire by the rules above. A 0.2.1 device still uses its own setting (and its offer) until it is updated; once the vault's is off, the Worker refuses its uploads too.
 

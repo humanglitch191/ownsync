@@ -156,6 +156,8 @@ test("the setup key adds the first passkey: right key, in the window, once; stra
 	assert.deepEqual([await history(vault), await history(other), await snapshots(vault)], [[], [0, 0, 0, 1, 9], 1]);
 	assert.deepEqual((await call(`/api/vaults/${vault.id}/snapshots/clear`, {}, { cookie: session.cookie! })).body, { ok: true });
 	assert.deepEqual([await snapshots(vault), await snapshots(other), await history(other)], [0, 1, [0, 0, 0, 1, 9]]);
+	// Its devices are told which ones went, so their ledgers don't show them as missing.
+	assert.deepEqual(await Promise.all([vault, other].map(async (v) => (await post(v, "snapshot/list")).headers.get("ownsync-removed"))), ["02".repeat(16), ""]);
 	other.ws.close();
 	vault.ws.close();
 	assert.equal((await call("/api/logout", {}, { cookie: session.cookie! })).status, 200);
