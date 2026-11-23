@@ -633,3 +633,117 @@ test("a device that syncs notes only leaves attachments alone, then catches up w
 	assert.deepEqual(disk(a!), disk(b!));
 	noProblems([a!, b!]);
 });
+
+// A note open in an editor whose typing is on record, and whose editor saved an older version last: the file
+// holds nothing the document lacks, so a crash (a phone killing the app, say) must not leave a recovery copy.
+async function typedAheadOfSave(b: Device, id: string) {
+	const eb = (await b.engine!.open(id))!, t = eb.getText("t");
+	t.insert(t.length, " This is test content");
+	await b.idle();
+	b.write(b.pathOf(id)!, t.toString()); // the editor saves
+	t.insert(t.length, " hhh"); // and the user types on before the engine handles that save
+	await b.idle();
+	b.drain();
+	await b.idle();
+	return eb;
+}
+const copies = (d: Device) => [...d.files.keys()].filter((p) => p.includes("(recovered "));
+
+test("a crash with a note open whose typing is on record leaves no recovery copy", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "hello");
+	await quiesce([a!, b!]);
+	await typedAheadOfSave(b!, b!.engine!.noteAt("Note.md")!);
+	await quiesce([a!, b!]);
+	b!.crash();
+	b!.boot();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "Note.md": "hello This is test content hhh" });
+	assert.deepEqual(disk(a!), disk(b!));
+	noProblems([a!, b!]);
+});
+
+test("a note deleted elsewhere while open here, its typing synced, stays deleted with no copy, even if this app was killed", async () => {
+	for (const killed of [false, true]) {
+		const { devs: [a, b] } = world();
+		a!.write("Note.md", "hello");
+		await quiesce([a!, b!]);
+		await typedAheadOfSave(b!, b!.engine!.noteAt("Note.md")!);
+		await quiesce([a!, b!]);
+		if (killed) b!.crash();
+		a!.remove("Note.md");
+		await quiesce([a!, b!]);
+		if (killed) { b!.boot(); b!.connect(); }
+		await quiesce([a!, b!]);
+		assert.deepEqual(disk(b!), {}, `killed: ${killed}`);
+		assert.deepEqual(disk(a!), {}, `killed: ${killed}`);
+		noProblems([a!, b!]);
+	}
+});
+
+test("a note deleted elsewhere while open here with typing that never left this device keeps that typing", async () => {
+	for (const killed of [false, true]) {
+		const { devs: [a, b] } = world();
+		a!.write("Note.md", "hello");
+		await quiesce([a!, b!]);
+		b!.disconnect();
+		const id = b!.engine!.noteAt("Note.md")!, eb = await typedAheadOfSave(b!, id);
+		if (killed) b!.crash();
+		a!.remove("Note.md");
+		await quiesce([a!, b!]);
+		if (killed) b!.boot();
+		b!.connect();
+		await quiesce([a!, b!]);
+		if (!killed) { // the editor saves what it shows, and closes
+			b!.write(b!.pathOf(id)!, eb.getText("t").toString());
+			await b!.engine!.close(id);
+			await quiesce([a!, b!]);
+		}
+		const all = Object.values(disk(b!)).join(" ");
+		assert.ok(all.includes("This is test content") && all.includes("hhh"), `killed: ${killed}: ${JSON.stringify(disk(b!))}`);
+		assert.deepEqual(disk(a!), disk(b!));
+		noProblems([a!, b!]);
+	}
+});
+
+test("text that reached a crashed note's file only, and a recovery copy then open and killed, make one copy, not a copy of a copy", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "hello");
+	await quiesce([a!, b!]);
+	const id = b!.engine!.noteAt("Note.md")!;
+	const eb = (await b!.engine!.open(id))!;
+	eb.getText("t").insert(5, " world");
+	await quiesce([a!, b!]);
+	b!.crash();
+	b!.write("Note.md", "hello gghjjhuu"); // typed with the app down: only the file has it
+	b!.boot();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "Note.md": "hello world", [`Note (recovered ${id.slice(0, 6)}).md`]: "hello gghjjhuu" });
+	// The copy is opened, typed in, and the app is killed again.
+	await typedAheadOfSave(b!, b!.engine!.noteAt(copies(b!)[0]!)!);
+	await quiesce([a!, b!]);
+	b!.crash();
+	b!.boot();
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(copies(b!), [`Note (recovered ${id.slice(0, 6)}).md`]);
+	assert.equal(disk(b!)[copies(b!)[0]!], "hello gghjjhuu This is test content hhh");
+	assert.deepEqual(disk(a!), disk(b!));
+	noProblems([a!, b!]);
+});
+
+test("an editor closed before saving its last typing leaves no recovery copy", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "one\ntwo\nthree\nfour");
+	await quiesce([a!, b!]);
+	const id = b!.engine!.noteAt("Note.md")!, eb = (await b!.engine!.open(id))!;
+	eb.getText("t").insert(eb.getText("t").length, " more");
+	await quiesce([a!, b!]);
+	await b!.engine!.close(id); // the editor's last save is still the version it opened
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(b!), { "Note.md": "one\ntwo\nthree\nfour more" });
+	assert.deepEqual(disk(a!), disk(b!));
+	noProblems([a!, b!]);
+});

@@ -123,6 +123,21 @@ function units(text: string): Set<string> {
 	return new Set(lines.length >= 4 ? lines : text.split(/\s+/).filter(Boolean));
 }
 /**
+ * Whether `text` is `older` with things typed into it: each word of `older`, in order, is in a word of `text`
+ * (letters may have been typed into a word since). Whitespace alone is not compared.
+ */
+function grewFrom(older: string, text: string): boolean {
+	const words = text.split(/\s+/);
+	const inWord = (w: string, x: string) => { let i = 0; for (const c of x) if (c === w[i]) i++; return i === w.length; };
+	let j = 0;
+	for (const w of older.split(/\s+/)) {
+		if (!w) continue;
+		while (j < words.length && !inWord(w, words[j]!)) j++;
+		if (j++ === words.length) return false;
+	}
+	return true;
+}
+/**
  * How much of the smaller text is in the larger one: a note that grew or shrank a lot is still the same note.
  * (A small note matching a big unrelated file is harmless: it would otherwise have counted as deleted.)
  * The share of the larger text breaks ties, so an exact copy beats a superset.
@@ -1238,8 +1253,9 @@ export class Engine {
 			// After a crash, an editor's save newer than the last agreement might hold typing that was never
 			// recorded. And after an editor closed, the file counts as its last save, but one holding text the
 			// document never had was edited from outside since. Either is about to be overwritten: keep it as its own note.
-			const doc = units(text), outside = mode === "doc" && [...units(current)].some((u) => !doc.has(u));
-			if ((mode === "recover" && (await this.opts.hash(current)) !== m.baseHash) || outside) await this.keepCopy(want, id, current);
+			// A save the document has only typed past holds nothing new. (The agreed hash can't say: an editor's save that the
+			// document had already moved past when it was taken in never updates it.)
+			if (mode !== "merge" && !grewFrom(current, text) && (mode === "doc" || (await this.opts.hash(current)) !== m.baseHash)) await this.keepCopy(want, id, current);
 		} else if (m.diskPath !== want) {
 			if (!(await this.vacate(want, id))) return this.deferred.has(id) || "blocked"; // waiting, or places shifted: look again
 			if (m.diskPath === want) return true; // the file there turned out to be this note
