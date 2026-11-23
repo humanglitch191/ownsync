@@ -542,7 +542,7 @@ class HistoryModal extends Modal {
 			if (rows.length) status.remove();
 			else {
 				if (lead) lead.remove();
-				status.setText(`No deleted notes. Notes you delete show up here for 30 days${engine ? ", on every device" : ""}.`);
+				status.setText(`No deleted notes. Notes and attachments you delete show up here for 30 days${engine ? ", on every device" : ""}.`);
 			}
 		} catch {
 			if (!this.showing) return;

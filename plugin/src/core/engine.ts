@@ -348,8 +348,8 @@ export class Engine {
 	}
 
 	/**
-	 * Deleted notes this device can preview, those of the last 30 days, and deleted attachments (unless it syncs notes
-	 * only) until Clean up has removed their file, however old; most recent first, at most 200. Texts are read one at a
+	 * Deleted notes and attachments (unless it syncs notes only) of the last 30 days that this device can preview, less
+	 * attachments whose file Clean up removed; most recent first, at most 200. Texts are read one at a
 	 * time with `deletedText`, so a phone never decodes them all at once.
 	 */
 	async deletedNotes(): Promise<DeletedNote[]> {
@@ -359,7 +359,7 @@ export class Engine {
 			for (const [id, v] of this.notes) {
 				if (v.d === undefined || (this.notesOnly && !isNote(v.p))) continue;
 				const deletedAt = Number.isSafeInteger(v.t) ? v.t : undefined;
-				if (!isNote(v.p) || deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
+				if (deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
 			}
 			candidates.sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity));
 		});

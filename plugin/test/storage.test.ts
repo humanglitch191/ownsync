@@ -115,7 +115,7 @@ async function listed(d: Device, devs: Device[]): Promise<string[]> {
 	return (await list).map((n) => n.path).sort();
 }
 
-test("a deleted attachment is listed until its content is cleaned up, then isn't restored; one still stored is, however old", async () => {
+test("a deleted attachment is listed for 30 days unless its content is cleaned up, which it then isn't restored from; one still stored is", async () => {
 	const { server, devs } = world();
 	const [a, b] = devs as [Device, Device];
 	a.write("p.png", bytes(PIC));
@@ -141,17 +141,19 @@ test("a deleted attachment is listed until its content is cleaned up, then isn't
 	// The check made its version current on the Worker for a moment: it is retired again.
 	assert.ok([...server.versions.values()].every((v) => v.retiredAt !== null));
 
-	await nextDay(server, devs, devs, 40); // no 30-day limit for attachments: listed while stored
-	assert.deepEqual(await listed(b, devs), ["q.png"]);
+	b.disconnect();
+	assert.deepEqual(await listed(b, []), ["p.png", "q.png"]); // offline it can't ask which were cleaned up; restoring says so
+	assert.equal(await b.engine!.restoreAttachment(p), "offline");
+	b.connect();
+	await quiesce(devs);
+
+	await nextDay(server, devs, devs, 40); // listed for 30 days, like notes; the file stays stored until Clean up
+	assert.deepEqual(await listed(b, devs), []);
 	const back = b.engine!.restoreAttachment(q);
 	await quiesce(devs);
 	assert.equal(await back, "q.png");
 	assert.deepEqual(disk(a), { "q.png": PIC2 });
 	assert.deepEqual(disk(b), disk(a));
-
-	b.disconnect();
-	assert.deepEqual(await listed(b, []), ["p.png"]); // offline it can't ask; restoring says so
-	assert.equal(await b.engine!.restoreAttachment(p), "offline");
 	noProblems(devs);
 });
 
