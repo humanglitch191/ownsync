@@ -54,7 +54,7 @@ export interface VaultRpc {
 }
 
 /** The server's version, shown on the dashboard. */
-export const VERSION = "0.2.1";
+export const VERSION = "0.2.2";
 
 // Workers Free plan, from Cloudflare's pricing and limits pages (2026-11-13).
 export const LIMITS = { storageBytes: 5e9, vaultBytes: 1e9, requestsPerDay: 100_000, rowsWrittenPerDay: 100_000 };
