@@ -16,13 +16,15 @@ export interface ConflictHost {
 	addCommand(c: { id: string; name: string; callback: () => void }): unknown;
 }
 
-interface Pair { original: TFile; copy: TFile }
+/** `original` is null when the file the copy was made from is gone (deleted or renamed since): only the copy is left. */
+interface Pair { path: string; original: TFile | null; copy: TFile }
 
 function pairOf(app: App, file: unknown): Pair | null {
 	if (!(file instanceof TFile)) return null;
-	const o = conflictOriginal(file.path);
-	const original = o && app.vault.getAbstractFileByPath(o);
-	return original instanceof TFile ? { original, copy: file } : null;
+	const path = conflictOriginal(file.path);
+	if (!path) return null;
+	const original = app.vault.getAbstractFileByPath(path);
+	return { path, original: original instanceof TFile ? original : null, copy: file };
 }
 
 const allPairs = (app: App) => app.vault.getFiles().flatMap((f) => pairOf(app, f) ?? []);
@@ -41,21 +43,30 @@ const conflictModal = () => class ConflictModal extends Modal {
 		if (!this.pairs.length) return this.close();
 		for (const p of this.pairs) {
 			const box = this.contentEl.createDiv({ cls: "ownsync-conflict" });
-			box.createEl("h4", { text: p.original.path });
+			box.createEl("h4", { text: p.path });
 			const row = box.createDiv({ cls: "ownsync-conflict-row" });
-			this.side(row, p, p.original, "Keep this one", "Deletes the other copy.", () => this.app.fileManager.trashFile(p.copy));
+			const original = p.original;
+			if (!original) {
+				// Only the copy is left: give it its name back, or let it go.
+				const name = p.path.split("/").pop()!;
+				this.side(row, p, p.copy, `Rename back to "${name}"`, "The original is gone; this copy takes its place.", () => this.app.fileManager.renameFile(p.copy, p.path));
+				this.side(row, p, p.copy, "Delete this copy", "Moves it to the trash.", () => this.app.fileManager.trashFile(p.copy), false);
+				continue;
+			}
+			this.side(row, p, original, "Keep this one", "Deletes the other copy.", () => this.app.fileManager.trashFile(p.copy));
 			this.side(row, p, p.copy, "Keep this one", "Replaces the original with this copy.", async () => {
-				await this.app.fileManager.trashFile(p.original);
-				await this.app.fileManager.renameFile(p.copy, p.original.path);
+				await this.app.fileManager.trashFile(original);
+				await this.app.fileManager.renameFile(p.copy, p.path);
 			});
 		}
 	}
 
-	private side(row: HTMLElement, p: Pair, f: TFile, label: string, hint: string, act: () => Promise<void>): void {
+	private side(row: HTMLElement, p: Pair, f: TFile, label: string, hint: string, act: () => Promise<void>, preview = true): void {
 		const side = row.createDiv({ cls: "ownsync-conflict-side" });
-		side.createDiv({ cls: "ownsync-quiet", text: f === p.original ? "Original" : "Other device" });
-		if (IMAGE.test(f.path)) side.createEl("img", { attr: { src: this.app.vault.getResourcePath(f), alt: f.name } });
-		else {
+		side.createDiv({ cls: "ownsync-quiet", text: f === p.original ? "Original" : p.original ? "Other device" : preview ? "Only copy left" : "" });
+		// `preview` false: the same file as the side before it, shown once.
+		if (preview && IMAGE.test(f.path)) side.createEl("img", { attr: { src: this.app.vault.getResourcePath(f), alt: f.name } });
+		else if (preview) {
 			side.createDiv({ text: f.name });
 			side.createDiv({ cls: "ownsync-quiet", text: `${(f.stat.size / 1024).toFixed(1)} KB, changed ${new Date(f.stat.mtime).toLocaleString()}` });
 		}
@@ -71,20 +82,24 @@ const conflictModal = () => class ConflictModal extends Modal {
 export function installConflictNotice(plugin: ConflictHost): void {
 	const { app } = plugin;
 	const shown = new Map<string, Notice>(); // by original path, one at a time
-	const review = () => { const M = conflictModal(); new M(app, allPairs(app)).open(); };
+	const review = () => {
+		const pairs = allPairs(app);
+		if (!pairs.length) return void new Notice("No attachment conflicts.");
+		const M = conflictModal(); new M(app, pairs).open();
+	};
 
 	const announce = (pairs: Pair[]) => {
-		const fresh = pairs.filter((p) => !shown.has(p.original.path));
+		const fresh = pairs.filter((p) => p.original && !shown.has(p.path)); // a copy with no original isn't news: the review lists it
 		if (!fresh.length) return;
 		const notice = new Notice(createFragment((f) => {
-			f.createDiv({ text: fresh.length === 1 ? `${fresh[0]!.original.name} was changed on two devices at once.` : `${fresh.length} attachments were changed on two devices at once.` });
+			f.createDiv({ text: fresh.length === 1 ? `${fresh[0]!.original!.name} was changed on two devices at once.` : `${fresh.length} attachments were changed on two devices at once.` });
 			const actions = f.createDiv({ cls: "ownsync-notice-actions" });
 			actions.createEl("button", { text: "Compare" }).addEventListener("click", () => { notice.hide(); review(); });
 			actions.createEl("button", { text: "Not now" }).addEventListener("click", () => notice.hide());
 		}), 0);
-		for (const p of fresh) shown.set(p.original.path, notice);
+		for (const p of fresh) shown.set(p.path, notice);
 		const hide = notice.hide.bind(notice);
-		notice.hide = () => { for (const p of fresh) shown.delete(p.original.path); hide(); };
+		notice.hide = () => { for (const p of fresh) shown.delete(p.path); hide(); };
 	};
 
 	plugin.registerEvent(app.vault.on("create", (file) => { const p = pairOf(app, file); if (p) announce([p]); }));
