@@ -25,14 +25,17 @@ export function textColour(hex: string): "#000" | "#fff" {
 	return (l + 0.05) / 0.05 > 1.05 / (l + 0.05) ? "#000" : "#fff";
 }
 
-/** Show `people` in a view's header, before its action buttons; nothing (and no element) when the list is empty. */
+/**
+ * Show `people` in a view's header, first among its action buttons (inside them, so a phone that hides the buttons
+ * while the keyboard is open hides these too); nothing (and no element) when the list is empty.
+ */
 export function showAvatars(view: HTMLElement, people: Person[], jump: (id: number) => void): void {
 	const actions = view.querySelector(".view-header .view-actions");
 	let box = view.querySelector<HTMLElement>(".ownsync-avatars");
 	if (!people.length || !actions) return void box?.remove();
 	const key = JSON.stringify(people);
 	if (box?.dataset.key === key) return; // a cursor moved: keep the elements, so an open tooltip stays
-	if (!box) actions.before((box = createDiv({ cls: "ownsync-avatars", attr: { role: "group" } })));
+	if (!box) actions.prepend((box = createDiv({ cls: "ownsync-avatars", attr: { role: "group" } })));
 	box.empty();
 	box.dataset.key = key;
 	box.setAttr("aria-label", `In this note: ${people.map((p) => p.name).join(", ")}`);
