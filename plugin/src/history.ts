@@ -476,17 +476,17 @@ function showComparison(preview: HTMLElement, current: string, copy: string): st
 	const diff = diffLines(current, copy);
 	const summary = diff ? `${diff.added} ${diff.added === 1 ? "line" : "lines"} added, ${diff.removed} removed.` : "Too long to compare.";
 	preview.setText("");
-	preview.createEl("span", { text: summary, cls: "ownsync-history-diff-summary" });
+	preview.createSpan({ text: summary, cls: "ownsync-history-diff-summary" });
 	if (!diff) {
-		preview.createEl("span", { text: copy.length > 8_000 ? `${copy.slice(0, 8_000)}…` : copy });
+		preview.createSpan({ text: copy.length > 8_000 ? `${copy.slice(0, 8_000)}…` : copy });
 		return summary;
 	}
 	for (const { type, text } of diff.changes.slice(0, 200)) {
 		const sign = type === "added" ? "+" : "−";
 		const line = text.length > 500 ? `${text.slice(0, 500)}…` : text;
-		preview.createEl("span", { text: `${sign} ${line}`, cls: `ownsync-history-diff-${type}` });
+		preview.createSpan({ text: `${sign} ${line}`, cls: `ownsync-history-diff-${type}` });
 	}
-	if (diff.changes.length > 200) preview.createEl("span", { text: "Showing the first 200 changed lines." });
+	if (diff.changes.length > 200) preview.createSpan({ text: "Showing the first 200 changed lines." });
 	return summary;
 }
 

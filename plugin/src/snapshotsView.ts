@@ -35,9 +35,9 @@ export function restoreFolderName(date: string, exists: (path: string) => boolea
 	return path;
 }
 
-export function safeSnapshotPath(path: string, configDir = ".obsidian"): boolean {
+export function safeSnapshotPath(path: string, configDir: string): boolean {
 	const lower = path.toLowerCase(), config = configDir.toLowerCase();
-	return !/[\\:\x00-\x1f]/.test(path)
+	return !/[\\:]/.test(path) && ![...path].some((c) => c.charCodeAt(0) < 0x20) // no backslash, colon or control character
 		&& (!config || (lower !== config && !lower.startsWith(`${config}/`)))
 		&& path.split("/").every((part) => part && !part.startsWith(".") && !/[. ]$/.test(part));
 }
@@ -48,7 +48,7 @@ interface Folder {
 	notes: SnapshotNote[];
 }
 
-export function snapshotTree(notes: readonly SnapshotNote[], configDir?: string): Folder {
+export function snapshotTree(notes: readonly SnapshotNote[], configDir: string): Folder {
 	const root: Folder = { path: "", folders: new Map(), notes: [] };
 	for (const note of [...notes].sort((a, b) => a.path.localeCompare(b.path))) {
 		if (!safeSnapshotPath(note.path, configDir)) continue;

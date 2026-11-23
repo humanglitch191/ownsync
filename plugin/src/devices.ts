@@ -64,7 +64,7 @@ function showRecoveryKit(app: App, why: string, host: string, vaultId: string, c
 		// Outside the vault on purpose: the vault syncs, and the recovery code must not.
 		if (!Platform.isMobile) buttons.createEl("button", { text: "Save as file" }).addEventListener("click", () => {
 			const url = URL.createObjectURL(new Blob([kit], { type: "text/plain" }));
-			const a = document.createElement("a");
+			const a = createEl("a");
 			a.href = url;
 			a.download = "Ownsync recovery kit.txt";
 			a.click();

@@ -169,7 +169,7 @@ export function createSnapshots(deps: SnapshotDeps): {
 
 	function readLastDay(): number {
 		try {
-			const saved = (deps.deviceDayStore ?? globalThis.localStorage)?.getItem(dayKey);
+			const saved = (deps.deviceDayStore ?? window.localStorage)?.getItem(dayKey);
 			if (saved && natural(Number(saved))) return Number(saved);
 		} catch { /* The ledger and Worker list still cover stored snapshots. */ }
 		return -1;
@@ -304,7 +304,7 @@ export function createSnapshots(deps: SnapshotDeps): {
 		if (!allowed()) return "unavailable";
 		await deps.recordSnapshot(id, entry);
 		lastTakenDay = day;
-		try { (deps.deviceDayStore ?? globalThis.localStorage)?.setItem(dayKey, String(day)); }
+		try { (deps.deviceDayStore ?? window.localStorage)?.setItem(dayKey, String(day)); }
 		catch { /* The ledger and Worker list still cover stored snapshots. */ }
 		pending = undefined;
 		return "taken";

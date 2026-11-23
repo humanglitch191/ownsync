@@ -47,8 +47,8 @@ const backupTiming: NonNullable<HistoryBackupDeps["timing"]> = {
 	now: () => performance.now(),
 	random: () => crypto.getRandomValues(new Uint32Array(1))[0]! / 2 ** 32,
 	setTimer: (callback, delay) => {
-		const timer = setTimeout(callback, delay);
-		return () => clearTimeout(timer);
+		const timer = window.setTimeout(callback, delay);
+		return () => window.clearTimeout(timer);
 	},
 };
 

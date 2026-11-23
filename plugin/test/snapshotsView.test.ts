@@ -13,10 +13,10 @@ test("restore folders use the first available name", () => {
 
 test("snapshot paths are relative and outside vault settings", () => {
 	for (const path of ["Read me.md", "Projects/Drafts/Idea.md", "A..B.md"]) {
-		assert.equal(safeSnapshotPath(path), true, path);
+		assert.equal(safeSnapshotPath(path, ".obsidian"), true, path);
 	}
 	for (const path of ["", "/Root.md", "../Escape.md", "A/../Escape.md", "A/./Note.md", "A//Note.md", "A\\..\\Escape.md", "C:/Note.md", ".obsidian", ".Obsidian/plugins/Note.md", "A/.obsidian/Note.md", "A/.. /Escape.md", "A/\0Note.md"]) {
-		assert.equal(safeSnapshotPath(path), false, path);
+		assert.equal(safeSnapshotPath(path, ".obsidian"), false, path);
 	}
 	assert.equal(safeSnapshotPath("Vault Settings/Note.md", "vault settings"), false);
 	assert.equal(safeSnapshotPath("Vault Settings references/Note.md", "vault settings"), true);
@@ -25,7 +25,7 @@ test("snapshot paths are relative and outside vault settings", () => {
 test("the snapshot tree keeps root notes and folder contents separate", () => {
 	const root = note("Welcome.md"), apple = note("Projects/Apple.md"), zebra = note("Projects/Zebra.md");
 	const draft = note("Projects/Drafts/New.md"), other = note("Projects archive/X.md");
-	const tree = snapshotTree([draft, root, zebra, other, apple, note("../Wrong.md")]);
+	const tree = snapshotTree([draft, root, zebra, other, apple, note("../Wrong.md")], ".obsidian");
 	assert.deepEqual(tree.notes, [root]);
 	assert.deepEqual([...tree.folders.keys()].sort(), ["Projects", "Projects archive"]);
 	const projects = tree.folders.get("Projects");
