@@ -28,6 +28,10 @@ export interface VaultStats {
 	deleted: boolean;
 	devices: { id: string; name: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
 	settings: VaultSettings;
+	/** Complete vault snapshots, newest first: when the last part arrived, and their size. */
+	snapshots: { at: number; size: number }[];
+	/** History backup copies, all devices together. */
+	historyCopies: { copies: number; bytes: number };
 }
 
 /**
@@ -452,6 +456,8 @@ export class Dashboard {
 				lastActivity: v.stats!.lastActivity,
 				conflicts: Math.max(0, ...v.stats!.devices.map((d) => d.conflicts)),
 				settings: v.stats!.settings,
+				snapshots: v.stats!.snapshots ?? [],
+				historyCopies: v.stats!.historyCopies ?? { copies: 0, bytes: 0 },
 				devices: v.stats!.devices.map((d) => ({ ...d, label: labels.get(`${v.id}/${d.id}`) ?? "", behind: !!newest && d.version !== newest && d.version.localeCompare(newest, undefined, { numeric: true }) < 0, lost: !d.online && now - d.lastOnline > LOST_AFTER_MS })),
 			})),
 			passkeys: this.sql.exec<{ id: string; created: number }>("SELECT id, created FROM passkeys ORDER BY created").toArray().map((p) => ({ ...p, current: p.id === session.passkey })),

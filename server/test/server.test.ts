@@ -885,7 +885,7 @@ test("deleting a vault takes its token; then its devices are told 4004, it can't
 	assert.equal(await bare.closed, CLOSE.deleted);
 	assert.equal(await post("delete", tok), 410);
 	assert.equal(await post("names", new Uint8Array([...tok, ...bytes("{}")])), 410);
-	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: true, devices: [], settings: { snapshots: null, historyBackup: null } });
+	assert.deepEqual({ ...(await stats(home, v)), bytes: 0 }, { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: true, devices: [], settings: { snapshots: null, historyBackup: null }, snapshots: [], historyCopies: { copies: 0, bytes: 0 } });
 });
 
 test("history expiry has an index on its time, so it doesn't scan the table", async () => {

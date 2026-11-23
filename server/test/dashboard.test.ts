@@ -152,10 +152,14 @@ test("the setup key adds the first passkey: right key, in the window, once; stra
 		assert.equal((await call(`/api/vaults/${"0".repeat(32)}/${kind}/clear`, {}, { cookie: session.cookie! })).status, 404);
 	}
 	assert.deepEqual([await history(vault), await history(other), await snapshots(vault), await snapshots(other)], [[0, 0, 0, 1, 9], [0, 0, 0, 1, 9], 1, 1]);
+	// The Storage page's figures: complete snapshots (when, how big) and history copies as totals.
+	const stored = async () => { const v = (await call("/api/overview", undefined, { cookie: session.cookie! })).body.vaults.find((x: { id: string }) => x.id === vault.id); return [v.snapshots.map((s: { size: number }) => s.size), v.historyCopies]; };
+	assert.deepEqual(await stored(), [[1], { copies: 1, bytes: 1 }]);
 	assert.deepEqual((await call(`/api/vaults/${vault.id}/history/clear`, {}, { cookie: session.cookie! })).body, { ok: true });
 	assert.deepEqual([await history(vault), await history(other), await snapshots(vault)], [[], [0, 0, 0, 1, 9], 1]);
 	assert.deepEqual((await call(`/api/vaults/${vault.id}/snapshots/clear`, {}, { cookie: session.cookie! })).body, { ok: true });
 	assert.deepEqual([await snapshots(vault), await snapshots(other), await history(other)], [0, 1, [0, 0, 0, 1, 9]]);
+	assert.deepEqual(await stored(), [[], { copies: 0, bytes: 0 }]);
 	// Its devices are told which ones went, so their ledgers don't show them as missing.
 	assert.deepEqual(await Promise.all([vault, other].map(async (v) => (await post(v, "snapshot/list")).headers.get("ownsync-removed"))), ["02".repeat(16), ""]);
 	other.ws.close();

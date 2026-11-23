@@ -705,7 +705,7 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	async stats(): Promise<VaultStats> {
-		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [], settings: { snapshots: null, historyBackup: null } };
+		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [], settings: { snapshots: null, historyBackup: null }, snapshots: [], historyCopies: { copies: 0, bytes: 0 } };
 		const online = new Set(this.ctx.getWebSockets().map((ws) => (ws.deserializeAttachment() as Session).device));
 		const fresh = this.usage.day === today();
 		const devices = this.sql.exec<{ id: string; last_online: number; version: string; conflicts: number; name: string }>("SELECT id, last_online, version, conflicts, name FROM devices ORDER BY last_online DESC").toArray();
@@ -721,6 +721,9 @@ export class Vault extends DurableObject<Env> {
 			name: this.sql.exec<{ name: string }>("SELECT name FROM vault_name").toArray()[0]?.name ?? "",
 			deleted: this.deleted,
 			settings: this.settings(),
+			// Complete snapshots, newest first; history copies only as totals (the Worker doesn't know which device made one).
+			snapshots: this.sql.exec<{ at: number; size: number }>("SELECT at, size FROM snapshots WHERE received = parts ORDER BY day DESC").toArray(),
+			historyCopies: this.sql.exec<{ copies: number; bytes: number }>("SELECT COUNT(*) AS copies, COALESCE(SUM(size), 0) AS bytes FROM history").one(),
 			devices: devices.map((d) => {
 				// A device reports "<version> mobile notes-only": its plugin version, then what kind of device it is.
 				const [version = "", ...flags] = d.version.split(" ");
