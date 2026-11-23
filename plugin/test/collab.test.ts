@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import { Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
-import { applyPresence, deviceNames, localUndo } from "../src/collab";
+import { applyPresence, deviceNames, localUndo, presenceGoes } from "../src/collab";
 
 test("undo takes back only this editor's typing, not another device's or the engine's", () => {
 	const doc = new Y.Doc(), text = doc.getText("t"), undo = localUndo(text);
@@ -67,4 +67,30 @@ test("presence from another device is cleaned before the editor sees it", () => 
 test("device names from the Worker: only 8-hex IDs and cleaned names", () => {
 	assert.deepEqual([...deviceNames({ ABCD0063: " Anna's iPhone 17 Pro\u0007", "bad id": "x", ABCD0064: "", ABCD0065: 7 })], [["ABCD0063", "Anna's iPhone 17 Pro"]]);
 	for (const raw of [null, "x", [], 5]) assert.equal(deviceNames(raw).size, 0);
+});
+
+test("presence goes only while in view and someone else is in the note; an announce goes regardless; leaving goes to whoever is there", () => {
+	// Alone, in view: the 15 s renewal and cursor moves stay home; opening the note (or coming back) announces once.
+	assert.equal(presenceGoes("change", true, false), false);
+	assert.equal(presenceGoes("announce", true, false), true);
+	// Someone else there: renewals, cursor moves and the reply to a newcomer go.
+	assert.equal(presenceGoes("change", true, true), true);
+	assert.equal(presenceGoes("announce", true, true), true);
+	// Hidden or in the background: nothing, so the others drop this device after 30 s.
+	assert.equal(presenceGoes("change", false, true), false);
+	assert.equal(presenceGoes("announce", false, true), false);
+	assert.equal(presenceGoes("announce", false, false), false);
+	// Closing the note clears the cursor on the others' screens, if there are any.
+	assert.equal(presenceGoes("leave", false, true), true);
+	assert.equal(presenceGoes("leave", true, false), false);
+});
+
+test("presence goes out only when someone else is in the note and Obsidian is in view", () => {
+	assert.equal(presenceGoes("change", true, false), false); // alone: cursor moves and renewals stay home, so the vault can sleep
+	assert.equal(presenceGoes("announce", true, false), true); // opening the note or coming back: say so once
+	assert.equal(presenceGoes("change", true, true), true);
+	assert.equal(presenceGoes("change", false, true), false); // in the background: nothing; the others drop this device after 30 s
+	assert.equal(presenceGoes("announce", false, true), false);
+	assert.equal(presenceGoes("leave", false, true), true); // leaving is always told to whoever is there
+	assert.equal(presenceGoes("leave", true, false), false);
 });

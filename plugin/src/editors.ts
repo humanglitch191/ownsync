@@ -10,7 +10,7 @@ import { EditorView } from "@codemirror/view";
 import * as Y from "yjs";
 import { Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
 import { showAvatars } from "./avatars";
-import { applyPresence, collab, localUndo, user } from "./collab";
+import { applyPresence, collab, localUndo, presenceGoes, user } from "./collab";
 import type { Engine } from "./core/engine";
 
 /** Registered once on every editor by the plugin; filled with the binding for bound editors. */
@@ -18,11 +18,15 @@ export const editorBinding = new Compartment();
 
 type Binding = { id: string; view: MarkdownView; editor: Editor; undo: Y.UndoManager };
 
+/** Obsidian is on screen and has the focus (activeDocument follows it into popout windows). */
+const inView = () => activeDocument.visibilityState === "visible" && activeDocument.hasFocus();
+
 export class Editors {
 	private bound = new Map<EditorView, Binding>();
 	private presence = new Map<string, Awareness>(); // note ID → this device's presence there, while an editor shows it
 	private queue: Promise<void> = Promise.resolve();
 	private stopped = false;
+	private shown = inView(); // in view when last looked: coming back into view announces every open note
 
 	constructor(
 		private readonly app: App, private readonly engine: Engine, private readonly onProblem: (what: string, err: unknown) => void,
@@ -32,7 +36,19 @@ export class Editors {
 	/** Another device's presence in a note. Dropped unless an editor here shows the note. */
 	receivePresence(note: string, update: Uint8Array): void {
 		const aw = this.presence.get(note);
-		if (aw && applyPresence(aw, update)) this.send(note, aw); // it just appeared: show it this cursor now, not at the next renewal
+		if (aw && applyPresence(aw, update)) this.offer(note, aw, "change"); // it just appeared: show it this cursor now, not at the next renewal
+	}
+
+	/** Window focus or visibility changed. Back in view: tell the others in each open note this device is there. */
+	viewChanged(): void {
+		const now = inView();
+		if (now && !this.shown) this.announce();
+		this.shown = now;
+	}
+
+	/** Tell the others in each open note this device is there, on reconnecting say; whoever is there answers. */
+	announce(): void {
+		for (const [id, aw] of this.presence) this.offer(id, aw, "announce");
 	}
 
 	setName(name: string): void {
@@ -129,10 +145,16 @@ export class Editors {
 		if (aw) return aw;
 		const fresh = (aw = new Awareness(doc));
 		this.presence.set(id, aw);
-		fresh.on("update", (_: unknown, origin: unknown) => { if (origin === "local") this.send(id, fresh); });
+		// The local state changing, or y-protocols renewing it every 15 s: sent only while someone else is in the note.
+		fresh.on("update", (_: unknown, origin: unknown) => {
+			if (origin !== "local") return;
+			if (!this.shown && inView()) return this.viewChanged(); // focus went to a popout window, whose events don't reach main.ts
+			this.offer(id, fresh, fresh.getLocalState() === null ? "leave" : "change");
+		});
 		// Other devices joining, renaming or leaving: by their empty state when they close the note, or after 30 s unheard.
 		fresh.on("change", () => this.showPeople(id));
 		fresh.setLocalStateField("user", user(this.name, fresh.clientID));
+		this.offer(id, fresh, "announce");
 		return fresh;
 	}
 
@@ -152,8 +174,9 @@ export class Editors {
 		}
 	}
 
-	private send(id: string, aw: Awareness): void {
-		this.sendPresence(id, encodeAwarenessUpdate(aw, [aw.clientID]));
+	private offer(id: string, aw: Awareness, why: "announce" | "change" | "leave"): void {
+		const others = [...aw.getStates().keys()].some((client) => client !== aw.clientID);
+		if (presenceGoes(why, inView(), others)) this.sendPresence(id, encodeAwarenessUpdate(aw, [aw.clientID]));
 	}
 
 	/** Close the note in the engine once no editor shows it. The engine then writes the file itself. */

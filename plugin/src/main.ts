@@ -146,6 +146,11 @@ export default class OwnsyncPlugin extends Plugin {
 		const wake = () => { if (document.visibilityState === "visible" && this.status === "offline") void this.session?.transport.connect().catch(() => {}); };
 		this.registerDomEvent(document, "visibilitychange", wake);
 		this.registerDomEvent(window, "online", wake);
+		// Presence (cursors, avatars) goes out only while Obsidian is in view: each frame wakes the vault's Durable Object.
+		const viewChanged = () => this.session?.editors.viewChanged();
+		this.registerDomEvent(document, "visibilitychange", viewChanged);
+		this.registerDomEvent(window, "focus", viewChanged);
+		this.registerDomEvent(window, "blur", viewChanged);
 		installHistory(this, () => this.session && {
 			client: this.session.historyBackup,
 			connected: this.session.transport.status === "synced",
@@ -322,6 +327,7 @@ export default class OwnsyncPlugin extends Plugin {
 				// The vault now exists on the Worker: the owner code that created it isn't needed again.
 				if (s === "synced" && this.ownerCode) this.app.saveLocalStorage("ownsync-owner-code", null);
 				if (s === "synced") void this.reportNames();
+				if (s === "synced") editors.announce(); // presence sent while offline was lost: the others in each open note learn this device is back
 				this.setStatus(s);
 				if (s === "frozen") void chooseFork(this);
 			},

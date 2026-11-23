@@ -48,6 +48,16 @@ export function cleanState(s: unknown) {
 	return { user: { name: cleanName(o.user?.name) || "Another device", color }, cursor: anchor && head ? { anchor, head } : null };
 }
 
+/**
+ * Whether this device's presence in a note goes out now. Each frame wakes the vault's Durable Object, so with nobody
+ * else in the note only an announce goes (opening the note, coming back to the window, reconnecting), which whoever
+ * joins later answers; and with the window hidden or in the background nothing does, and the others drop this device
+ * after 30 s. Leaving goes to whoever is there.
+ */
+export function presenceGoes(why: "announce" | "change" | "leave", inView: boolean, others: boolean): boolean {
+	return why === "leave" ? others : inView && (others || why === "announce");
+}
+
 /** Apply another device's presence. Returns true if a device appeared, so it can be sent this device's state at once. */
 export function applyPresence(aw: Awareness, update: Uint8Array): boolean {
 	const d = decoding.createDecoder(update), out: [number, number, string][] = [];

@@ -161,7 +161,7 @@ After a key rotation, the plugin lists copies from the new epoch. It can clear c
 
 Once a device is connected and caught up, it can take a daily snapshot of Markdown text and the current attachment references. If references are unavailable, it can take a notes-only snapshot. The Worker assigns the UTC day and stores individually encrypted parts. The device checks the Worker's list before collecting files and records the ordered hashes in the encrypted synced index after the Worker acknowledges the complete upload. It remembers the successful day in local storage so a restart after deletion won't recreate the day's snapshot.
 
-The Worker keeps seven UTC days and the newest snapshot in each of the four ISO weeks entirely before that window. It can prune older complete snapshots as uploads arrive to stay within 400 MiB, and always protects the newest complete copy.
+The Worker keeps seven UTC days and the newest snapshot in each of the four ISO weeks entirely before that window. It can prune older complete snapshots as uploads arrive to stay within 150 MiB, and always protects the newest complete copy.
 
 The synced index determines which snapshots a device can open. The Worker can supply ciphertext and report availability. Devices verify each envelope against the ledger before decrypting it, including when using an older key from the key ring. After validating every part and the bounded gzip stream, the plugin checks all file paths against the vault's path rules. The snapshot client exposes note text and attachment paths to the caller. File restores are handled by the caller.
 

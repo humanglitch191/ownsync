@@ -9,9 +9,11 @@ Ownsync runs on your own Cloudflare account. For one person's notes, the free pl
 | Rows written | 100,000 | Every saved edit is about one row. Typing in a note saves roughly every 3 seconds, so this is about 80 hours of nonstop typing a day. The first upload of a vault is about one row per note. |
 | Requests | 100,000 | 20 messages from your devices count as one request, so about 2 million messages a day. |
 | Active time | 13,000 GB-s | About 29 hours a day of your Worker actively relaying. It sleeps between edits, so idle devices cost nothing. |
-| Storage | 5 GB in total | Notes are small: 1,000 notes took 15 MB in the stress test. Attachments are what fill it, then history backups (up to 50 MB a vault) and vault snapshots if you turn them on (up to 400 MB a vault). Keep each vault under about 1 GB, those included. |
+| Storage | 5 GB in total | Notes are small: 1,000 notes took 15 MB in the stress test. Attachments are what fill it, then history backups (up to 50 MB a vault) and vault snapshots if you turn them on (up to 150 MB a vault). Keep each vault under about 1 GB, those included. |
 
 The counts reset at midnight UTC. If a vault hits a limit, syncing pauses until then. Nothing is lost: your devices keep your edits and send them after the reset.
+
+**Several vaults:** a vault's Worker is only active while someone is working in it. Left alone, it sleeps and costs nothing; a note open on a device that nobody is looking at doesn't keep it awake. So the active time adds up per vault in use, not per device or per person. The free allowance is shared by every Worker on your Cloudflare account, not only Ownsync's.
 
 **When you might hit a limit:**
 - Uploading a vault of 50,000 or more notes, or gigabytes of attachments, in one day. The upload pauses at the limit and carries on the next day.

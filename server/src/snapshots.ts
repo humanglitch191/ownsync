@@ -1,4 +1,4 @@
-export const SNAPSHOT_BUDGET = 400 * 1024 * 1024;
+export const SNAPSHOT_BUDGET = 150 * 1024 * 1024;
 
 type Snapshot = { day: number; size: number; complete: number | boolean };
 
