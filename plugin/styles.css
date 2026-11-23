@@ -1,5 +1,5 @@
-/* Ownsync's setup and pairing screens. Obsidian's own colours and font, so they match any theme: hairline
-   borders, no shadows, one primary button per screen. */
+/* Ownsync's own screens. Obsidian's colours and fonts, so they follow any theme, light or dark: hairline borders,
+   no shadows, one primary button per screen, quiet secondary actions. */
 .ownsync-setup .modal-content { display: flex; flex-direction: column; gap: var(--size-4-3); }
 .ownsync-setup p { margin: 0; }
 .ownsync-lead { color: var(--text-muted); }
@@ -20,6 +20,7 @@
 .ownsync-choice-title { font-weight: var(--font-semibold); color: var(--text-normal); }
 .ownsync-choice-desc { color: var(--text-muted); font-size: var(--font-ui-small); margin-top: 2px; }
 
+/* The QR code stays black on white in a dark theme too, so every camera reads it. */
 .ownsync-qr { align-self: center; padding: var(--size-4-2); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-l); background: #fff; line-height: 0; }
 .ownsync-id {
 	align-self: center; font-size: 1.6em; font-weight: var(--font-semibold); letter-spacing: .08em; font-variant-numeric: tabular-nums;
@@ -31,76 +32,97 @@
 .ownsync-field .ownsync-quiet { margin-top: var(--size-2-2); }
 .ownsync-setup textarea { width: 100%; resize: none; font-variant-numeric: tabular-nums; }
 .ownsync-code { width: 100%; resize: none; word-break: break-all; }
-.ownsync-server { font-weight: var(--font-semibold); color: var(--text-normal); }
+.ownsync-server { font-weight: var(--font-semibold); color: var(--text-normal); overflow-wrap: anywhere; }
+/* Settings: descriptions keep their line breaks (status, vault ID); short number fields stay short. */
+.ownsync-settings .setting-item-description { white-space: pre-line; }
+.ownsync-settings input.ownsync-narrow { width: 6em; }
 .ownsync-notice-actions { display: flex; gap: var(--size-4-2); margin-top: var(--size-4-2); }
 .ownsync-conflict { margin-bottom: var(--size-4-4); }
 .ownsync-conflict-row { display: flex; gap: var(--size-4-4); }
 .ownsync-conflict-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--size-4-2); }
 .ownsync-conflict-side img { max-width: 100%; max-height: 40vh; object-fit: contain; border-radius: var(--radius-s); }
 
-.ownsync-history-modal { width: min(900px, 95vw); }
-.ownsync-history { display: flex; gap: var(--size-4-3); height: 60vh; }
-.ownsync-history-list { display: flex; flex-direction: column; gap: var(--size-2-1); width: 38%; overflow-y: auto; }
-.ownsync-history-item { text-align: left; justify-content: flex-start; background: transparent; box-shadow: none; height: auto; padding: var(--size-2-3) var(--size-4-2); overflow-wrap: anywhere; }
-.ownsync-history-item:hover { background: var(--background-modifier-hover); }
-.ownsync-history-item .ownsync-quiet { margin-inline-start: var(--size-2-2); }
-.ownsync-history-item.is-active { background: var(--background-modifier-active-hover); }
-.ownsync-history-right { display: flex; flex-direction: column; gap: var(--size-4-2); flex: 1; min-width: 0; }
-.ownsync-history-preview {
-	flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; user-select: text; padding: var(--size-4-2);
-	border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); font-size: var(--font-ui-small); color: var(--text-normal);
+/* Note history, Recently deleted and Vault snapshots: one layout. A list on the left, a preview on the right with
+   its actions under it (quiet ones on the left, the one primary button on the right); stacked on a phone. */
+.ownsync-history-modal, .ownsync-snapshots-modal { width: min(900px, 95vw); }
+.ownsync-history-modal .modal-content > p { margin: 0 0 var(--size-4-3); }
+.ownsync-history, .ownsync-snapshot-browser {
+	display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: var(--size-4-4); height: 60vh;
 }
-.ownsync-history-right > button { align-self: flex-end; }
+.ownsync-snapshot-browser { margin-top: var(--size-4-3); }
+.ownsync-history-list, .ownsync-snapshot-sidebar, .ownsync-snapshot-list, .ownsync-snapshot-view {
+	display: flex; flex-direction: column; gap: var(--size-2-1); min-width: 0; overflow-y: auto;
+}
+.ownsync-snapshot-view { gap: var(--size-4-2); }
+.ownsync-snapshot-list { max-height: 55vh; }
+.ownsync-snapshot-sidebar input { width: 100%; margin-bottom: var(--size-2-2); }
+.ownsync-history-right { display: flex; flex-direction: column; gap: var(--size-4-2); min-width: 0; min-height: 0; }
 
-.ownsync-history-item { flex-shrink: 0; white-space: normal; }
-.ownsync-history-preview { min-height: 0; overflow-wrap: anywhere; }
-@media (max-width: 600px) {
-	.ownsync-history { flex-direction: column; }
-	.ownsync-history-list { width: 100%; max-height: 35%; }
-	.ownsync-history-right { min-height: 0; }
-}
-
-.ownsync-history-right > button[hidden] { display: none; }
-
-.ownsync-snapshots-modal { width: min(900px, 95vw); }
-.ownsync-snapshot-list, .ownsync-snapshot-sidebar, .ownsync-snapshot-view {
-	display: flex; flex-direction: column; gap: var(--size-4-2); min-width: 0;
-}
-.ownsync-snapshot-browser {
-	display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
-	gap: var(--size-4-4); height: 60vh; margin-top: var(--size-4-3);
-}
-.ownsync-snapshot-sidebar, .ownsync-snapshot-view, .ownsync-snapshot-review { overflow: auto; }
-.ownsync-snapshot-list, .ownsync-snapshot-review { max-height: 55vh; }
-.ownsync-snapshot-sidebar input { width: 100%; }
-.ownsync-snapshot-view h3, .ownsync-snapshot-view p { margin: 0; overflow-wrap: anywhere; }
-.ownsync-snapshot-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--size-4-2); }
-.ownsync-snapshot-actions button { height: auto; min-height: var(--input-height); white-space: normal; }
+/* List rows: flat, a grey fill when selected (no accent pill). */
+.ownsync-history-modal button.ownsync-history-item,
 .ownsync-snapshots-modal button.ownsync-snapshot-row {
 	display: block; flex-shrink: 0; width: 100%; height: auto; padding: var(--size-2-3) var(--size-4-2);
-	text-align: left; white-space: normal; overflow-wrap: anywhere; background: transparent; box-shadow: none;
+	text-align: left; white-space: normal; overflow-wrap: anywhere; font-variant-numeric: tabular-nums;
+	background: transparent; box-shadow: none; border: none; border-radius: var(--radius-s); color: var(--text-normal);
 }
+.ownsync-history-modal button.ownsync-history-item:hover,
 .ownsync-snapshots-modal button.ownsync-snapshot-row:enabled:hover { background: var(--background-modifier-hover); }
-.ownsync-snapshots-modal button.ownsync-snapshot-row[aria-pressed="true"] { background: var(--background-modifier-active-hover); }
+.ownsync-history-modal button.ownsync-history-item.is-active,
+.ownsync-snapshots-modal button.ownsync-snapshot-row[aria-pressed="true"] { background: var(--nav-item-background-active, var(--background-modifier-hover)); }
+.ownsync-snapshots-modal button.ownsync-snapshot-row:disabled { color: var(--text-faint); }
+.ownsync-history-item .ownsync-quiet { margin-inline-start: var(--size-2-2); white-space: nowrap; }
 .ownsync-snapshot-tree summary, .ownsync-snapshot-review summary {
 	cursor: pointer; padding: var(--size-2-2) var(--size-4-2); overflow-wrap: anywhere;
 }
 .ownsync-snapshot-branch { margin-inline-start: var(--size-4-2); }
-.ownsync-snapshot-text {
-	max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
-	padding: var(--size-4-2); border: 1px solid var(--background-modifier-border);
-	border-radius: var(--radius-m); font-size: var(--font-ui-small);
-}
-.ownsync-snapshot-added { color: var(--text-success); }
-.ownsync-snapshot-removed { color: var(--text-error); }
-.ownsync-snapshot-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: var(--size-4-2); margin-top: var(--size-4-3); }
-@media (max-width: 600px) {
-	.ownsync-snapshot-browser { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 2fr) minmax(0, 3fr); }
-}
 
-.ownsync-history-diff-summary,
-.ownsync-history-diff-added,
-.ownsync-history-diff-removed { display: block; }
-.ownsync-history-diff-summary { margin-bottom: var(--size-2-3); color: var(--text-muted); }
-.ownsync-history-diff-added { color: var(--text-success); }
-.ownsync-history-diff-removed { color: var(--text-error); }
+/* Previews: the note's own font, in a hairline box. */
+.ownsync-history-preview, .ownsync-snapshot-text {
+	margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+	padding: var(--size-4-2); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m);
+	font-family: var(--font-text); font-size: var(--font-ui-small); color: var(--text-normal);
+}
+.ownsync-history-preview { flex: 1; min-height: 0; }
+.ownsync-snapshot-preview { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: var(--size-4-2); }
+.ownsync-snapshot-text { max-height: 40vh; }
+.ownsync-snapshot-view h3 { margin: 0; font-size: var(--font-ui-medium); overflow-wrap: anywhere; }
+.ownsync-snapshot-view p { margin: 0; overflow-wrap: anywhere; }
+.ownsync-history-diff-summary, .ownsync-history-diff-added, .ownsync-history-diff-removed { display: block; }
+.ownsync-history-diff-summary { margin-bottom: var(--size-2-3); color: var(--text-muted); font-family: var(--font-interface); }
+.ownsync-history-diff-added, .ownsync-snapshot-added { color: var(--text-success); }
+.ownsync-history-diff-removed, .ownsync-snapshot-removed { color: var(--text-error); }
+
+/* Actions under a preview. */
+.ownsync-history-actions, .ownsync-snapshot-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: var(--size-4-2); }
+.ownsync-snapshot-actions { justify-content: flex-start; }
+.ownsync-history-actions button, .ownsync-snapshot-actions button { height: auto; min-height: var(--input-height); white-space: normal; }
+.ownsync-history-actions button[hidden] { display: none; }
+.ownsync-history-actions button.ownsync-quiet-button {
+	margin-inline-end: auto; padding: 0; min-height: 0; background: none; box-shadow: none; border: none;
+	color: var(--text-muted); font-size: var(--font-ui-small); text-decoration: underline; text-underline-offset: 2px;
+}
+.ownsync-history-actions button.ownsync-quiet-button:hover { color: var(--text-normal); background: none; }
+.ownsync-snapshot-review { max-height: 55vh; overflow: auto; }
+.ownsync-snapshot-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: var(--size-4-2); margin-top: var(--size-4-3); }
+
+@media (max-width: 600px) {
+	.ownsync-history, .ownsync-snapshot-browser { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 2fr) minmax(0, 3fr); }
+}
+.is-phone .ownsync-history, .is-phone .ownsync-snapshot-browser { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 2fr) minmax(0, 3fr); height: 70vh; }
+
+/* Presence avatars: other devices in this note, in its header. 28px touch target, 22px face, flat with a hairline ring. */
+.ownsync-avatars { display: flex; align-items: center; flex-shrink: 0; margin-inline-end: var(--size-2-2); }
+.ownsync-avatar {
+	display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; margin: 0;
+	background: transparent; border: none; box-shadow: none; border-radius: 50%; cursor: default;
+}
+.ownsync-avatar + .ownsync-avatar { margin-inline-start: -6px; }
+button.ownsync-avatar { cursor: pointer; }
+button.ownsync-avatar:hover, button.ownsync-avatar:active { background: transparent; box-shadow: none; }
+button.ownsync-avatar:focus-visible { box-shadow: none; outline: 2px solid var(--background-modifier-border-focus); outline-offset: -1px; }
+.ownsync-avatar-face {
+	display: flex; align-items: center; justify-content: center; box-sizing: border-box; width: 22px; height: 22px;
+	border-radius: 50%; border: 1px solid var(--background-primary);
+	font-size: 10px; font-weight: var(--font-semibold); line-height: 1; letter-spacing: 0.02em; user-select: none;
+}
+.ownsync-avatar-more { background: var(--background-secondary); color: var(--text-muted); }

@@ -2,7 +2,8 @@
 // from the server's dashboard, which also says which server; any other device is paired from one that already
 // syncs. The setup key is only ever typed on the dashboard.
 
-import { Modal, Notice } from "obsidian";
+import { Modal } from "obsidian";
+import { say } from "./notice";
 import { RecoverModal, type DevicesHost } from "./devices";
 import { paramsOfPairLink, parseVaultCode, trimHost } from "./links";
 import { type PairingHost, attachmentsToggle, handlePairLink, showPairingCode } from "./pairing";
@@ -122,7 +123,7 @@ export class SetupModal extends Modal {
 			buttons.createEl("button", { text: "Back" }).addEventListener("click", () => this.go("choose"));
 			const pair = async () => {
 				const params = paramsOfPairLink(pasted.value);
-				if (!params) return void new Notice("That isn't an Ownsync pairing link. Copy it again from your other device.", 8000);
+				if (!params) return void say("That isn't an Ownsync pairing link. Copy it again from your other device.", 8000);
 				this.close();
 				await handlePairLink(this.plugin, params);
 			};

@@ -2,7 +2,8 @@
 // with a recovery kit, removing a device, replacing the recovery key, recovering a vault on a new device, and
 // choosing between two competing device lists.
 
-import { type App, Modal, Notice, Platform, Setting } from "obsidian";
+import { type App, Modal, Platform, Setting } from "obsidian";
+import { say } from "./notice";
 import { decodeRecoveryCode, hex, openRecoveryPrivate, randomBytes } from "../../protocol/ownsync";
 import { type Candidate, type Recovery, type VaultKeys, newRecovery, shortId, vaultIdOf } from "./keys";
 import { isAllowedHost, trimHost } from "./links";
@@ -16,12 +17,12 @@ export interface DevicesHost {
 }
 
 const guarded = <A extends unknown[]>(fn: (...args: A) => Promise<void>) => (...args: A): Promise<void> =>
-	fn(...args).catch((err) => void new Notice(`Ownsync: ${err instanceof Error ? err.message : String(err)}`, 10000));
+	fn(...args).catch((err) => void say(`Ownsync: ${err instanceof Error ? err.message : String(err)}`, 10000));
 
 function synced(host: DevicesHost) {
 	const s = host.session;
 	if (s?.transport.status === "synced") return s;
-	new Notice("Wait until Ownsync shows synced, then try again.", 7000);
+	say("Wait until Ownsync shows synced, then try again.", 7000);
 	return null;
 }
 
@@ -58,7 +59,7 @@ function showRecoveryKit(app: App, why: string, host: string, vaultId: string, c
 		new Setting(modal.contentEl).setName("I have saved this kit somewhere safe").addToggle((t) => t.onChange((v) => { saved = v; done.disabled = !v; }));
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Copy" }).addEventListener("click", () => {
-			void navigator.clipboard.writeText(kit).then(() => new Notice("Recovery kit copied."), () => new Notice("Failed to copy the recovery kit.", 6000));
+			void navigator.clipboard.writeText(kit).then(() => say("Recovery kit copied."), () => say("Failed to copy the recovery kit.", 6000));
 		});
 		// Outside the vault on purpose: the vault syncs, and the recovery code must not.
 		if (!Platform.isMobile) buttons.createEl("button", { text: "Save as file" }).addEventListener("click", () => {
@@ -81,7 +82,7 @@ function showRecoveryKit(app: App, why: string, host: string, vaultId: string, c
 export const createVault = guarded(async (host: DevicesHost, server: string, vaultId: string = hex(randomBytes(16))) => {
 	const recovery = await newRecovery(await vaultIdOf(vaultId));
 	const saved = await showRecoveryKit(host.app, "A recovery key is optional, and recommended.", server, vaultId, recovery.code, "Skip: no recovery key");
-	if (!saved) return void new Notice("Nothing was created.");
+	if (!saved) return void say("Nothing was created.");
 	await host.setUp(server, vaultId, new Map([[0, randomBytes(32)]]), (keys) => keys.genesis(saved === true ? recovery : undefined));
 });
 
@@ -96,11 +97,11 @@ export const removeDevice = guarded(async (host: DevicesHost, id: Uint8Array) =>
 		// It knows the current recovery public key: with the server's help it could plant a fake history that a recovery would trust.
 		recovery = await newRecovery(s.keys.vaultId);
 		const why = "A lost or stolen device knows your current recovery key, so it is replaced as well.";
-		if (!(await showRecoveryKit(host.app, why, host.settings.host, host.settings.vaultId, recovery.code))) return void new Notice("Nothing was removed.");
+		if (!(await showRecoveryKit(host.app, why, host.settings.host, host.settings.vaultId, recovery.code))) return void say("Nothing was removed.");
 	}
 	await s.keys.remove(id, recovery);
 	s.transport.offer();
-	new Notice(recovery ? "Removing the device, then replacing the recovery key." : answer === 1 && hasRecovery ? "Removing the device. Consider replacing the recovery key too." : "Removing the device.", 8000);
+	say(recovery ? "Removing the device, then replacing the recovery key." : answer === 1 && hasRecovery ? "Removing the device. Consider replacing the recovery key too." : "Removing the device.", 8000);
 });
 
 export const replaceRecovery = guarded(async (host: DevicesHost) => {
@@ -108,7 +109,7 @@ export const replaceRecovery = guarded(async (host: DevicesHost) => {
 	if (!s) return;
 	const recovery = await newRecovery(s.keys.vaultId);
 	if (!(await showRecoveryKit(host.app, "This replaces the old recovery code, which stops working.", host.settings.host, host.settings.vaultId, recovery.code))) {
-		return void new Notice("The recovery key was not changed.");
+		return void say("The recovery key was not changed.");
 	}
 	await s.keys.replaceRecovery(recovery);
 	s.transport.offer();
@@ -124,9 +125,9 @@ export const recoverVault = guarded(async (host: DevicesHost, server: string, va
 	await openRecoveryPrivate(decodeRecoveryCode(code), id, recovery).catch(() => { throw new Error("this recovery code doesn't open the vault"); });
 	const next = await newRecovery(id);
 	const why = "Recovering uses up the old recovery code, and removes every other device (pair them again afterwards). Here is the new kit.";
-	if (!(await showRecoveryKit(host.app, why, server, vaultId, next.code))) return void new Notice("Nothing changed.");
+	if (!(await showRecoveryKit(host.app, why, server, vaultId, next.code))) return void say("Nothing changed.");
 	await host.setUp(server, vaultId, new Map(), (keys) => keys.recover(code, recovery, records, next));
-	new Notice("Recovered. Ownsync catches up, then gives the vault a new key.", 10000);
+	say("Recovered. Ownsync catches up, then gives the vault a new key.", 10000);
 });
 
 export class RecoverModal extends Modal {

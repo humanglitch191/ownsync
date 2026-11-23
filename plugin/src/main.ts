@@ -1,4 +1,5 @@
 import { type App, type EventRef, Events, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, apiVersion, normalizePath, requestUrl, setIcon } from "obsidian";
+import { say } from "./notice";
 import { cleanName, deviceNames } from "./collab";
 import { docTag, hex, randomBytes, sha256 } from "../../protocol/ownsync";
 import { Engine } from "./core/engine";
@@ -112,7 +113,7 @@ export default class OwnsyncPlugin extends Plugin {
 		}
 		this.statusEl = this.addStatusBarItem();
 		this.statusEl.addClass("mod-clickable");
-		const showStatus = () => (this.hasKey() ? new Notice(this.describe(), 10000) : this.openSetup());
+		const showStatus = () => (this.hasKey() ? say(this.describe(), 10000) : this.openSetup());
 		this.registerDomEvent(this.statusEl, "click", showStatus);
 		// Phones hide the status bar: the ribbon (the menu there) carries the status.
 		this.ribbonEl = this.addRibbonIcon(STATUS_ICON[this.status], "Ownsync", showStatus);
@@ -120,7 +121,8 @@ export default class OwnsyncPlugin extends Plugin {
 		installConflictNotice(this);
 		this.addCommand({ id: "copy-diagnostics", name: "Copy diagnostics", callback: () => this.showDiagnostics() });
 		this.registerEditorExtension(editorBinding.of([]));
-		this.registerObsidianProtocolHandler("ownsync-pair", (params) => void handlePairLink(this, params));
+		// Paired from a link opened elsewhere (a QR code, the browser): the Set up screen has nothing left to do.
+		this.registerObsidianProtocolHandler("ownsync-pair", (params) => void handlePairLink(this, params).then((ok) => { if (ok) this.setup?.close(); }));
 		// Any web page can open this link: it only ever opens a note of this vault.
 		this.registerObsidianProtocolHandler("ownsync-open", (params) => void this.openNoteLink(params));
 		this.addCommand({ id: "copy-url", name: "Copy URL", checkCallback: (checking) => {
@@ -132,14 +134,14 @@ export default class OwnsyncPlugin extends Plugin {
 			if (id) menu.addItem((item) => item.setTitle("Copy URL").setIcon("link").onClick(() => this.copyUrl(id)));
 		}));
 		this.registerObsidianProtocolHandler("ownsync-setup", (params) => {
-			if (this.hasKey()) return void new Notice("This vault already syncs with Ownsync, so the setup link was ignored.", 8000);
+			if (this.hasKey()) return void say("This vault already syncs with Ownsync, so the setup link was ignored.", 8000);
 			this.openSetup(parseSetupLink(params) ?? "");
 		});
 		this.addCommand({ id: "set-up", name: "Set up", checkCallback: (checking) => !this.hasKey() && (checking || this.openSetup(), true) });
 		this.addCommand({ id: "pair-device", name: "Add a device", checkCallback: (checking) => this.hasKey() && (checking || void showPairingCode(this), true) });
 		this.addCommand({ id: "open-dashboard", name: "Open dashboard", checkCallback: (checking) => this.hasKey() && (checking || openDashboard(this), true) });
 		// Phones have no status bar, so the status is also a command.
-		this.addCommand({ id: "show-status", name: "Show sync status", callback: () => new Notice(this.describe(), 10000) });
+		this.addCommand({ id: "show-status", name: "Show sync status", callback: () => say(this.describe(), 10000) });
 		// Phones suspend the app and drop its connection without telling it: reconnect when it comes back.
 		const wake = () => { if (document.visibilityState === "visible" && this.status === "offline") void this.session?.transport.connect().catch(() => {}); };
 		this.registerDomEvent(document, "visibilitychange", wake);
@@ -241,21 +243,23 @@ export default class OwnsyncPlugin extends Plugin {
 	/** A note's web link, for anyone who syncs this vault. */
 	private copyUrl(noteId: string): void {
 		const url = noteUrl(this.settings.host, this.settings.vaultId, noteId);
-		void navigator.clipboard.writeText(url).then(() => new Notice("Link copied. It opens this note for anyone in this vault."), () => new Notice("Failed to copy the link.", 6000));
+		void navigator.clipboard.writeText(url).then(() => say("Link copied. It opens this note for anyone in this vault."), () => say("Failed to copy the link.", 6000));
 	}
 
 	private async openNoteLink(params: Record<string, string>): Promise<void> {
 		const link = parseOpenLink(params);
-		if (!link) return void new Notice("This Ownsync link is incomplete.", 6000);
-		if (!this.hasKey() || link.vaultId !== this.settings.vaultId) return void new Notice("This link is for another vault.", 6000);
-		if (!this.session) return void new Notice("Ownsync is still starting. Open the link again in a moment.", 6000);
+		if (!link) return void say("This Ownsync link is incomplete.", 6000);
+		if (!this.hasKey() || link.vaultId !== this.settings.vaultId) return void say("This link is for another vault.", 6000);
+		if (!this.session) return void say("Ownsync is still starting. Open the link again in a moment.", 6000);
 		const path = this.pathOf(link.noteId), file = path ? this.app.vault.getFileByPath(path) : null;
-		if (!file) return void new Notice("That note was deleted. Look in Recently deleted.", 8000);
+		if (!file) return void say("That note was deleted. Look in Recently deleted.", 8000);
 		await this.app.workspace.getLeaf().openFile(file);
 	}
 
+	private setup?: SetupModal;
 	openSetup(code = ""): void {
-		new SetupModal(this, code).open();
+		this.setup?.close();
+		(this.setup = new SetupModal(this, code)).open();
 	}
 
 	onunload(): void {
@@ -490,7 +494,7 @@ export default class OwnsyncPlugin extends Plugin {
 		text.rows = 10;
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Copy", cls: "mod-cta" }).addEventListener("click", () => {
-			void navigator.clipboard.writeText(report).then(() => new Notice("Diagnostics copied."), () => new Notice("Failed to copy the diagnostics.", 6000));
+			void navigator.clipboard.writeText(report).then(() => say("Diagnostics copied."), () => say("Failed to copy the diagnostics.", 6000));
 		});
 		modal.open();
 	}
@@ -504,16 +508,16 @@ export default class OwnsyncPlugin extends Plugin {
 		this.statusEl.setText(`Ownsync: ${STATUS_TEXT[status]}${this.problems.length ? ` (${this.problems.length} problem${this.problems.length > 1 ? "s" : ""})` : ""}`);
 		if (!changed) return; // problems call this again in the same state: tell once per change
 		this.snapshotSyncEvents.trigger("change");
-		if (status === "unauthorized") new Notice("Ownsync: the Worker rejected this vault's key. Pair this device again from one that syncs.", 15000);
-		if (status === "needs owner code") new Notice("Ownsync: the Worker refused this vault's code: it was already used or has expired. Use Settings → Ownsync → Leave this vault, then connect again with a new code from your Worker's dashboard.", 15000);
-		if (status === "deleted") new Notice("Ownsync: This vault was deleted from the Worker. Your notes stay on this device. Use Leave this vault, then set up again.", 15000);
+		if (status === "unauthorized") say("Ownsync: the Worker rejected this vault's key. Pair this device again from one that syncs.", 15000);
+		if (status === "needs owner code") say("Ownsync: the Worker refused this vault's code: it was already used or has expired. Use Settings → Ownsync → Leave this vault, then connect again with a new code from your Worker's dashboard.", 15000);
+		if (status === "deleted") say("Ownsync: This vault was deleted from the Worker. Your notes stay on this device. Use Leave this vault, then set up again.", 15000);
 	}
 
 	// One note failing must not stop the rest, but the user must be able to find out.
 	private problem(what: string, err: unknown): void {
 		const line = `${what}: ${err instanceof Error ? err.message : String(err)}`;
 		console.error("[ownsync]", what, err);
-		if (!this.problems.includes(line)) new Notice(`Ownsync: ${line}`, 10000);
+		if (!this.problems.includes(line)) say(`Ownsync: ${line}`, 10000);
 		this.problems = [...this.problems.filter((p) => p !== line), line].slice(-20);
 		this.setStatus(this.status);
 	}
@@ -542,6 +546,7 @@ class OwnsyncSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl, plugin } = this;
 		containerEl.empty();
+		containerEl.addClass("ownsync-settings");
 		plugin.onStatusChange = null;
 		if (!plugin.hasKey()) {
 			new Setting(containerEl)
@@ -552,6 +557,8 @@ class OwnsyncSettingTab extends PluginSettingTab {
 				.setName("Recover a vault")
 				.setDesc("Lost every device? Use the recovery kit you saved when you set up the vault.")
 				.addButton((b) => b.setButtonText("Recover").onClick(() => new RecoverModal(plugin, () => this.display()).open()));
+			this.thisDevice(containerEl);
+			this.history(containerEl);
 			this.advanced(containerEl);
 			return;
 		}
@@ -563,39 +570,59 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		};
 		showStatus();
 		plugin.onStatusChange = showStatus;
-		new Setting(containerEl)
-			.setName("Add a device")
-			.setDesc(createFragment((f) => {
-				f.appendText("Your phone, tablet or another computer: shows a one-time code to scan.");
-				f.createEl("br");
-				f.appendText("Someone else's device joins the same way, and can read and change every note.");
-			}))
-			.addButton((b) => b.setButtonText("Add a device").setCta().onClick(() => void showPairingCode(plugin)));
-		new Setting(containerEl)
-			.setName("Dashboard")
-			.setDesc("See your devices, when each last synced, conflicts, and how much of Cloudflare's free plan you use. Opens your Worker's page in the browser; sign in with your passkey.")
-			.addButton((b) => b.setButtonText("Open dashboard").onClick(() => openDashboard(plugin)));
-		new Setting(containerEl)
-			.setName("Add another vault")
-			.setDesc("Sync a different Obsidian vault through the same Worker. Your dashboard walks you through it.")
-			.addButton((b) => b.setButtonText("Connect another vault").onClick(() => openDashboard(plugin, "connect")));
-		new Setting(containerEl)
-			.setName("Device name")
-			.setDesc("Shown next to this device's cursor on your other devices, and on your Worker's dashboard.")
-			.addText((t) => t.setPlaceholder(plugin.deviceName).setValue(plugin.settings.deviceName).onChange(async (v) => {
-				plugin.settings.deviceName = v;
-				await plugin.saveData(plugin.settings);
-				plugin.session?.editors.setName(plugin.deviceName);
-				plugin.namesChanged();
-			}));
+		this.thisDevice(containerEl);
 		this.devices(containerEl);
+		this.history(containerEl);
+		new Setting(containerEl).setName("Snapshots").setHeading();
+		snapshotSettings(containerEl, plugin);
+		this.recovery(containerEl);
 		this.advanced(containerEl);
 		new Setting(containerEl).setName("Leave or delete").setHeading();
 		new Setting(containerEl)
 			.setName("Leave this vault")
-			.setDesc("This device stops syncing and forgets the vault's key. Your notes stay here as ordinary files, and the vault keeps syncing on your other devices.")
+			.setDesc("This device stops syncing and forgets the vault's key. Your notes stay here as ordinary files; your other devices keep syncing.")
 			.addButton((b) => b.setButtonText("Leave").setWarning().onClick(() => this.confirmLeave()));
 		this.deleteFromServer(containerEl);
+	}
+
+	private thisDevice(containerEl: HTMLElement): void {
+		const { plugin } = this;
+		new Setting(containerEl).setName("This device").setHeading();
+		new Setting(containerEl)
+			.setName("Device name")
+			.setDesc("How your other devices, and your Worker's dashboard, show this one.")
+			.addText((t) => t.setPlaceholder(plugin.deviceName).setValue(plugin.settings.deviceName).onChange((v) => plugin.setDeviceName(v)));
+		new Setting(containerEl)
+			.setName("Sync attachments")
+			.setDesc("Images, PDFs and other files. Off: this device syncs notes only, and leaves attachments on your other devices alone.")
+			.addToggle((t) => t.setValue(plugin.attachments).onChange(async (on) => { await plugin.setAttachments(on); this.display(); }));
+	}
+
+	private history(containerEl: HTMLElement): void {
+		const { plugin } = this;
+		new Setting(containerEl).setName("History").setHeading();
+		new Setting(containerEl)
+			.setName("Back up history to your Worker")
+			.setDesc("Encrypted copies of the notes you edit here, kept 30 days on your Worker. Each device has its own setting.")
+			.addToggle((toggle) => toggle.setValue(plugin.settings.backUpHistoryToWorker).onChange(async (on) => {
+				const { host, vaultId } = plugin.settings;
+				plugin.settings.backUpHistoryToWorker = on;
+				if (!on) plugin.session?.historyBackup.discardUploads();
+				toggle.setDisabled(true);
+				try {
+					await plugin.saveData(plugin.settings);
+				} catch {
+					plugin.settings.backUpHistoryToWorker = !on;
+					toggle.setValue(!on);
+					say("Couldn't save the history backup setting.");
+					return;
+				} finally {
+					toggle.setDisabled(false);
+				}
+				if (!on && plugin.hasKey() && plugin.settings.host === host && plugin.settings.vaultId === vaultId) {
+					this.confirmDeleteHistoryBackups(host, vaultId);
+				}
+			}));
 	}
 
 	private confirmLeave(): void {
@@ -614,48 +641,26 @@ class OwnsyncSettingTab extends PluginSettingTab {
 
 	private advanced(containerEl: HTMLElement): void {
 		const { plugin } = this;
-		new Setting(containerEl)
-			.setName("Sync attachments")
-			.setDesc("Images, PDFs and other files. Off: this device syncs notes only, and leaves attachments on your other devices alone.")
-			.addToggle((t) => t.setValue(plugin.attachments).onChange(async (on) => { await plugin.setAttachments(on); this.display(); }));
-		new Setting(containerEl)
-			.setName("Back up history to your Worker")
-			.setDesc("Encrypted copies of notes you edit on this device, kept 30 days on your Worker. Off stops this device's backups. Your other devices have their own setting.")
-			.addToggle((toggle) => toggle.setValue(plugin.settings.backUpHistoryToWorker).onChange(async (on) => {
-				const { host, vaultId } = plugin.settings;
-				plugin.settings.backUpHistoryToWorker = on;
-				if (!on) plugin.session?.historyBackup.discardUploads();
-				toggle.setDisabled(true);
-				try {
-					await plugin.saveData(plugin.settings);
-				} catch {
-					plugin.settings.backUpHistoryToWorker = !on;
-					toggle.setValue(!on);
-					new Notice("Couldn't save the history backup setting.");
-					return;
-				} finally {
-					toggle.setDisabled(false);
-				}
-				if (!on && plugin.hasKey() && plugin.settings.host === host && plugin.settings.vaultId === vaultId) {
-					this.confirmDeleteHistoryBackups(host, vaultId);
-				}
-			}));
-		if (plugin.hasKey()) snapshotSettings(containerEl, plugin);
 		new Setting(containerEl).setName("Advanced").setHeading();
-		if (!plugin.attachments) return this.vaultFacts(containerEl);
-		let mb = String(plugin.settings.maxFileMB);
-		new Setting(containerEl)
-			.setName("Largest attachment (MB)")
-			.setDesc("Larger files are reported and not synced. The Worker holds at most about 1 GB in all.")
-			.addText((t) => t.setValue(mb).onChange((v) => { mb = v.trim(); }))
-			.addButton((b) => b.setButtonText("Save").onClick(async () => {
-				const n = Number(mb);
-				if (!(n > 0)) return void new Notice("Enter a number of megabytes.");
-				plugin.settings.maxFileMB = n;
-				await plugin.saveData(plugin.settings);
-				await plugin.restart();
-				this.display();
-			}));
+		if (plugin.attachments) {
+			let mb = String(plugin.settings.maxFileMB);
+			new Setting(containerEl)
+				.setName("Largest attachment (MB)")
+				.setDesc("Larger files are reported and not synced. The Worker holds at most about 1 GB in all.")
+				.addText((t) => { t.inputEl.addClass("ownsync-narrow"); t.setValue(mb).onChange((v) => { mb = v.trim(); }); })
+				.addButton((b) => b.setButtonText("Save").onClick(async () => {
+					const n = Number(mb);
+					if (!(n > 0)) return void say("Enter a number of megabytes.");
+					plugin.settings.maxFileMB = n;
+					await plugin.saveData(plugin.settings);
+					await plugin.restart();
+					this.display();
+				}));
+		}
+		if (plugin.hasKey()) new Setting(containerEl)
+			.setName("Add another vault")
+			.setDesc("Sync a different Obsidian vault through the same Worker. Your dashboard walks you through it.")
+			.addButton((b) => b.setButtonText("Connect another vault").onClick(() => openDashboard(plugin, "connect")));
 		this.vaultFacts(containerEl);
 	}
 
@@ -670,7 +675,7 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			modal.close();
 			if (plugin.settings.backUpHistoryToWorker || plugin.settings.host !== host || plugin.settings.vaultId !== vaultId) return;
 			const cleared = await plugin.session?.historyBackup.forgetAll().catch(() => false);
-			new Notice(cleared ? "History backups deleted from the Worker." : "Couldn't delete history backups from the Worker.");
+			say(cleared ? "History backups deleted from the Worker." : "Couldn't delete history backups from the Worker.");
 		};
 		modal.open();
 	}
@@ -683,7 +688,7 @@ class OwnsyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl).setName("Vault ID").setDesc(short ? `${plugin.settings.vaultId}\nOn the Worker and its dashboard: ${short}` : plugin.settings.vaultId);
 		new Setting(containerEl)
 			.setName("Copy diagnostics")
-			.setDesc("A short report for a bug report, with no vault ID, Worker, device or note names. You read it before you copy it.")
+			.setDesc("A short report for a bug report. It names no vault, Worker, device or note, and you read it before copying.")
 			.addButton((b) => b.setButtonText("Show").onClick(() => plugin.showDiagnostics()));
 	}
 
@@ -710,9 +715,9 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			modal.close();
 			try {
 				await plugin.deleteFromServer();
-				new Notice("Ownsync: the vault was deleted from the Worker. Your notes stay on this device.", 10000);
+				say("Ownsync: the vault was deleted from the Worker. Your notes stay on this device.", 10000);
 			} catch (err) {
-				new Notice(`Ownsync: couldn't delete the vault: ${err instanceof Error ? err.message : String(err)}`, 10000);
+				say(`Ownsync: couldn't delete the vault: ${err instanceof Error ? err.message : String(err)}`, 10000);
 			}
 			this.display();
 		});
@@ -722,24 +727,40 @@ class OwnsyncSettingTab extends PluginSettingTab {
 	private devices(containerEl: HTMLElement): void {
 		const { plugin } = this;
 		const keys = plugin.session?.keys, head = keys?.state.head;
-		if (!keys || !head) return;
-		const me = hex(keys.me.id);
-		const label = (id: Uint8Array) => { const short = shortId(id), given = plugin.deviceNames.get(short); return given ? `${given} (${short})` : short; };
-		const name = (id: Uint8Array) => (hex(id) === me ? "this device" : label(id));
-		if (!this.namesAsked) {
-			this.namesAsked = true;
-			void plugin.refreshNames().then((changed) => { if (changed) this.display(); });
-		}
-		new Setting(containerEl).setName("Devices").setDesc("When and by which device each was paired is what the pairing device reported; it isn't verified. A stolen device can pair others before you remove it.").setHeading();
-		for (const m of head.members) {
-			const row = new Setting(containerEl)
-				.setName(`${label(m.id)}${hex(m.id) === me ? " (this device)" : ""}`)
-				.setDesc(`Paired ${new Date(m.pairedAt).toLocaleString()} by ${hex(m.pairedBy) === hex(m.id) ? "itself" : name(m.pairedBy)}.`);
-			if (hex(m.id) !== me) row.addButton((b) => b.setButtonText("Remove").setWarning().onClick(async () => { await removeDevice(plugin, m.id); this.display(); }));
+		new Setting(containerEl).setName("Devices").setDesc("Who paired each device, and when, is what the pairing device reported; it isn't verified. A stolen device can pair others until you remove it.").setHeading();
+		if (keys && head) {
+			const me = hex(keys.me.id);
+			const label = (id: Uint8Array) => { const short = shortId(id), given = plugin.deviceNames.get(short); return given ? `${given} (${short})` : short; };
+			const name = (id: Uint8Array) => (hex(id) === me ? "this device" : label(id));
+			if (!this.namesAsked) {
+				this.namesAsked = true;
+				void plugin.refreshNames().then((changed) => { if (changed) this.display(); });
+			}
+			for (const m of head.members) {
+				const row = new Setting(containerEl)
+					.setName(`${label(m.id)}${hex(m.id) === me ? " (this device)" : ""}`)
+					.setDesc(`Paired ${new Date(m.pairedAt).toLocaleString()} by ${hex(m.pairedBy) === hex(m.id) ? "itself" : name(m.pairedBy)}.`);
+				if (hex(m.id) !== me) row.addButton((b) => b.setButtonText("Remove").onClick(async () => { await removeDevice(plugin, m.id); this.display(); }));
+			}
 		}
 		new Setting(containerEl)
-			.setName("Recovery key")
-			.setDesc(head.recoveryPub ? "Set up. Replace it if the code may have been seen by someone else." : "None. Without one, losing every device loses the vault.")
-			.addButton((b) => b.setButtonText(head.recoveryPub ? "Replace" : "Set up").onClick(async () => { await replaceRecovery(plugin); this.display(); }));
+			.setName("Add a device")
+			.setDesc("Your phone, tablet or another computer. Anyone you add can read and change every note.")
+			.addButton((b) => b.setButtonText("Add a device").setCta().onClick(() => void showPairingCode(plugin)));
+		new Setting(containerEl)
+			.setName("Dashboard")
+			.setDesc("When each device last synced, conflicts, and how much of Cloudflare's free plan you use. Sign in with your passkey.")
+			.addButton((b) => b.setButtonText("Open dashboard").onClick(() => openDashboard(plugin)));
 	}
+
+	private recovery(containerEl: HTMLElement): void {
+		const head = this.plugin.session?.keys.state.head;
+		if (!head) return;
+		new Setting(containerEl).setName("Recovery key").setHeading();
+		new Setting(containerEl)
+			.setName(head.recoveryPub ? "Replace the recovery key" : "Set up a recovery key")
+			.setDesc(head.recoveryPub ? "One is set up. Replace it if someone else may have seen it." : "Without one, losing every device loses the vault.")
+			.addButton((b) => b.setButtonText(head.recoveryPub ? "Replace" : "Set up").onClick(async () => { await replaceRecovery(this.plugin); this.display(); }));
+	}
+
 }

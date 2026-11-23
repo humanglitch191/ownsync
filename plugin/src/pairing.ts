@@ -4,7 +4,8 @@
 // most), a fresh code replaces each one as it runs out. The link never contains the vault key; the Worker never
 // sees the code. The new device then adds itself to the membership log (keys.ts).
 
-import { type App, Modal, Notice, Setting, requestUrl } from "obsidian";
+import { type App, Modal, Setting, requestUrl } from "obsidian";
+import { say } from "./notice";
 import * as QRCode from "qrcode";
 import { hex, openFromPairing, pairingRoom, randomBytes, sealForPairing, unhex, unpackPairing } from "../../protocol/ownsync";
 import type { VaultKeys } from "./keys";
@@ -24,6 +25,9 @@ export interface PairingHost {
 	/** This device's name, given while pairing. */
 	deviceName: string;
 	setDeviceName(name: string): Promise<void>;
+	/** Names the devices gave themselves, by short ID, as the Worker last reported them. */
+	deviceNames: Map<string, string>;
+	refreshNames(): Promise<boolean>;
 }
 
 // A phone's camera opens web links, not obsidian:// ones, so the QR code goes through the server's own
@@ -52,10 +56,10 @@ export async function createPairingLink(host: PairingHost, renewal = false): Pro
 export async function showPairingCode(host: PairingHost): Promise<void> {
 	try {
 		const link = await createPairingLink(host);
-		if (!link) return void new Notice("Wait until Ownsync shows synced, then try again.", 7000);
+		if (!link) return void say("Wait until Ownsync shows synced, then try again.", 7000);
 		new PairDeviceModal(host, link).open();
 	} catch (err) {
-		new Notice(`Could not start pairing: ${String(err)}`, 8000);
+		say(`Could not start pairing: ${String(err)}`, 8000);
 	}
 }
 
@@ -63,51 +67,53 @@ export async function showPairingCode(host: PairingHost): Promise<void> {
 export async function handlePairLink(host: PairingHost, params: Record<string, string>): Promise<boolean> {
 	const link = parsePairLink(params);
 	if (!link) {
-		new Notice("This pairing link is incomplete or uses an insecure Worker address. Show a new code on your other device.", 8000);
+		say("This pairing link is incomplete or uses an insecure Worker address. Show a new code on your other device.", 8000);
 		return false;
 	}
 	const { host: server, vaultId, code: codeHex } = link;
 	// A device that already syncs takes no pairing link, not even one for its own vault: a link from anywhere could
 	// otherwise replace its keys with ones someone else holds. To pair it again, leave the vault first.
 	if (host.hasKey()) {
-		new Notice("This device already syncs a vault, so the pairing link was ignored. To pair it again, use Settings → Ownsync → Leave this vault first.", 12000);
+		say("This device already syncs a vault, so the pairing link was ignored. To pair it again, use Settings → Ownsync → Leave this vault first.", 12000);
 		return false;
 	}
 	let attachments = host.attachments, name = "";
-	const ok = await confirm(host.app, "Pair this device?", `Worker: ${server}. The notes in this Obsidian vault will be encrypted and synced with the vault on that Worker. Only continue if you got this code just now, from your own device or from the person whose vault this is.`, "Pair", (el) => {
+	const ok = await confirm(host.app, "Pair this device?", (el) => {
+		el.createEl("p", { cls: "ownsync-server", text: `Worker: ${server}` });
+		el.createEl("p", { cls: "ownsync-lead", text: "This vault's notes will be encrypted and synced through that Worker. Only continue if you got this code just now, from your own device or from the person whose vault this is." });
 		new Setting(el)
 			.setName("Device name")
-			.setDesc("Shown next to this device's cursor, and on the Worker's dashboard. For example: iPhone 17 Pro, or Anna's iPhone 17 Pro.")
+			.setDesc("How your other devices show this one. For example: Anna's iPhone 17 Pro.")
 			.addText((t) => t.setPlaceholder(host.deviceName).onChange((v) => (name = v)));
 		attachmentsToggle(el, attachments, (on) => (attachments = on));
 	});
 	if (!ok) {
-		new Notice("Pairing cancelled. Nothing changed.", 6000);
+		say("Pairing cancelled. Nothing changed.", 6000);
 		return false;
 	}
 
 	const code = unhex(codeHex);
 	const res = await requestUrl({ url: `${server}/pair/${await pairingRoom(code)}`, method: "GET", throw: false });
 	if (res.status === 410) {
-		new Notice("Someone else already used this pairing code, so they may hold the vault key. On a device that syncs, open Settings → Ownsync → Recovery key and press Replace (or Set up): the vault then gets a new key they don't have.", 20000);
+		say("Someone else already used this pairing code, so they may hold the vault key. On a device that syncs, open Settings → Ownsync → Recovery key and press Replace (or Set up): the vault then gets a new key they don't have.", 20000);
 		return false;
 	}
 	if (res.status !== 200) {
-		new Notice("This pairing code has run out. Scan the code now shown on your other device (it shows a fresh one every 2 minutes).", 10000);
+		say("This pairing code has run out. Scan the code now shown on your other device (it shows a fresh one every 2 minutes).", 10000);
 		return false;
 	}
 	let p: ReturnType<typeof unpackPairing>;
 	try {
 		p = unpackPairing(await openFromPairing(code, new Uint8Array(res.arrayBuffer)));
 	} catch {
-		new Notice("Pairing failed: the Worker returned something this code can't open. Both devices need the same Ownsync version.", 8000);
+		say("Pairing failed: the Worker returned something this code can't open. Both devices need the same Ownsync version.", 8000);
 		return false;
 	}
 	await host.setAttachments(attachments);
 	if (name.trim()) await host.setDeviceName(name);
 	await host.setUp(server, vaultId, new Map([[p.epoch, p.vmk]]), undefined, { number: p.number, hash: p.hash, pairedBy: p.pairerId });
 	const me = host.session?.keys.me.id;
-	new Notice(`Paired, and syncing.${me ? ` This device is ${shortId(me)}: your other device should show the same.` : ""}`, 15000);
+	say(`Paired and syncing.${me ? ` This device's ID is ${shortId(me)}: check that your other device shows the same.` : ""}`, 15000);
 	return true;
 }
 
@@ -119,16 +125,16 @@ export function attachmentsToggle(el: HTMLElement, on: boolean, set: (on: boolea
 		.addToggle((t) => t.setValue(on).onChange(set));
 }
 
-function confirm(app: App, title: string, message: string, action = "Pair", extra?: (el: HTMLElement) => void): Promise<boolean> {
+function confirm(app: App, title: string, body: (el: HTMLElement) => void): Promise<boolean> {
 	return new Promise((resolve) => {
 		const modal = new Modal(app);
 		let answer = false;
+		modal.modalEl.addClass("ownsync-setup");
 		modal.titleEl.setText(title);
-		modal.contentEl.createEl("p", { text: message });
-		extra?.(modal.contentEl);
+		body(modal.contentEl);
 		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
-		buttons.createEl("button", { text: action, cls: "mod-warning" }).addEventListener("click", () => { answer = true; modal.close(); });
+		buttons.createEl("button", { text: "Pair", cls: "mod-cta" }).addEventListener("click", () => { answer = true; modal.close(); });
 		modal.onClose = () => resolve(answer);
 		modal.open();
 	});
@@ -170,19 +176,21 @@ class PairDeviceModal extends Modal {
 	private showCode(): void {
 		const el = this.contentEl;
 		el.empty();
-		el.createEl("p", { cls: "ownsync-lead", text: "On a phone or tablet, scan this code with its camera. On a computer, copy the link and open it there." });
+		el.createEl("p", { cls: "ownsync-lead", text: "Scan this code with the new device's camera, or copy the link and open it there." });
 		const qr = el.createDiv({ cls: "ownsync-qr" });
 		const canvas = qr.createEl("canvas");
 		canvas.setAttr("aria-label", "One-time pairing code");
 		void QRCode.toCanvas(canvas, pairPage(this.link), { width: 220, margin: 2 }).catch(() => canvas.replaceWith(createEl("p", { text: "Could not draw the QR code; use the link instead." })));
-		el.createEl("p", { cls: "ownsync-quiet ownsync-center", attr: { "data-countdown": "" } });
-		el.createEl("p", { cls: "ownsync-quiet", text: "Ownsync not on the new device yet? Scanning shows how to install it; then scan again, as a fresh code appears here every 2 minutes." });
-		el.createEl("p", { cls: "ownsync-quiet", text: "Anyone who scans or copies this code before your device does gets your notes. Don't share or screenshot it." });
-		const buttons = el.createDiv({ cls: "modal-button-container" });
-		buttons.createEl("button", { text: "Copy link" }).addEventListener("click", () => {
-			void navigator.clipboard.writeText(this.link).then(() => new Notice("Pairing link copied. Open it on the new device within 2 minutes."), () => new Notice("Failed to copy the pairing link.", 6000));
+		const copy = el.createDiv({ cls: "ownsync-center" }).createEl("button", { text: "Copy link", cls: "mod-cta" });
+		copy.addEventListener("click", () => {
+			void navigator.clipboard.writeText(this.link).then(() => {
+				copy.setText("Copied");
+				window.setTimeout(() => copy.setText("Copy link"), 2000);
+			}, () => say("Failed to copy the pairing link.", 6000));
 		});
-		buttons.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());
+		el.createEl("p", { cls: "ownsync-quiet ownsync-center", attr: { "data-countdown": "" } });
+		el.createEl("p", { cls: "ownsync-quiet", text: "Ownsync not on the new device yet? Scanning shows how to install it." });
+		el.createEl("p", { cls: "ownsync-quiet", text: "Anyone who uses this code before your device does gets your notes. Don't share or screenshot it." });
 		this.countdown();
 	}
 
@@ -192,7 +200,7 @@ class PairDeviceModal extends Modal {
 
 	private async tick(): Promise<void> {
 		const joined = this.members().find((id) => !this.known.has(id));
-		if (joined) return this.joined(joined);
+		if (joined) return void this.joined(joined);
 		if (Date.now() < this.expires) return this.countdown();
 		// Out of time, or nobody is looking: stop handing out codes until the user asks again.
 		if (Date.now() - this.opened >= SCREEN_MS || document.visibilityState !== "visible") return this.stopped();
@@ -222,16 +230,23 @@ class PairDeviceModal extends Modal {
 		});
 	}
 
-	private joined(id: string): void {
+	private async joined(id: string): Promise<void> {
 		if (this.timer !== null) window.clearInterval(this.timer);
 		this.timer = null;
-		const el = this.contentEl;
+		const el = this.contentEl, short = shortId(unhex(id));
 		el.empty();
-		this.titleEl.setText("Device added");
-		el.createEl("p", { cls: "ownsync-lead", text: "A new device joined this vault. Check that the new device shows the same ID:" });
-		el.createDiv({ cls: "ownsync-id", text: shortId(unhex(id)) });
+		this.titleEl.setText("A new device joined");
+		el.createEl("p", { cls: "ownsync-lead", text: "Check that it shows the same ID:" });
+		el.createDiv({ cls: "ownsync-id", text: short });
 		el.createEl("p", { cls: "ownsync-quiet", text: "If it doesn't match, someone else used the code: remove that device in Settings → Ownsync → Devices." });
 		const buttons = el.createDiv({ cls: "modal-button-container" });
 		buttons.createEl("button", { text: "Done", cls: "mod-cta" }).addEventListener("click", () => this.close());
+		// The new device reports its name once it syncs, a moment after it joins: ask the Worker a few times.
+		for (let i = 0; i < 6 && this.containerEl.isConnected; i++) {
+			const name = this.host.deviceNames.get(short);
+			if (name) return void this.titleEl.setText(`${name} joined`);
+			await new Promise((r) => window.setTimeout(r, 1500));
+			await this.host.refreshNames();
+		}
 	}
 }

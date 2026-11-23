@@ -1,6 +1,7 @@
 // Local copies live in IndexedDB. Only an explicit restore writes to the vault.
 
-import { type App, type Command, type EventRef, FileView, Modal, Notice, TFile, TFolder } from "obsidian";
+import { type App, type Command, type EventRef, FileView, Modal, TFile, TFolder } from "obsidian";
+import { say } from "./notice";
 import { type EditorState, type Extension, StateField, type Text, Transaction } from "@codemirror/state";
 import { type EditorView, ViewPlugin } from "@codemirror/view";
 import { ySyncAnnotation, ySyncFacet } from "y-codemirror.next";
@@ -179,7 +180,7 @@ class History {
 		console.error("[ownsync] note history", err);
 		if (this.reported) return;
 		this.reported = true;
-		new Notice("Ownsync couldn't save note history.");
+		say("Ownsync couldn't save note history.");
 	};
 
 	private queue<T>(work: () => Promise<T>): Promise<T | undefined> {
@@ -502,7 +503,7 @@ class HistoryModal extends Modal {
 		const engine = file ? undefined : this.plugin.engine?.();
 		this.titleEl.setText(file ? "Note history" : "Recently deleted notes");
 		if (file) return this.showNote(file);
-		if (engine) this.contentEl.createEl("p", { text: "This list is the same on every device.", cls: "ownsync-lead" });
+		const lead = engine && this.contentEl.createEl("p", { text: "This list is the same on every device.", cls: "ownsync-lead" });
 		const status = this.contentEl.createEl("p", { text: "Loading…", cls: "ownsync-quiet", attr: { role: "status" } });
 		let rows: HistoryRow[] = [];
 		try {
@@ -515,7 +516,7 @@ class HistoryModal extends Modal {
 					restore: this.deletedRestore(entry.path, async () => {
 						if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
 						const path = await engine.restoreDeleted(entry.id);
-						new Notice(path ? `Restored ${path}.` : "Note restored.");
+						say(path ? `Restored ${path}.` : "Note restored.");
 					}),
 				}));
 			} else {
@@ -525,7 +526,10 @@ class HistoryModal extends Modal {
 			}
 			if (!this.showing) return;
 			if (rows.length) status.remove();
-			else status.setText("No recently deleted notes.");
+			else {
+				if (lead) lead.remove();
+				status.setText(`No deleted notes. Notes you delete show up here for 30 days${engine ? ", on every device" : ""}.`);
+			}
 		} catch {
 			if (!this.showing) return;
 			status.setText("Couldn't load recently deleted notes.");
@@ -539,15 +543,14 @@ class HistoryModal extends Modal {
 		const target = this.history.backupFor(path);
 		const fetching = target?.connected ? target.client.list(target.noteId).catch(() => []) : undefined;
 		this.contentEl.createEl("p", {
-			text: "This device saves copies up to once every 10 minutes and when you leave the note.",
+			text: "This device keeps a copy up to every 10 minutes while you edit, and when you leave the note.",
 			cls: "ownsync-lead",
 		});
 		const status = this.contentEl.createEl("p", { text: "Loading…", cls: "ownsync-quiet", attr: { role: "status" } });
-		const show = this.showEntries();
+		let forget!: HTMLButtonElement;
+		const show = this.showEntries((actions) => { forget = actions.createEl("button", { text: "Forget this note's history", cls: "ownsync-quiet-button" }); });
 		const current: HistoryRow = { label: "Now", read: () => this.app.vault.read(file) };
 		show([current]);
-		const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
-		const forget = actions.createEl("button", { text: "Forget this note's history" });
 		forget.onclick = () => {
 			const prompt = this.history.backupFor(file.path) ? "Delete this device's copies and clear the note's backup?" : "Delete this device's copies?";
 			this.confirm(forget, "Forget this note's history?", "Forget",
@@ -556,7 +559,7 @@ class HistoryModal extends Modal {
 					const result = await this.history.forgetNote(file.path);
 					if (!result) return;
 					if (this.showing) this.close();
-					if (await result.remote === false) new Notice("Local history cleared. Couldn't clear the backup.");
+					if (await result.remote === false) say("Local history cleared. Couldn't clear the backup.");
 				}, true);
 		};
 		const local = await this.history.list(path).then((entries) => Promise.all(entries.map(async (entry) => {
@@ -564,8 +567,10 @@ class HistoryModal extends Modal {
 			const text = await read();
 			if (text !== undefined) return { takenAt: entry.time, text, row: this.noteRow(file, read) };
 		}))).then((copies) => {
-			status.remove();
-			return copies.filter((copy) => copy !== undefined);
+			const saved = copies.filter((copy) => copy !== undefined);
+			if (saved.length) status.remove();
+			else status.setText("No earlier copies yet.");
+			return saved;
 		}, () => {
 			if (this.showing) status.setText("Couldn't load saved copies.");
 			return [];
@@ -581,6 +586,7 @@ class HistoryModal extends Modal {
 		if (!this.showing || !copies?.length) return;
 		const active = this.history.backupFor(file.path);
 		if (!active || active.client !== target?.client || active.noteId !== target.noteId) return;
+		status.remove();
 		const backedUp = copies.map(({ takenAt, text }) => ({ takenAt, text, row: this.noteRow(file, async () => text, true) }));
 		show([current, ...labelled(mergeCopies(local, backedUp))]);
 	}
@@ -628,12 +634,14 @@ class HistoryModal extends Modal {
 		};
 	}
 
-	private showEntries(): (entries: HistoryRow[]) => void {
+	private showEntries(extra?: (actions: HTMLElement) => void): (entries: HistoryRow[]) => void {
 		const body = this.contentEl.createDiv({ cls: "ownsync-history" });
 		const list = body.createDiv({ cls: "ownsync-history-list", attr: { role: "group", "aria-label": this.file ? "Note copies" : "Deleted notes" } });
 		const right = body.createDiv({ cls: "ownsync-history-right" });
 		const preview = right.createEl("pre", { cls: "ownsync-history-preview", attr: { tabindex: "0", "aria-label": "Note preview" } });
-		const restore = right.createEl("button", { text: "Restore", cls: "mod-cta" });
+		const actions = right.createDiv({ cls: "ownsync-history-actions" });
+		extra?.(actions);
+		const restore = actions.createEl("button", { text: "Restore", cls: "mod-cta" });
 		const buttons = new Map<HistoryRow, HTMLButtonElement>();
 		let selected: HTMLButtonElement | undefined;
 		let selection = 0;
@@ -716,7 +724,7 @@ class HistoryModal extends Modal {
 			await apply();
 			this.close();
 		} catch (err) {
-			new Notice(err instanceof Error ? `Couldn't restore the note. ${err.message}` : "Couldn't restore the note.");
+			say(err instanceof Error ? `Couldn't restore the note. ${err.message}` : "Couldn't restore the note.");
 		}
 	}
 
@@ -729,7 +737,7 @@ class HistoryModal extends Modal {
 		const path = await restorePath(entry.path, (to) => vault.adapter.exists(to));
 		await vault.create(path, text);
 		await this.history.forget(entry);
-		new Notice(`Restored ${path}.`);
+		say(`Restored ${path}.`);
 	}
 
 	onClose(): void {

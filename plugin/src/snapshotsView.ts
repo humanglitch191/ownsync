@@ -1,4 +1,5 @@
 import { type App, type Command, type EventRef, type Vault, Modal, Notice, Setting, normalizePath } from "obsidian";
+import { say } from "./notice";
 import { diffLines } from "./historyRules";
 import type { createSnapshots, SnapshotContent, SnapshotInfo, SnapshotNote } from "./snapshots";
 
@@ -156,7 +157,7 @@ async function copyIntoFolder(vault: Vault, date: string, notes: readonly Snapsh
 			written++;
 		} catch { /* A blocked path doesn't prevent other notes from being restored. */ }
 	}
-	new Notice(`Restored ${noteCount(written)} into the folder "${root}".${skippedNotice(notes.length - written, occupied)}`);
+	say(`Restored ${noteCount(written)} into the folder "${root}".${skippedNotice(notes.length - written, occupied)}`);
 }
 
 function skippedNotice(skipped: number, occupied: number): string {
@@ -228,7 +229,7 @@ async function replaceNotes(plugin: SnapshotsHost, changes: readonly Replacement
 			written++;
 		} catch { /* Continue with the other reviewed targets. */ }
 	}
-	new Notice(`Restored ${noteCount(written)} in place.${skippedNotice(changes.length - written, occupied)}`);
+	say(`Restored ${noteCount(written)} in place.${skippedNotice(changes.length - written, occupied)}`);
 }
 
 type Selection = { kind: "all" } | { kind: "folder"; path: string } | { kind: "note"; note: SnapshotNote };
@@ -273,8 +274,9 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 			const list = await this.api.list();
 			if (!this.showing) return;
 			if (!this.active()) return status.setText("The sync session changed. Reopen Vault snapshots.");
-			if (!list.length) return status.setText("No vault snapshots yet.");
-			status.remove();
+			if (!list.length) return status.setText(this.plugin.settings.snapshots ? "No vault snapshots yet. Ownsync takes one a day while this device syncs." : "No vault snapshots yet. Turn them on in Settings → Ownsync → Snapshots.");
+			status.setText("Encrypted copies of the whole vault, on your Worker. Pick one to see its notes.");
+			status.addClass("ownsync-lead");
 			const rows = this.contentEl.createDiv({ cls: "ownsync-snapshot-list" });
 			for (const info of [...list].sort((a, b) => b.day - a.day)) {
 				const flags = [snapshotDate(info.day, info.takenAt) ?? "Date unknown", info.missingOnServer ? "Size unknown" : sizeLabel(info.size)];
@@ -333,13 +335,13 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 		const tree = side.createDiv({ cls: "ownsync-snapshot-tree" });
 		const view = body.createDiv({ cls: "ownsync-snapshot-view" });
 		const title = view.createEl("h3");
-		const actions = view.createDiv({ cls: "ownsync-snapshot-actions" });
-		const copy = actions.createEl("button", { text: "Restore to a folder", cls: "mod-cta" });
+		const preview = view.createDiv({ cls: "ownsync-snapshot-preview" });
+		this.syncHint = view.createEl("p", { text: "Replacing notes in place works once sync is caught up and running.", cls: "ownsync-quiet" });
+		const actions = view.createDiv({ cls: "ownsync-history-actions" });
 		const replace = actions.createEl("button");
+		const copy = actions.createEl("button", { text: "Restore to a folder", cls: "mod-cta" });
 		if (notes.length) this.replaceButton = replace;
 		else replace.disabled = true;
-		this.syncHint = view.createEl("p", { text: "In-place restore is available when sync is caught up and running.", cls: "ownsync-lead" });
-		const preview = view.createDiv();
 
 		let selection: Selection = { kind: "all" };
 		let selectedNotes: readonly SnapshotNote[] = notes;
@@ -360,7 +362,7 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 			this.updateSync();
 			preview.empty();
 			if (next.kind !== "note") {
-				preview.createEl("p", { text: noteCount(selectedNotes.length), cls: "ownsync-lead" });
+				preview.createEl("p", { text: `${noteCount(selectedNotes.length)}. Select a note to see its text.`, cls: "ownsync-lead" });
 				return;
 			}
 			preview.createEl("pre", { text: next.note.text, cls: "ownsync-snapshot-text", attr: { "aria-label": "Snapshot text" } });
@@ -407,7 +409,7 @@ const snapshotsModal = () => class SnapshotsModal extends Modal {
 			try {
 				await copyIntoFolder(vault, date, selectedNotes, this.active);
 			} catch {
-				new Notice("Couldn't create a restore folder. Try again.");
+				say("Couldn't create a restore folder. Try again.");
 			} finally {
 				lock(false);
 			}
@@ -513,8 +515,8 @@ export function installSnapshots(plugin: SnapshotsHost): void {
 		if (running || stopped || !api || !plugin.snapshotsSynced()) return;
 		running = true;
 		try {
-			// Not in a device's first minutes after setup or pairing, and not over an open dialog.
-			const settled = Date.now() - (plugin.pairedAt?.() ?? 0) >= OFFER_AFTER && !document.querySelector(".modal-container");
+			// Not in a device's first minutes after setup or pairing, and not over an open dialog or another offer.
+			const settled = Date.now() - (plugin.pairedAt?.() ?? 0) >= OFFER_AFTER && !document.querySelector(".modal-container, .notice .ownsync-notice-actions");
 			if (!plugin.settings.snapshotsOffered && settled) {
 				plugin.settings.snapshotsOffered = true;
 				try {
@@ -528,7 +530,7 @@ export function installSnapshots(plugin: SnapshotsHost): void {
 			if (stopped || api !== plugin.snapshots() || !plugin.snapshotsSynced() || !plugin.settings.snapshots) return;
 			if (await api.takeIfDue() === "too large" && !tooLarge && !stopped && api === plugin.snapshots()) {
 				tooLarge = true;
-				new Notice("This vault exceeds the daily snapshot size limit.", 8000);
+				say("This vault exceeds the daily snapshot size limit.", 8000);
 			}
 		} catch { /* A background attempt can be retried on the next tick. */ }
 		finally {
@@ -552,7 +554,7 @@ export function installSnapshots(plugin: SnapshotsHost): void {
 		name: "Vault snapshots",
 		callback: () => {
 			const api = plugin.snapshots();
-			if (!api) return void new Notice("Set up Ownsync to view vault snapshots.");
+			if (!api) return void say("Set up Ownsync to view vault snapshots.");
 			modal?.close();
 			const View = snapshotsModal();
 			modal = new View(plugin, api);
@@ -592,7 +594,7 @@ async function saveSnapshotSetting(plugin: SnapshotsHost, enabled: boolean): Pro
 		await plugin.saveData(plugin.settings);
 	} catch (err) {
 		Object.assign(plugin.settings, previous);
-		new Notice("Couldn't save the snapshot setting.");
+		say("Couldn't save the snapshot setting.");
 		throw err;
 	}
 }
@@ -612,9 +614,9 @@ export function snapshotSettings(containerEl: HTMLElement, plugin: SnapshotsHost
 		}));
 	new Setting(containerEl).setName("Delete all snapshots")
 		.setDesc("Removes every vault snapshot from your Worker.")
-		.addButton((button) => button.setButtonText("Delete all snapshots").setWarning().onClick(() => {
+		.addButton((button) => button.setButtonText("Delete all snapshots").onClick(() => {
 			const api = plugin.snapshots();
-			if (!api) return void new Notice("Connect to your Worker to delete snapshots.");
+			if (!api) return void say("Connect to your Worker to delete snapshots.");
 			const modal = new Modal(plugin.app);
 			modal.setTitle("Delete all snapshots?");
 			modal.contentEl.createEl("p", { text: "This permanently deletes all vault snapshots from your Worker." });
@@ -623,15 +625,15 @@ export function snapshotSettings(containerEl: HTMLElement, plugin: SnapshotsHost
 			const remove = actions.createEl("button", { text: "Delete all snapshots", cls: "mod-warning" });
 			cancel.onclick = () => modal.close();
 			remove.onclick = async () => {
-				if (api !== plugin.snapshots()) return void new Notice("The sync session changed. Reopen snapshot settings.");
+				if (api !== plugin.snapshots()) return void say("The sync session changed. Reopen snapshot settings.");
 				remove.disabled = true;
 				try {
 					await api.remove();
 					modal.close();
-					new Notice("Vault snapshots deleted.");
+					say("Vault snapshots deleted.");
 				} catch {
 					remove.disabled = false;
-					new Notice("Couldn't delete vault snapshots.");
+					say("Couldn't delete vault snapshots.");
 				}
 			};
 			modal.open();
