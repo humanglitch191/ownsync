@@ -45,6 +45,8 @@ export interface VaultRpc {
 	cleanupSizes(): Promise<{ at: number; old: number; deleted: number }[]>;
 	cleanUp(ranges: unknown, zone: unknown, months: unknown): Promise<{ removed: number; more: boolean } | { error: string }>;
 	setSettings(settings: unknown): Promise<{ ok: true } | { error: string }>;
+	clearHistory(): Promise<{ ok: true } | { error: string }>;
+	clearSnapshots(): Promise<{ ok: true } | { error: string }>;
 }
 
 /** The server's version, shown on the dashboard. */
@@ -221,6 +223,14 @@ export class Dashboard {
 		if (settings) {
 			if (!this.vaults().some((v) => v.id === settings[1])) return fail(404, "no such vault");
 			const result = await this.vault(settings[1]!).setSettings(body);
+			return "error" in result ? fail(400, result.error) : json(result);
+		}
+		// Delete history backups, or all vault snapshots: everything of that kind on the Worker. Devices keep their notes.
+		const clear = path.match(/^\/api\/vaults\/([0-9a-f]{32})\/(history|snapshots)\/clear$/);
+		if (clear) {
+			if (!this.vaults().some((v) => v.id === clear[1])) return fail(404, "no such vault");
+			const vault = this.vault(clear[1]!);
+			const result = clear[2] === "history" ? await vault.clearHistory() : await vault.clearSnapshots();
 			return "error" in result ? fail(400, result.error) : json(result);
 		}
 		if (path === "/api/vault-code") {

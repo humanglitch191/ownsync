@@ -677,6 +677,20 @@ export class Vault extends DurableObject<Env> {
 		return { ok: true };
 	}
 
+	/** Delete history backups on the dashboard (an RPC from the Owner object, which checked the session and Origin). */
+	async clearHistory(): Promise<{ ok: true } | { error: string }> {
+		if (this.token === null || this.deleted) return { error: "no such vault" };
+		this.dropHistory("");
+		return { ok: true };
+	}
+
+	/** Delete all vault snapshots on the dashboard, as a device's snapshot/delete with no ID does. */
+	async clearSnapshots(): Promise<{ ok: true } | { error: string }> {
+		if (this.token === null || this.deleted) return { error: "no such vault" };
+		this.write("DELETE FROM snapshots");
+		return { ok: true };
+	}
+
 	async stats(): Promise<VaultStats> {
 		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [], settings: { snapshots: null, historyBackup: null } };
 		const online = new Set(this.ctx.getWebSockets().map((ws) => (ws.deserializeAttachment() as Session).device));

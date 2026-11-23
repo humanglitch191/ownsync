@@ -1,4 +1,4 @@
-import { type App, type Command, type EventRef, type Vault, Modal, Setting, normalizePath } from "obsidian";
+import { type App, type Command, type EventRef, type Vault, Modal, normalizePath } from "obsidian";
 import { say } from "./notice";
 import { diffLines } from "./historyRules";
 import type { createSnapshots, SnapshotContent, SnapshotInfo, SnapshotNote } from "./snapshots";
@@ -538,33 +538,4 @@ export function installSnapshots(plugin: SnapshotsHost): void {
 			modal.open();
 		},
 	});
-}
-
-export function snapshotSettings(containerEl: HTMLElement, plugin: SnapshotsHost): void {
-	new Setting(containerEl).setName("Delete all snapshots")
-		.setDesc("Removes every vault snapshot from your Worker.")
-		.addButton((button) => button.setButtonText("Delete all snapshots").onClick(() => {
-			const api = plugin.snapshots();
-			if (!api) return void say("Connect to your Worker to delete snapshots.");
-			const modal = new Modal(plugin.app);
-			modal.setTitle("Delete all snapshots?");
-			modal.contentEl.createEl("p", { text: "This permanently deletes all vault snapshots from your Worker." });
-			const actions = modal.contentEl.createDiv({ cls: "modal-button-container" });
-			const cancel = actions.createEl("button", { text: "Cancel" });
-			const remove = actions.createEl("button", { text: "Delete all snapshots", cls: "mod-warning" });
-			cancel.onclick = () => modal.close();
-			remove.onclick = async () => {
-				if (api !== plugin.snapshots()) return void say("The sync session changed. Reopen snapshot settings.");
-				remove.disabled = true;
-				try {
-					await api.remove();
-					modal.close();
-					say("Vault snapshots deleted.");
-				} catch {
-					remove.disabled = false;
-					say("Couldn't delete vault snapshots.");
-				}
-			};
-			modal.open();
-		}));
 }

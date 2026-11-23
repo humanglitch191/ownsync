@@ -15,7 +15,7 @@ import { noteUrl, parseOpenLink, parseSetupLink, trimHost } from "./links";
 import { handlePairLink, showPairingCode } from "./pairing";
 import { SetupModal, openDashboard } from "./setup";
 import { createSnapshots } from "./snapshots";
-import { installSnapshots, snapshotSettings } from "./snapshotsView";
+import { installSnapshots } from "./snapshotsView";
 import { type Status, Transport } from "./transport";
 import { VaultDisk } from "./vaultDisk";
 
@@ -636,11 +636,6 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			.setName("Storage on your Worker")
 			.setDesc("Replaced and deleted attachments stay on your Worker until you remove them. Your dashboard shows how much, by month or year.")
 			.addButton((b) => b.setButtonText("Clean up storage…").onClick(async () => openDashboard(plugin, `cleanup/${await vault()}`)));
-		new Setting(containerEl)
-			.setName("Delete history backups")
-			.setDesc("Removes the history backups of every device from your Worker.")
-			.addButton((b) => b.setButtonText("Delete history backups").onClick(() => this.confirmDeleteHistoryBackups(plugin.settings.host, plugin.settings.vaultId)));
-		snapshotSettings(containerEl, plugin);
 	}
 
 	private confirmLeave(): void {
@@ -680,22 +675,6 @@ class OwnsyncSettingTab extends PluginSettingTab {
 			.setDesc("Sync a different Obsidian vault through the same Worker. Your dashboard walks you through it.")
 			.addButton((b) => b.setButtonText("Connect another vault").onClick(() => openDashboard(plugin, "connect")));
 		this.vaultFacts(containerEl);
-	}
-
-	private confirmDeleteHistoryBackups(host: string, vaultId: string): void {
-		const { plugin } = this;
-		const modal = new Modal(this.app);
-		modal.titleEl.setText("Delete history backups?");
-		modal.contentEl.createEl("p", { text: "This permanently deletes the history backups on your Worker, the copies from all your devices." });
-		const buttons = modal.contentEl.createDiv({ cls: "modal-button-container" });
-		buttons.createEl("button", { text: "Keep backups" }).onclick = () => modal.close();
-		buttons.createEl("button", { text: "Delete backups", cls: "mod-warning" }).onclick = async () => {
-			modal.close();
-			if (plugin.settings.host !== host || plugin.settings.vaultId !== vaultId) return;
-			const cleared = await plugin.session?.historyBackup.forgetAll().catch(() => false);
-			say(cleared ? "History backups deleted from the Worker." : "Couldn't delete history backups from the Worker.");
-		};
-		modal.open();
 	}
 
 	private vaultFacts(containerEl: HTMLElement): void {

@@ -135,6 +135,28 @@ test("the setup key adds the first passkey: right key, in the window, once; stra
 	assert.equal((await device("snapshot", Buffer.concat([Buffer.alloc(16, 1), Buffer.from([0, 0, 0, 1, 7])]))).status, 403);
 	assert.equal((await settings({ historyBackup: true, snapshots: true })).status, 200);
 	assert.deepEqual(await shown(), { snapshots: true, historyBackup: true });
+	// Delete history backups, or all vault snapshots: the session and this site's own pages only; that vault's go, another's stay.
+	const other = await makeVault((await call("/api/vault-code", {}, { cookie: session.cookie! })).body.code.split("#")[1]);
+	const tag = Buffer.alloc(16, 3);
+	const post = (v: typeof vault, path: string, ...parts: Uint8Array[]) => fetch(`${ORIGIN}/vault/${v.id}/${path}`, { method: "POST", body: Buffer.concat([v.token, ...parts]) });
+	const history = async (v: typeof vault) => [...new Uint8Array(await (await post(v, "history/list", tag)).arrayBuffer())];
+	const snapshots = async (v: typeof vault) => ((await (await post(v, "snapshot/list")).json()) as unknown[]).length;
+	for (const v of [vault, other]) {
+		assert.equal((await post(v, "history", tag, Buffer.of(9))).status, 200);
+		assert.equal((await post(v, "snapshot", Buffer.alloc(16, 2), Buffer.from([0, 0, 0, 1, 7]))).status, 200);
+	}
+	for (const kind of ["history", "snapshots"]) {
+		const clear = (opts: { cookie: string; origin?: string }) => call(`/api/vaults/${vault.id}/${kind}/clear`, {}, opts);
+		assert.equal((await clear({ cookie: "" })).status, 401);
+		assert.equal((await clear({ cookie: session.cookie!, origin: "https://evil.example" })).status, 403);
+		assert.equal((await call(`/api/vaults/${"0".repeat(32)}/${kind}/clear`, {}, { cookie: session.cookie! })).status, 404);
+	}
+	assert.deepEqual([await history(vault), await history(other), await snapshots(vault), await snapshots(other)], [[0, 0, 0, 1, 9], [0, 0, 0, 1, 9], 1, 1]);
+	assert.deepEqual((await call(`/api/vaults/${vault.id}/history/clear`, {}, { cookie: session.cookie! })).body, { ok: true });
+	assert.deepEqual([await history(vault), await history(other), await snapshots(vault)], [[], [0, 0, 0, 1, 9], 1]);
+	assert.deepEqual((await call(`/api/vaults/${vault.id}/snapshots/clear`, {}, { cookie: session.cookie! })).body, { ok: true });
+	assert.deepEqual([await snapshots(vault), await snapshots(other), await history(other)], [0, 1, [0, 0, 0, 1, 9]]);
+	other.ws.close();
 	vault.ws.close();
 	assert.equal((await call("/api/logout", {}, { cookie: session.cookie! })).status, 200);
 	assert.equal((await call("/api/overview", undefined, { cookie: session.cookie! })).status, 401);
