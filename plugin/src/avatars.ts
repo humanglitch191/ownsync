@@ -26,18 +26,25 @@ export function textColour(hex: string): "#000" | "#fff" {
 }
 
 /**
- * Show `people` in a view's header, first among its action buttons (inside them, so a phone that hides the buttons
- * while the keyboard is open hides these too); nothing (and no element) when the list is empty.
+ * Show `people` in a view's header, first among its action buttons; nothing (and no element) when the list is empty.
+ * A phone hides the whole header while you type or scroll (`is-hidden-nav`), so a second, floating copy of the group
+ * sits at the top right of the note; CSS shows it only then.
  */
 export function showAvatars(view: HTMLElement, people: Person[], jump: (id: number) => void): void {
 	const actions = view.querySelector(".view-header .view-actions");
-	let box = view.querySelector<HTMLElement>(".ownsync-avatars");
-	if (!people.length || !actions) return void box?.remove();
+	let box = view.querySelector<HTMLElement>(".view-header .ownsync-avatars");
+	let float = view.querySelector<HTMLElement>(":scope > .ownsync-avatars-float");
+	if (!people.length || !actions) { box?.remove(); float?.remove(); return; }
 	const key = JSON.stringify(people);
-	if (box?.dataset.key === key) return; // a cursor moved: keep the elements, so an open tooltip stays
+	if (box?.dataset.key === key && float) return; // a cursor moved: keep the elements, so an open tooltip stays
 	if (!box) actions.prepend((box = createDiv({ cls: "ownsync-avatars", attr: { role: "group" } })));
-	box.empty();
+	if (!float) view.append((float = createDiv({ cls: "ownsync-avatars ownsync-avatars-float", attr: { role: "group" } })));
+	for (const group of [box, float]) fill(group, people, jump);
 	box.dataset.key = key;
+}
+
+function fill(box: HTMLElement, people: Person[], jump: (id: number) => void): void {
+	box.empty();
 	box.setAttr("aria-label", `In this note: ${people.map((p) => p.name).join(", ")}`);
 	const { shown, rest } = split(people);
 	for (const p of shown) {

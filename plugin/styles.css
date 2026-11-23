@@ -126,3 +126,12 @@ button.ownsync-avatar:focus-visible { box-shadow: none; outline: 2px solid var(-
 	font-size: 10px; font-weight: var(--font-semibold); line-height: 1; letter-spacing: 0.02em; user-select: none;
 }
 .ownsync-avatar-more { background: var(--background-secondary); color: var(--text-muted); }
+/* Phones: inside the header's button pill, the same room on the left as its icons have. */
+.is-phone .view-actions .ownsync-avatars { padding-inline-start: var(--size-4-2); }
+/* The floating copy: only while a phone hides the header (typing, scrolling), at the top right of the note. */
+.ownsync-avatars-float { display: none; }
+.is-phone.is-hidden-nav .ownsync-avatars-float {
+	display: flex; position: fixed; z-index: var(--layer-cover, 5); margin: 0;
+	top: calc(var(--safe-area-inset-top, 0px) + var(--size-4-2)); right: var(--size-4-3);
+	padding: 2px 4px; border-radius: 999px; background: var(--background-primary); border: 1px solid var(--background-modifier-border);
+}
