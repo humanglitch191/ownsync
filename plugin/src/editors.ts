@@ -6,16 +6,17 @@
 
 import { type App, type Editor, MarkdownView } from "obsidian";
 import { Compartment } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
-import type * as Y from "yjs";
+import { EditorView } from "@codemirror/view";
+import * as Y from "yjs";
 import { Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
+import { showAvatars } from "./avatars";
 import { applyPresence, collab, localUndo, user } from "./collab";
 import type { Engine } from "./core/engine";
 
 /** Registered once on every editor by the plugin; filled with the binding for bound editors. */
 export const editorBinding = new Compartment();
 
-type Binding = { id: string; editor: Editor; undo: Y.UndoManager };
+type Binding = { id: string; view: MarkdownView; editor: Editor; undo: Y.UndoManager };
 
 export class Editors {
 	private bound = new Map<EditorView, Binding>();
@@ -97,14 +98,16 @@ export class Editors {
 			// Obsidian's Undo command and the phone toolbar call the editor's undo(), which goes straight to
 			// CodeMirror's history, past any keymap.
 			Object.assign(editor, { undo: () => undo.undo(), redo: () => undo.redo() });
-			this.bound.set(cm, { id, editor, undo });
+			this.bound.set(cm, { id, view, editor, undo });
+			this.showPeople(id);
 			return;
 		}
 	}
 
 	private async unbind(cm: EditorView, onScreen: boolean): Promise<void> {
-		const { id, editor, undo } = this.bound.get(cm)!;
+		const { id, view, editor, undo } = this.bound.get(cm)!;
 		this.bound.delete(cm);
+		showAvatars(view.containerEl, [], () => {});
 		if (onScreen) cm.dispatch({ effects: editorBinding.reconfigure([]) });
 		delete (editor as Partial<Editor>).undo; // back to the prototype's
 		delete (editor as Partial<Editor>).redo;
@@ -127,8 +130,26 @@ export class Editors {
 		const fresh = (aw = new Awareness(doc));
 		this.presence.set(id, aw);
 		fresh.on("update", (_: unknown, origin: unknown) => { if (origin === "local") this.send(id, fresh); });
+		// Other devices joining, renaming or leaving: by their empty state when they close the note, or after 30 s unheard.
+		fresh.on("change", () => this.showPeople(id));
 		fresh.setLocalStateField("user", user(this.name, fresh.clientID));
 		return fresh;
+	}
+
+	/** The other devices in the note, as avatars in the header of every editor here that shows it. */
+	private showPeople(id: string): void {
+		const aw = this.presence.get(id);
+		if (!aw) return;
+		const states = aw.getStates() as Map<number, { user?: { name: string; color: string }; cursor?: { head: unknown } | null }>;
+		const people = [...states].flatMap(([client, s]) => (client !== aw.clientID && s.user ? [{ id: client, ...s.user }] : []));
+		for (const [cm, b] of this.bound) {
+			if (b.id !== id) continue;
+			showAvatars(b.view.containerEl, people, (client) => {
+				const head = states.get(client)?.cursor?.head;
+				const at = head ? Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(head), aw.doc) : null;
+				if (at) cm.dispatch({ effects: EditorView.scrollIntoView(Math.min(at.index, cm.state.doc.length), { y: "center" }) });
+			});
+		}
 	}
 
 	private send(id: string, aw: Awareness): void {
