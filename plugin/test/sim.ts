@@ -59,8 +59,8 @@ export class Server {
 			if (msg.state === "current") conn.listFrom ??= this.clock;
 			for (const tag of msg.tags) {
 				const v = this.versions.get(tag);
-				if (msg.state === "current") {
-					if (v) Object.assign(v, { retiredAt: null, deleted: false });
+				if (msg.state === "current" || msg.state === "ask") {
+					if (v && msg.state === "current") Object.assign(v, { retiredAt: null, deleted: false });
 					if (this.missing(tag)) missing.push(tag);
 				} else if (v && v.retiredAt === null) Object.assign(v, { retiredAt: this.clock, deleted: msg.state === "deleted" });
 			}

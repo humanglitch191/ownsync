@@ -541,7 +541,8 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	// Devices report which versions stopped or started being current; the Worker's clock says when. The answer names
-	// each version called current that has a recorded chunk missing, worked out from what is stored every time.
+	// each version called current, or asked about (no flags), that has a recorded chunk missing, worked out from what is
+	// stored every time.
 	private mark(ws: WebSocket, session: Session, f: Extract<ClientFrame, { t: "mark" }>): void {
 		const now = Date.now(), missing: Uint8Array[] = [];
 		// A full list confirms only retirements from before it began: a version this device listed as current in an
@@ -549,10 +550,13 @@ export class Vault extends DurableObject<Env> {
 		if ((f.flags & MARK.current) && session.listFrom === undefined) session = { ...session, listFrom: now };
 		this.ctx.storage.transactionSync(() => {
 			for (const tag of f.tags) {
-				if (f.flags & MARK.current) {
-					this.write("UPDATE versions SET retired_at = NULL, deleted = 0 WHERE tag = ? AND retired_at IS NOT NULL", tag);
-					if (this.sql.exec("SELECT 1 FROM version_chunks v WHERE v.tag = ? AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.name = v.name) LIMIT 1", tag).toArray().length) missing.push(tag);
-				} else if (f.flags & MARK.retired) this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND retired_at IS NULL", now, f.flags & MARK.deleted ? 1 : 0, tag);
+				if (f.flags & MARK.current) this.write("UPDATE versions SET retired_at = NULL, deleted = 0 WHERE tag = ? AND retired_at IS NOT NULL", tag);
+				else if (f.flags & MARK.retired) {
+					this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND retired_at IS NULL", now, f.flags & MARK.deleted ? 1 : 0, tag);
+					continue;
+				}
+				// Called current, or only asked about (no flag: Recently deleted leaves out what Clean up removed).
+				if (this.sql.exec("SELECT 1 FROM version_chunks v WHERE v.tag = ? AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.name = v.name) LIMIT 1", tag).toArray().length) missing.push(tag);
 			}
 			// The end of a caught-up device's full list: as far as it knows, nothing retired before it began is current.
 			if ((f.flags & MARK.last) && session.live && session.device) this.write("INSERT INTO lists (device, at) VALUES (?, ?) ON CONFLICT(device) DO UPDATE SET at = max(at, excluded.at)", session.device, session.listFrom ?? now);

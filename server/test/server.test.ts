@@ -723,6 +723,9 @@ test("Clean up removes only past, retired versions a full list confirmed: never 
 		assert.equal(left.length, 4);
 		assert.ok(left.includes(1) && left.includes(31) && left.includes(41) && (left.includes(11) !== left.includes(12)));
 		assert.deepEqual(await cleanupSizes(v), []);
+		// Only asked (no flags), as Recently deleted does: B is named, and stays retired.
+		assert.deepEqual(await mark(0, 102, 103), [102]);
+		assert.notEqual(db.prepare("SELECT retired_at FROM versions WHERE tag = ?").get(name(102))!.retired_at, null);
 		a.send({ t: "get", name: name(21) });
 		assert.deepEqual(await a.next(), { t: "missing", name: name(21) });
 		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM version_chunks").get()!.n, 5); // how a missing chunk is known later

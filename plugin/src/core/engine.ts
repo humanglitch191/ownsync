@@ -205,7 +205,7 @@ export class Engine {
 	private markFrames = new Map<number, { u: string; state: MarkState }[]>();
 	private nextMark = 1;
 	private listing = false; // this input sends the daily full list
-	private checks = new Map<number, (missing: boolean | undefined) => void>(); // restores waiting for the Worker's answer
+	private checks = new Map<number, (missing: string[] | undefined) => void>(); // questions waiting for the Worker's answer
 	private repairs = new Set<string>();
 	private tags = new Map<string, Promise<string>>();
 	// One Yjs client ID per run, so a crash or a copied profile can never reuse an ID with different edits.
@@ -348,26 +348,40 @@ export class Engine {
 	}
 
 	/**
-	 * Deleted notes this device can preview, and deleted attachments (unless it syncs notes only), most recent first:
-	 * those of the last 30 days, at most 200. Texts are read one at a time with `deletedText`, so a phone never
-	 * decodes them all at once.
+	 * Deleted notes this device can preview, those of the last 30 days, and deleted attachments (unless it syncs notes
+	 * only) until Clean up has removed their file, however old; most recent first, at most 200. Texts are read one at a
+	 * time with `deletedText`, so a phone never decodes them all at once.
 	 */
-	deletedNotes(): Promise<DeletedNote[]> {
-		const deleted: DeletedNote[] = [];
-		return this.run("list deleted notes", async () => {
+	async deletedNotes(): Promise<DeletedNote[]> {
+		const deleted: DeletedNote[] = [], candidates: DeletedNote[] = [];
+		await this.run("list deleted notes", async () => {
 			const since = (this.opts.now?.() ?? Date.now()) - DELETED_DAYS * DAY_MS;
-			const candidates: DeletedNote[] = [];
 			for (const [id, v] of this.notes) {
 				if (v.d === undefined || (this.notesOnly && !isNote(v.p))) continue;
 				const deletedAt = Number.isSafeInteger(v.t) ? v.t : undefined;
-				if (deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
+				if (!isNote(v.p) || deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
 			}
 			candidates.sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity));
-			for (const note of candidates) {
-				if (deleted.length === MAX_DELETED) break;
-				if (await this.state(note.id)) deleted.push(note); // without it, only another device can bring the note back
-			}
-		}).then(() => deleted);
+		});
+		// A page at a time, as many as are still wanted. Whether Clean up removed an attachment's file only the Worker
+		// can say; offline, or with no answer, it is listed, and restoring it says so.
+		for (let i = 0; i < candidates.length && deleted.length < MAX_DELETED;) {
+			const page = candidates.slice(i, (i += MAX_DELETED - deleted.length)), held: DeletedNote[] = [], tags = new Map<string, string[]>();
+			const answers: Promise<string[] | undefined>[] = [];
+			await this.run("check deleted", async () => {
+				for (const note of page) {
+					if (!(await this.state(note.id))) continue; // without it, only another device can bring the note back
+					held.push(note);
+					if (isNote(note.path) || !this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.()) continue;
+					tags.set(note.id, await Promise.all((await this.scopedVersions(note.id)).map((u) => this.tagOf(u))));
+				}
+				const all = [...tags.values()].flat();
+				for (let j = 0; j < all.length; j += MAX_MARK) answers.push(this.ask("ask", all.slice(j, j + MAX_MARK)));
+			});
+			const gone = new Set((await Promise.all(answers)).flatMap((missing) => missing ?? []));
+			for (const note of held) if (!tags.get(note.id)?.some((tag) => gone.has(tag))) deleted.push(note);
+		}
+		return deleted;
 	}
 
 	/** The text of a deleted note, if this device holds it. */
@@ -399,7 +413,7 @@ export class Engine {
 	 * "gone" (its file is no longer stored: nothing was restored), or "offline".
 	 */
 	async restoreAttachment(id: string): Promise<string | "gone" | "offline" | undefined> {
-		let us: string[] = [], answer: Promise<boolean | undefined> | undefined, offline = false, ours = false;
+		let us: string[] = [], answer: Promise<string[] | undefined> | undefined, offline = false, ours = false;
 		await this.run(`check ${id}`, async () => {
 			const v = this.notes.get(id);
 			if (v?.d === undefined || isNote(v.p) || this.notesOnly) return;
@@ -407,13 +421,11 @@ export class Engine {
 			us = await this.scopedVersions(id);
 			if (!us.length) return; // chunks from before 0.2.0: never removed
 			if (!this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.()) return void (offline = true);
-			const frame = this.nextMark++;
-			answer = new Promise((resolve) => this.checks.set(frame, resolve));
-			this.link.send({ t: "mark", id: frame, state: "current", tags: await Promise.all(us.map((u) => this.tagOf(u))) });
+			answer = this.ask("current", await Promise.all(us.map((u) => this.tagOf(u))));
 		});
 		if (!ours) return undefined;
 		if (offline) return "offline";
-		const missing = answer ? await answer : false;
+		const answered = answer ? await answer : [], missing = answered && answered.length > 0; // undefined: no answer
 		let restored: string | undefined;
 		await this.run(`restore ${id}`, async () => {
 			if (missing === false && this.notes.get(id)?.d !== undefined) restored = await this.bringBack(id);
@@ -1692,6 +1704,13 @@ export class Engine {
 		for (let i = 0; i === 0 || i < current.length; i += MAX_MARK) await this.sendMark("current", current.slice(i, i + MAX_MARK), i + MAX_MARK >= current.length);
 	}
 
+	/** Versions (by tag) that have a chunk missing on the Worker; undefined if the link went first. "current" also says they are. */
+	private ask(state: "ask" | "current", tags: string[]): Promise<string[] | undefined> {
+		const id = this.nextMark++, answer = new Promise<string[] | undefined>((resolve) => this.checks.set(id, resolve));
+		this.link!.send({ t: "mark", id, state, tags });
+		return answer;
+	}
+
 	private async sendMark(state: MarkState, us: string[], last = false): Promise<void> {
 		const id = this.nextMark++, tags = await Promise.all(us.map((u) => this.tagOf(u)));
 		this.markFrames.set(id, us.map((u) => ({ u, state })));
@@ -1701,7 +1720,7 @@ export class Engine {
 
 	private async marked({ id, tags }: Extract<ServerMsg, { t: "marked" }>): Promise<void> {
 		const check = this.checks.get(id);
-		if (check) return void (this.checks.delete(id), check(tags.length > 0));
+		if (check) return void (this.checks.delete(id), check(tags));
 		const frame = this.markFrames.get(id);
 		if (!frame) return;
 		this.markFrames.delete(id);

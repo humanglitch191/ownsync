@@ -24,7 +24,7 @@
 //                                              is already recorded under that tag; otherwise the reply is `missing`
 //   mark       id(4) | flags(1) | n × tag(32)  n ≤ 1024: these versions were retired (flag 1; with flag 8, because their
 //                                              attachment was deleted) or are current (flag 2); flag 4 ends this
-//                                              device's full list of what is current
+//                                              device's full list of what is current; no flags: only asks (marked)
 //
 // Worker → device
 //   entry      seq(8) | doc(16) | snapshot(1) | envelope
@@ -38,8 +38,8 @@
 //   stored     name(32)                        that chunk is stored
 //   chunk      name(32) | envelope
 //   missing    name(32)                        no such chunk (after a get), or it couldn't be stored (after a put or vput)
-//   marked     id(4) | n × tag(32)             the answer to a mark: each tag it called current that has a recorded
-//                                              chunk missing
+//   marked     id(4) | n × tag(32)             the answer to a mark: each tag it called current, or asked about, that
+//                                              has a recorded chunk missing
 
 export type ClientFrame =
 	| { t: "hello"; token: Uint8Array; owner?: Uint8Array }

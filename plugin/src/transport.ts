@@ -199,7 +199,7 @@ export class Transport {
 		// A chunk is sealed with its name as the document: the server can't file it under another one.
 		if (msg.t === "get") return { t: "get", name: unhex(msg.name) };
 		if (msg.t === "mark") {
-			const flags = msg.state === "current" ? MARK.current | (msg.last ? MARK.last : 0) : MARK.retired | (msg.state === "deleted" ? MARK.deleted : 0);
+			const flags = msg.state === "ask" ? 0 : msg.state === "current" ? MARK.current | (msg.last ? MARK.last : 0) : MARK.retired | (msg.state === "deleted" ? MARK.deleted : 0);
 			return { t: "mark", id: msg.id, flags, tags: msg.tags.map(unhex) };
 		}
 		if (msg.t === "put") {

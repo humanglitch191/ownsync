@@ -108,7 +108,14 @@ test("conflict copies keep their chunks through Clean up, and a copied file uplo
 	noProblems(devs);
 });
 
-test("a deleted attachment whose content was cleaned up isn't restored; one still stored is", async () => {
+/** Recently deleted as the device lists it: it may ask the Worker, so the network runs meanwhile. */
+async function listed(d: Device, devs: Device[]): Promise<string[]> {
+	const list = d.engine!.deletedNotes();
+	await quiesce(devs);
+	return (await list).map((n) => n.path).sort();
+}
+
+test("a deleted attachment is listed until its content is cleaned up, then isn't restored; one still stored is, however old", async () => {
 	const { server, devs } = world();
 	const [a, b] = devs as [Device, Device];
 	a.write("p.png", bytes(PIC));
@@ -122,8 +129,9 @@ test("a deleted attachment whose content was cleaned up isn't restored; one stil
 	server.clock += 10;
 	a.remove("q.png"); // after the last list: can't be cleaned up yet
 	await quiesce(devs);
+	assert.deepEqual(await listed(b, devs), ["p.png", "q.png"]);
 	assert.ok(server.cleanUp(0, server.clock) > 0);
-	assert.deepEqual((await b.engine!.deletedNotes()).map((n) => n.path).sort(), ["p.png", "q.png"]);
+	assert.deepEqual(await listed(b, devs), ["q.png"]);
 
 	const refused = b.engine!.restoreAttachment(p);
 	await quiesce(devs);
@@ -133,6 +141,8 @@ test("a deleted attachment whose content was cleaned up isn't restored; one stil
 	// The check made its version current on the Worker for a moment: it is retired again.
 	assert.ok([...server.versions.values()].every((v) => v.retiredAt !== null));
 
+	await nextDay(server, devs, devs, 40); // no 30-day limit for attachments: listed while stored
+	assert.deepEqual(await listed(b, devs), ["q.png"]);
 	const back = b.engine!.restoreAttachment(q);
 	await quiesce(devs);
 	assert.equal(await back, "q.png");
@@ -140,6 +150,7 @@ test("a deleted attachment whose content was cleaned up isn't restored; one stil
 	assert.deepEqual(disk(b), disk(a));
 
 	b.disconnect();
+	assert.deepEqual(await listed(b, []), ["p.png"]); // offline it can't ask; restoring says so
 	assert.equal(await b.engine!.restoreAttachment(p), "offline");
 	noProblems(devs);
 });

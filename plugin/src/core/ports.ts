@@ -82,8 +82,11 @@ export type ClientMsg =
 	 */
 	| { t: "put"; name: string; data: Uint8Array; tag?: string }
 	| { t: "get"; name: string }
-	/** These versions (by tag) are current, or stopped being; `last` ends this device's full list of current ones. */
-	| { t: "mark"; id: number; state: MarkState; last?: boolean; tags: string[] };
+	/**
+	 * These versions (by tag) are current, or stopped being; `last` ends this device's full list of current ones.
+	 * "ask" changes nothing: only the answer is wanted.
+	 */
+	| { t: "mark"; id: number; state: MarkState | "ask"; last?: boolean; tags: string[] };
 
 export type ServerMsg =
 	| { t: "entry"; seq: number; entry: Entry }
@@ -97,7 +100,7 @@ export type ServerMsg =
 	| { t: "chunk"; name: string; data: Uint8Array }
 	/** The server has no such chunk (after a get), or couldn't store it (after a put). */
 	| { t: "missing"; name: string }
-	/** The answer to a mark: each version it called current that is missing a chunk on the server. */
+	/** The answer to a mark: each version it called current, or asked about, that is missing a chunk on the server. */
 	| { t: "marked"; id: number; tags: string[] };
 
 /** An open connection to the server. Messages arrive in order or the connection drops. */

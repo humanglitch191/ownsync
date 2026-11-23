@@ -137,7 +137,11 @@ async function run(seed: number, steps: number): Promise<void> {
 		else if (r < 71 && exerciseRestores) {
 			const engine = d.engine!;
 			d.drain();
-			const deleted = await engine.deletedNotes();
+			// The list may ask the Worker which deleted attachments it still stores: this device's link carries the answer.
+			let deleted = undefined as { id: string; path: string }[] | undefined;
+			void engine.deletedNotes().then((list) => { deleted = list; }, () => { deleted = []; });
+			for (let quiet = 0; !deleted && d.alive && quiet < 3;) { const moved = d.pumpUp() || d.pumpDown(); await d.idle(); quiet = moved ? 0 : quiet + 1; }
+			deleted ??= [];
 			const note = deleted[Math.floor(restoreRandom() * deleted.length)];
 			if (note && d.alive && !isNote(note.path)) {
 				// An attachment: back only if the Worker still has its content, which takes a round trip.
