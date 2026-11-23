@@ -312,3 +312,13 @@ test("the Worker's storage holds no note text, attachment content, file names, f
 		assert.equal(hits, "", `found "${secret}" in ${hits}`);
 	}
 });
+
+test("while this device's own key change waits, marks wait with the chunks, in order; a daily list's first frame is flagged", async () => {
+	const keys = { state: { pending: { tokenHash: new Uint8Array(32) } } };
+	const t = new Transport(host, keys as never, {} as never) as unknown as { send(ws: unknown, msg: unknown): void; seal(msg: unknown): Promise<unknown>; held: unknown[] };
+	const put = { t: "put", name: "00", data: new Uint8Array(1), tag: "11" }, mark = { t: "mark", id: 1, state: "replaced", tags: ["11"] };
+	t.send({}, put);
+	t.send({}, mark);
+	assert.deepEqual(t.held, [put, mark]); // the retirement goes after the vput, never before
+	assert.deepEqual(await t.seal({ t: "mark", id: 2, state: "current", start: true, last: true, tags: [] }), { t: "mark", id: 2, flags: 2 | 16 | 4, tags: [] });
+});

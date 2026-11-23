@@ -182,9 +182,10 @@ export class Transport {
 	private send(ws: WebSocket, msg: ClientMsg | Presence): void {
 		// While this device's own key change is waiting, nothing new is sealed under the old key, which a device
 		// being removed (or, when recovering, every other device) can still read. Stored messages wait for the new
-		// key; live ones go, since what they carry follows in the stored ones anyway.
-		if (this.keys.state.pending?.tokenHash && msg.t !== "subscribe" && msg.t !== "get" && msg.t !== "mark") {
-			if (msg.t === "publish" || msg.t === "snapshot" || msg.t === "put") this.held.push(msg);
+		// key; live ones go, since what they carry follows in the stored ones anyway. Marks wait with the chunks: a
+		// retirement must not reach the Worker before the vput it follows, which would make the version current again.
+		if (this.keys.state.pending?.tokenHash && msg.t !== "subscribe" && msg.t !== "get") {
+			if (msg.t === "publish" || msg.t === "snapshot" || msg.t === "put" || msg.t === "mark") this.held.push(msg);
 			return;
 		}
 		this.sending = this.sending.then(async () => {
@@ -199,7 +200,7 @@ export class Transport {
 		// A chunk is sealed with its name as the document: the server can't file it under another one.
 		if (msg.t === "get") return { t: "get", name: unhex(msg.name) };
 		if (msg.t === "mark") {
-			const flags = msg.state === "ask" ? 0 : msg.state === "current" ? MARK.current | (msg.last ? MARK.last : 0) : MARK.retired | (msg.state === "deleted" ? MARK.deleted : 0);
+			const flags = msg.state === "ask" ? 0 : msg.state === "current" ? MARK.current | (msg.start ? MARK.start : 0) | (msg.last ? MARK.last : 0) : MARK.retired | (msg.state === "deleted" ? MARK.deleted : 0);
 			return { t: "mark", id: msg.id, flags, tags: msg.tags.map(unhex) };
 		}
 		if (msg.t === "put") {

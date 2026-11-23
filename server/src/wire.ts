@@ -23,8 +23,8 @@
 //                                              name is recorded under the tag only if this vput stored the chunk, or it
 //                                              is already recorded under that tag; otherwise the reply is `missing`
 //   mark       id(4) | flags(1) | n × tag(32)  n ≤ 1024: these versions were retired (flag 1; with flag 8, because their
-//                                              attachment was deleted) or are current (flag 2); flag 4 ends this
-//                                              device's full list of what is current; no flags: only asks (marked)
+//                                              attachment was deleted) or are current (flag 2); flag 16 starts and
+//                                              flag 4 ends this device's full list of what is current; no flags: only asks (marked)
 //
 // Worker → device
 //   entry      seq(8) | doc(16) | snapshot(1) | envelope
@@ -87,7 +87,7 @@ export const MAX_VERSION = 32;
 /** A version tag's size, the most tags in one mark, the most chunks one version may have, and mark's flags. */
 export const TAG_BYTES = 32;
 export const MAX_MARK = 1024;
-export const MARK = { retired: 1, current: 2, last: 4, deleted: 8 } as const;
+export const MARK = { retired: 1, current: 2, last: 4, deleted: 8, start: 16 } as const;
 
 const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13 } as const;
 const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27 } as const;

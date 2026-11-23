@@ -202,3 +202,84 @@ test("a notes-only device's daily list keeps what is current from being cleaned 
 	assert.deepEqual(missingChunks(server, a), []);
 	noProblems(devs);
 });
+
+test("the simulator confirms as the Worker does: seen on status and close only, lists only after status, the newest 64, open connections seen", () => {
+	const server = new Server(), random = rng(1);
+	const dev = (n: string) => { const d = new Device(n, server, random); server.conns.set(d, { up: [], down: [], live: true }); return d; };
+	const list = (d: Device) => server.handle(d, { t: "mark", id: 0, state: "current", start: true, last: true, tags: [] });
+	const a = dev("a");
+	list(a);
+	assert.deepEqual([server.lists.size, server.seen.size], [0, 0]); // no status yet: neither seen nor listed
+	server.status(a);
+	server.clock = 5;
+	list(a);
+	assert.equal(server.lists.get("a"), 5);
+	server.clock = 40 * DAY;
+	assert.equal(server.listedAt, 5); // still connected after 40 days: seen now
+	server.close(a);
+	for (let i = 0; i < 64; i++) { const d = dev(`x${i}`); server.clock++; server.status(d); list(d); server.close(d); }
+	assert.equal(server.seen.size, 64);
+	assert.ok(!server.seen.has("a"), "the device seen longest ago went");
+	assert.equal(server.listedAt, 0); // all 64 seen lately: one more may have fallen off
+});
+
+test("each daily list says where it starts, so an earlier report on the same connection doesn't date it", async () => {
+	const { server, devs } = world(1);
+	const marks: Extract<Parameters<Server["handle"]>[1], { t: "mark" }>[] = [], handle = server.handle.bind(server);
+	server.handle = (from, msg) => { if (msg.t === "mark") marks.push(msg); handle(from, msg); };
+	devs[0]!.write("p.png", bytes(PIC));
+	await quiesce(devs);
+	server.clock += 10;
+	await nextDay(server, devs);
+	const lists = marks.filter((m) => m.last);
+	assert.ok(lists.length >= 2);
+	assert.ok(lists.every((m) => m.start && m.state === "current")); // one frame each: it starts and ends the list
+	assert.ok(marks.filter((m) => !m.last).every((m) => !m.start));
+});
+
+test("an attachment of more chunks than one version may have goes the old way instead of stalling", async () => {
+	const { server, devs } = world();
+	const big = "x".repeat(4 * 1024 + 1); // 1,025 chunks of four bytes
+	devs[0]!.write("big.bin", bytes(big));
+	await quiesce(devs);
+	assert.ok(latin1(devs[1]!.files.get("big.bin")?.content ?? "") === big, "the other device has it");
+	assert.equal(server.versionChunks.size, 0);
+	noProblems(devs);
+});
+
+test("a deleted attachment whose head is old-style is listed and restored, though a same-content scoped version was cleaned up", async () => {
+	const { server, devs } = world(2, 1, (d, i) => { if (i === 0) d.overrides = { ...SCOPED, scoped: () => false }; });
+	const [a, b] = devs as [Device, Device];
+	a.write("p.png", bytes(PIC));
+	await quiesce(devs);
+	a.disconnect();
+	b.disconnect();
+	a.write("p.png", bytes(PIC2)); // the same new content on both, old-style on A and scoped on B
+	b.write("p.png", bytes(PIC2));
+	await quiesce(devs);
+	a.connect();
+	b.connect();
+	await quiesce(devs);
+	const id = a.engine!.noteAt("p.png")!, v = () => {
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, a.data.get(`state:${id}`) as Uint8Array);
+		const refs = doc.getArray<Ref>("v").toArray();
+		doc.destroy();
+		return refs;
+	};
+	assert.deepEqual(v().map((r) => r.s), [undefined, 1], "this seed puts the old-style version first");
+	a.remove("p.png");
+	await quiesce(devs);
+	server.clock += 10;
+	await nextDay(server, devs);
+	assert.ok(server.cleanUp(0, server.clock) > 0); // the scoped copy's chunks
+	assert.deepEqual(await listed(b, devs), ["p.png"]);
+	const back = b.engine!.restoreAttachment(id);
+	await quiesce(devs);
+	assert.equal(await back, "p.png");
+	assert.deepEqual(disk(a), { "p.png": PIC2 });
+	assert.deepEqual(disk(b), disk(a));
+	await nextDay(server, devs); // the daily list names the scoped copy missing: put back from the file
+	await nextDay(server, devs);
+	for (const d of devs) assert.deepEqual(missingChunks(server, d), []);
+});

@@ -545,9 +545,9 @@ export class Vault extends DurableObject<Env> {
 	// stored every time.
 	private mark(ws: WebSocket, session: Session, f: Extract<ClientFrame, { t: "mark" }>): void {
 		const now = Date.now(), missing: Uint8Array[] = [];
-		// A full list confirms only retirements from before it began: a version this device listed as current in an
-		// earlier frame, and that another device retired since, isn't confirmed by it.
-		if ((f.flags & MARK.current) && session.listFrom === undefined) session = { ...session, listFrom: now };
+		// A full list confirms only retirements from before it began (its first frame says so): a version this device
+		// listed as current in an earlier frame, and that another device retired since, isn't confirmed by it.
+		if ((f.flags & MARK.current) && (f.flags & MARK.start)) session = { ...session, listFrom: now };
 		this.ctx.storage.transactionSync(() => {
 			for (const tag of f.tags) {
 				if (f.flags & MARK.current) this.write("UPDATE versions SET retired_at = NULL, deleted = 0 WHERE tag = ? AND retired_at IS NOT NULL", tag);
@@ -559,7 +559,12 @@ export class Vault extends DurableObject<Env> {
 				if (this.sql.exec("SELECT 1 FROM version_chunks v WHERE v.tag = ? AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.name = v.name) LIMIT 1", tag).toArray().length) missing.push(tag);
 			}
 			// The end of a caught-up device's full list: as far as it knows, nothing retired before it began is current.
-			if ((f.flags & MARK.last) && session.live && session.device) this.write("INSERT INTO lists (device, at) VALUES (?, ?) ON CONFLICT(device) DO UPDATE SET at = max(at, excluded.at)", session.device, session.listFrom ?? now);
+			if ((f.flags & MARK.last) && session.live && session.device) {
+				this.write("INSERT INTO lists (device, at) VALUES (?, ?) ON CONFLICT(device) DO UPDATE SET at = max(at, excluded.at)", session.device, session.listFrom ?? now);
+				// The lists of devices not seen in 30 days count no more: a few go with each list.
+				this.touchOpen();
+				this.write("DELETE FROM lists WHERE device IN (SELECT l.device FROM lists l LEFT JOIN devices d ON d.id = l.device WHERE d.id IS NULL OR d.last_online < ? LIMIT 64)", now - SCOPED_SINCE_MS);
+			}
 		});
 		if (f.flags & MARK.last) session = { ...session, listFrom: undefined };
 		ws.serializeAttachment(session);
@@ -572,6 +577,7 @@ export class Vault extends DurableObject<Env> {
 	 * keeps the newest 64: when all of them are that recent, an older device may have fallen off it, so that counts as old too.
 	 */
 	private scoped(asking: string | null): boolean {
+		this.touchOpen();
 		const since = Date.now() - SCOPED_SINCE_MS;
 		const all = this.sql.exec<{ n: number; oldest: number | null }>("SELECT COUNT(*) AS n, MIN(last_online) AS oldest FROM devices").one();
 		if (all.n >= MAX_DEVICES && (all.oldest ?? 0) >= since) return false;
@@ -585,10 +591,24 @@ export class Vault extends DurableObject<Env> {
 	 * offline edit, its deleted version as the head again. (No device seen that long: the latest list.)
 	 */
 	private listedAt(): number {
+		this.touchOpen();
+		const since = Date.now() - SCOPED_SINCE_MS;
+		// As in scoped: a full device list may have lost a device seen lately, which then hasn't listed.
+		const all = this.sql.exec<{ n: number; oldest: number | null }>("SELECT COUNT(*) AS n, MIN(last_online) AS oldest FROM devices").one();
+		if (all.n >= MAX_DEVICES && (all.oldest ?? 0) >= since) return 0;
 		const recent = this.sql.exec<{ at: number | null; n: number }>(
-			"SELECT MIN(COALESCE(l.at, 0)) AS at, COUNT(*) AS n FROM devices d LEFT JOIN lists l ON l.device = d.id WHERE d.last_online >= ?", Date.now() - SCOPED_SINCE_MS,
+			"SELECT MIN(COALESCE(l.at, 0)) AS at, COUNT(*) AS n FROM devices d LEFT JOIN lists l ON l.device = d.id WHERE d.last_online >= ?", since,
 		).one();
 		return recent.n ? recent.at ?? 0 : this.sql.exec<{ at: number | null }>("SELECT MAX(at) AS at FROM lists").one().at ?? 0;
+	}
+
+	// A device connected without a break is seen now, however long ago it connected (last online is set on status and close).
+	private touchOpen(): void {
+		const now = Date.now();
+		for (const ws of this.ctx.getWebSockets()) {
+			const device = (ws.deserializeAttachment() as Session).device;
+			if (device) this.write("UPDATE devices SET last_online = ? WHERE id = ?", now, device);
+		}
 	}
 
 	/**

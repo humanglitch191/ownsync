@@ -147,7 +147,7 @@ export const docTag = async (vmk: Uint8Array, vaultId: Uint8Array, docId: string
 // The plaintext of an update or snapshot envelope: which document, then the Yjs update. u8 length | id | update.
 export function packEntry(docId: string, update: Uint8Array): Uint8Array {
 	const id = te.encode(docId);
-	if (id.length > 64) throw new Error("document ID too long");
+	if (id.length > 255) throw new Error("document ID too long"); // what its length byte holds; only version IDs are held to 64
 	return concat(u8(id.length), id, update);
 }
 export function unpackEntry(plaintext: Uint8Array): { docId: string; update: Uint8Array } {

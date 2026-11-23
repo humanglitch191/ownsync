@@ -60,7 +60,7 @@ const PART_HASH = /^[0-9a-f]{64}$/i;
 const MAX_DELETED = 200, DELETED_DAYS = 30, DAY_MS = 24 * 60 * 60 * 1000;
 /** Chunks in flight each way: enough to keep the line busy, few enough that memory holds one file plus these. */
 const WINDOW = 4;
-/** Versions in one report to the Worker. */
+/** Versions in one report to the Worker, and the most chunks the Worker records for one version. */
 const MAX_MARK = 1024;
 
 export interface EngineOptions {
@@ -373,7 +373,8 @@ export class Engine {
 					if (!(await this.state(note.id))) continue; // without it, only another device can bring the note back
 					held.push(note);
 					if (isNote(note.path) || !this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.()) continue;
-					tags.set(note.id, await Promise.all((await this.scopedVersions(note.id)).map((u) => this.tagOf(u))));
+					const tag = await this.headTag(note.id);
+					if (tag) tags.set(note.id, [tag]);
 				}
 				const all = [...tags.values()].flat();
 				for (let j = 0; j < all.length; j += MAX_MARK) answers.push(this.ask("ask", all.slice(j, j + MAX_MARK)));
@@ -413,7 +414,7 @@ export class Engine {
 	 * "gone" (its file is no longer stored: nothing was restored), or "offline".
 	 */
 	async restoreAttachment(id: string): Promise<string | "gone" | "offline" | undefined> {
-		let us: string[] = [], answer: Promise<string[] | undefined> | undefined, offline = false, ours = false;
+		let us: string[] = [], head: string | undefined, answer: Promise<string[] | undefined> | undefined, offline = false, ours = false;
 		await this.run(`check ${id}`, async () => {
 			const v = this.notes.get(id);
 			if (v?.d === undefined || isNote(v.p) || this.notesOnly) return;
@@ -421,11 +422,13 @@ export class Engine {
 			us = await this.scopedVersions(id);
 			if (!us.length) return; // chunks from before 0.2.0: never removed
 			if (!this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.()) return void (offline = true);
+			head = await this.headTag(id);
 			answer = this.ask("current", await Promise.all(us.map((u) => this.tagOf(u))));
 		});
 		if (!ours) return undefined;
 		if (offline) return "offline";
-		const answered = answer ? await answer : [], missing = answered && answered.length > 0; // undefined: no answer
+		// Only the head's chunks are downloaded: another version missing some is put back from the file later.
+		const answered = answer ? await answer : [], missing = answered && head !== undefined && answered.includes(head); // undefined: no answer
 		let restored: string | undefined;
 		await this.run(`restore ${id}`, async () => {
 			if (missing === false && this.notes.get(id)?.d !== undefined) restored = await this.bringBack(id);
@@ -1423,9 +1426,10 @@ export class Engine {
 			await this.dropUpload(id);
 			return this.agree(id, file, h);
 		}
-		// Scoped once every device lately seen can read it: then its chunks are this version's alone.
-		const scoped = !!this.opts.versionTag && !!this.opts.reports?.() && !!this.opts.scoped?.(), u = scoped ? this.opts.newId() : "";
+		// Scoped once every device lately seen can read it: then its chunks are this version's alone. A file of more
+		// chunks than the Worker records for one version goes the old way.
 		const size = this.opts.chunkSize ?? 2 ** 20, c: string[] = [];
+		const scoped = !!this.opts.versionTag && !!this.opts.reports?.() && !!this.opts.scoped?.() && Math.ceil(bytes.length / size) <= MAX_MARK, u = scoped ? this.opts.newId() : "";
 		for (let at = 0; at < bytes.length; at += size) c.push(await this.opts.chunkName(bytes.subarray(at, at + size), scoped ? { u, i: c.length } : undefined));
 		const ref: Ref = scoped ? { h, n: bytes.length, c, u, s: 1 } : { h, n: bytes.length, c, u: this.opts.newId() };
 		const up = await this.read<Upload>(`up:${id}`);
@@ -1620,6 +1624,12 @@ export class Engine {
 
 	// --- version-scoped chunks: reports for Clean up (DESIGN.md section 10) ---
 
+	/** The tag of the attachment's head, the version its file is downloaded from, if scoped (old-style chunks are never removed). */
+	private async headTag(id: string): Promise<string | undefined> {
+		const ref = await this.head(id);
+		return ref?.s === 1 && typeof ref.u === "string" ? this.tagOf(ref.u) : undefined;
+	}
+
 	/** The attachment's version-scoped versions (their `u`), head first. */
 	private async scopedVersions(id: string): Promise<string[]> {
 		const doc = this.load(await this.state(id));
@@ -1701,7 +1711,7 @@ export class Engine {
 		for (const [state, us] of waiting) for (let i = 0; i < us.length; i += MAX_MARK) await this.sendMark(state, us.slice(i, i + MAX_MARK));
 		if (!listing) return;
 		const current = [...this.holders.keys()]; // an empty list still says nothing is current
-		for (let i = 0; i === 0 || i < current.length; i += MAX_MARK) await this.sendMark("current", current.slice(i, i + MAX_MARK), i + MAX_MARK >= current.length);
+		for (let i = 0; i === 0 || i < current.length; i += MAX_MARK) await this.sendMark("current", current.slice(i, i + MAX_MARK), i + MAX_MARK >= current.length, i === 0);
 	}
 
 	/** Versions (by tag) that have a chunk missing on the Worker; undefined if the link went first. "current" also says they are. */
@@ -1711,11 +1721,12 @@ export class Engine {
 		return answer;
 	}
 
-	private async sendMark(state: MarkState, us: string[], last = false): Promise<void> {
+	private async sendMark(state: MarkState, us: string[], last = false, start = false): Promise<void> {
 		const id = this.nextMark++, tags = await Promise.all(us.map((u) => this.tagOf(u)));
 		this.markFrames.set(id, us.map((u) => ({ u, state })));
 		for (const u of us) this.marking.set(u, state);
-		this.link!.send(last ? { t: "mark", id, state, last, tags } : { t: "mark", id, state, tags });
+		// The list's first frame says so: the Worker dates the list from it, not from an earlier report.
+		this.link!.send({ t: "mark", id, state, ...(start && { start }), ...(last && { last }), tags });
 	}
 
 	private async marked({ id, tags }: Extract<ServerMsg, { t: "marked" }>): Promise<void> {

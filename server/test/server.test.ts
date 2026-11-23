@@ -687,10 +687,10 @@ test("Clean up removes only past, retired versions a full list confirmed: never 
 		assert.deepEqual(await mark(1, 101, 104), []);
 		assert.deepEqual(await mark(1 | 8, 102), []);
 		await new Promise((r) => setTimeout(r, 5));
-		assert.deepEqual(await mark(2 | 4, 103), []); // a full list from a device that hasn't said who it is: not counted
+		assert.deepEqual(await mark(2 | 4 | 16, 103), []); // a full list from a device that hasn't said who it is: not counted
 		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM lists").get()!.n, 0);
 		a.send(status(5, 0, "0.2.0"));
-		assert.deepEqual(await mark(2 | 4, 103), []); // now it is: the vault's only device has listed what it holds current
+		assert.deepEqual(await mark(2 | 4 | 16, 103), []); // now it is: the vault's only device has listed what it holds current
 		// When these happened, as if long ago.
 		const year = new Date().getUTCFullYear() - 1, at = (month: number, day: number) => Date.UTC(year, month, day);
 		const retire = db.prepare("UPDATE versions SET retired_at = ? WHERE tag = ?");
@@ -733,6 +733,84 @@ test("Clean up removes only past, retired versions a full list confirmed: never 
 		const gone = left.includes(11) ? 12 : 11;
 		await vput(101, gone, "A, again");
 		assert.deepEqual(await mark(2, 101), []);
+	} finally {
+		db.close();
+		a.ws.close();
+	}
+});
+
+const DAY = 86_400_000;
+const markOn = (a: Awaited<ReturnType<typeof connect>>) => async (flags: number, ...tags: number[]) => { a.send({ t: "mark", id: flags, flags, tags: tags.map(name) }); const f = await a.next(); assert.equal(f.t, "marked"); };
+const vputOn = (a: Awaited<ReturnType<typeof connect>>) => async (tag: number, n: number) => { a.send({ t: "vput", tag: name(tag), name: name(n), envelope: bytes(`chunk ${n}`) }); assert.equal((await a.next()).t, "stored"); };
+
+test("a device list of 64, all seen lately, confirms nothing: a 65th may have fallen off it", async () => {
+	const { v, a, db } = await snapshotVaultWithDb();
+	try {
+		const mark = markOn(a);
+		await vputOn(a)(101, 11);
+		a.send(status(1, 0, "0.2.0"));
+		await mark(1, 101);
+		await mark(2 | 4 | 16);
+		db.prepare("UPDATE versions SET retired_at = ?").run(Date.now() - 2 * DAY);
+		db.prepare("UPDATE lists SET at = ?").run(Date.now() - DAY);
+		const add = db.prepare("INSERT INTO devices (id, last_online, version, conflicts) VALUES (?, ?, '0.2.0', 0)"), list = db.prepare("INSERT INTO lists (device, at) VALUES (?, ?)");
+		for (let i = 2; i <= 64; i++) {
+			const id = `ABCD${i.toString(16).toUpperCase().padStart(4, "0")}`;
+			add.run(id, Date.now());
+			list.run(id, Date.now() - DAY);
+		}
+		assert.deepEqual(await cleanupSizes(v), []);
+		db.prepare("UPDATE devices SET last_online = ? WHERE id = 'ABCD0040'").run(Date.now() - 31 * DAY); // one not seen lately: the rest have listed
+		assert.equal((await cleanupSizes(v)).length, 1);
+	} finally {
+		db.close();
+		a.ws.close();
+	}
+});
+
+test("a device connected for over 30 days still counts as seen lately, for scoped uploads and for confirmation", async () => {
+	const { v, tok, a, db } = await snapshotVaultWithDb();
+	const b = await connect(v, tok);
+	try {
+		await b.catchUp(0);
+		a.send(status(7, 0, "0.1.5"));
+		b.send(status(8, 0, "0.2.0"));
+		await statsUntil(v, (s) => s.devices.length === 2);
+		const mark = markOn(b);
+		await vputOn(b)(101, 11);
+		await mark(1, 101);
+		await mark(2 | 4 | 16);
+		db.prepare("UPDATE devices SET last_online = ? WHERE id = 'ABCD0007'").run(Date.now() - 40 * DAY); // a's connection opened long ago
+		db.prepare("UPDATE versions SET retired_at = ?").run(Date.now() - 2 * DAY);
+		db.prepare("UPDATE lists SET at = ?").run(Date.now() - DAY);
+		assert.deepEqual(await cleanupSizes(v), []); // a, still connected, has sent no list
+		const names = await fetch(`http://localhost:${PORT}/vault/${v}/names`, { method: "POST", body: new Uint8Array([...tok, ...bytes(JSON.stringify({ device: "ABCD0008" }))]) });
+		assert.equal(((await names.json()) as { scoped: boolean }).scoped, false); // a runs 0.1.5
+	} finally {
+		db.close();
+		a.ws.close();
+		b.ws.close();
+	}
+});
+
+test("a full list dates from its first frame, flagged as such, not from an earlier report; lists of devices not seen in 30 days go", async () => {
+	const { a, db } = await snapshotVaultWithDb();
+	try {
+		const mark = markOn(a), vput = vputOn(a);
+		a.send(status(1, 0, "0.2.0"));
+		await vput(103, 31);
+		await vput(104, 41);
+		await mark(2, 103); // an ordinary report, hours before the daily list
+		await new Promise((r) => setTimeout(r, 5));
+		await mark(1, 104);
+		await new Promise((r) => setTimeout(r, 5));
+		db.prepare("INSERT INTO devices (id, last_online, version, conflicts) VALUES ('ABCD0F00', ?, '0.2.0', 0)").run(Date.now() - 40 * DAY);
+		db.prepare("INSERT INTO lists (device, at) VALUES ('ABCD0F00', ?), ('ABCD0F01', ?)").run(Date.now() - 40 * DAY, Date.now() - 50 * DAY);
+		await mark(2 | 16, 103);
+		await mark(2 | 4);
+		const retired = db.prepare("SELECT retired_at FROM versions WHERE tag = ?").get(name(104))!.retired_at as number;
+		assert.ok((db.prepare("SELECT at FROM lists WHERE device = 'ABCD0001'").get()!.at as number) > retired, "the list began after the retirement");
+		assert.deepEqual(db.prepare("SELECT device FROM lists").all().map((r) => r.device), ["ABCD0001"]);
 	} finally {
 		db.close();
 		a.ws.close();

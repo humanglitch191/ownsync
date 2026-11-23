@@ -83,10 +83,10 @@ export type ClientMsg =
 	| { t: "put"; name: string; data: Uint8Array; tag?: string }
 	| { t: "get"; name: string }
 	/**
-	 * These versions (by tag) are current, or stopped being; `last` ends this device's full list of current ones.
-	 * "ask" changes nothing: only the answer is wanted.
+	 * These versions (by tag) are current, or stopped being; `start` begins and `last` ends this device's full list
+	 * of current ones. "ask" changes nothing: only the answer is wanted.
 	 */
-	| { t: "mark"; id: number; state: MarkState | "ask"; last?: boolean; tags: string[] };
+	| { t: "mark"; id: number; state: MarkState | "ask"; start?: boolean; last?: boolean; tags: string[] };
 
 export type ServerMsg =
 	| { t: "entry"; seq: number; entry: Entry }

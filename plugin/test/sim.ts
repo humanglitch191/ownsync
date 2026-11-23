@@ -28,23 +28,23 @@ export class Server {
 	rows: { seq: number; entry: Entry }[] = [];
 	head = 0;
 	chunks = new Map<string, Uint8Array>();
-	conns = new Map<Device, { up: ClientMsg[]; down: ServerMsg[]; live: boolean; listFrom?: number }>();
+	conns = new Map<Device, { up: ClientMsg[]; down: ServerMsg[]; live: boolean; device?: boolean; listFrom?: number }>();
 	// Version-scoped chunks and Clean up, as the Worker keeps them (DESIGN.md section 10), on a clock the test moves.
 	clock = 1;
 	versions = new Map<string, { retiredAt: number | null; deleted: boolean }>();
 	versionChunks = new Map<string, string>(); // chunk name → its version's tag
 	lists = new Map<string, number>(); // device → when its latest full list of current versions began
-	seen = new Map<string, number>(); // device → when it was last connected
+	seen = new Map<string, number>(); // device → when it last said who it is, or its connection closed (the newest 64)
 	removed = new Set<string>(); // chunks Clean up removed
 
 	handle(from: Device, msg: ClientMsg): void {
 		const conn = this.conns.get(from);
 		if (!conn) return;
-		this.seen.set(from.name, this.clock);
 		const others = (m: ServerMsg) => { for (const [dev, c] of this.conns) if (dev !== from && c.live) c.down.push(m); };
 		if (msg.t === "put" && msg.tag) {
 			// A name is recorded under the tag only if this put stored it, or it is that tag's already.
-			const owner = this.versionChunks.get(msg.name), stored = owner === undefined ? !this.chunks.has(msg.name) : owner === msg.tag;
+			const owner = this.versionChunks.get(msg.name), full = () => [...this.versionChunks.values()].filter((t) => t === msg.tag).length >= 1024;
+			const stored = owner === undefined ? !this.chunks.has(msg.name) && !full() : owner === msg.tag;
 			if (stored) {
 				if (!this.chunks.has(msg.name)) this.chunks.set(msg.name, msg.data.slice());
 				this.versionChunks.set(msg.name, msg.tag);
@@ -56,7 +56,7 @@ export class Server {
 			conn.down.push({ t: "stored", name: msg.name });
 		} else if (msg.t === "mark") {
 			const missing: string[] = [];
-			if (msg.state === "current") conn.listFrom ??= this.clock;
+			if (msg.state === "current" && msg.start) conn.listFrom = this.clock;
 			for (const tag of msg.tags) {
 				const v = this.versions.get(tag);
 				if (msg.state === "current" || msg.state === "ask") {
@@ -65,7 +65,11 @@ export class Server {
 				} else if (v && v.retiredAt === null) Object.assign(v, { retiredAt: this.clock, deleted: msg.state === "deleted" });
 			}
 			if (msg.last) {
-				if (conn.live) this.lists.set(from.name, Math.max(this.lists.get(from.name) ?? 0, conn.listFrom ?? this.clock));
+				if (conn.live && conn.device) {
+					this.lists.set(from.name, Math.max(this.lists.get(from.name) ?? 0, conn.listFrom ?? this.clock));
+					this.touchOpen();
+					for (const d of this.lists.keys()) if ((this.seen.get(d) ?? -Infinity) < this.clock - 30 * 86_400_000) this.lists.delete(d);
+				}
 				conn.listFrom = undefined;
 			}
 			conn.down.push({ t: "marked", id: msg.id, tags: missing });
@@ -93,6 +97,25 @@ export class Server {
 		}
 	}
 
+	/** The status frame the transport sends once caught up, before anything the engine sends then. */
+	status(from: Device): void {
+		const conn = this.conns.get(from);
+		if (!conn || conn.device) return;
+		conn.device = true;
+		this.seen.set(from.name, this.clock);
+		while (this.seen.size > 64) this.seen.delete([...this.seen].reduce((a, b) => (b[1] < a[1] ? b : a))[0]);
+	}
+
+	/** A connection closes (or drops): its device was seen now. */
+	close(from: Device): void {
+		if (this.conns.get(from)?.device) this.seen.set(from.name, this.clock);
+		this.conns.delete(from);
+	}
+
+	private touchOpen(): void {
+		for (const [dev, c] of this.conns) if (c.device) this.seen.set(dev.name, this.clock);
+	}
+
 	private missing(tag: string): boolean {
 		for (const [name, t] of this.versionChunks) if (t === tag && !this.chunks.has(name)) return true;
 		return false;
@@ -100,6 +123,8 @@ export class Server {
 
 	/** Retirements before this are confirmed: every device seen in the last 30 days has listed what it holds current since. */
 	get listedAt(): number {
+		this.touchOpen();
+		if (this.seen.size >= 64 && Math.min(...this.seen.values()) >= this.clock - 30 * 86_400_000) return 0;
 		const recent = [...this.seen].filter(([, at]) => at >= this.clock - 30 * 86_400_000).map(([d]) => this.lists.get(d) ?? 0);
 		return recent.length ? Math.min(...recent) : Math.max(0, ...this.lists.values());
 	}
@@ -282,7 +307,7 @@ export class Device {
 		this.engine = null;
 		this.editors.clear();
 		this.events = [];
-		this.server.conns.delete(this);
+		this.server.close(this);
 	}
 
 	connect(): void {
@@ -293,14 +318,14 @@ export class Device {
 	}
 	disconnect(): void {
 		if (!this.online) return;
-		this.server.conns.delete(this);
+		this.server.close(this);
 		void this.engine?.disconnected();
 	}
 	/** Move one message in each direction; returns whether anything moved. */
 	pumpUp(): boolean {
 		const msg = this.server.conns.get(this)?.up.shift();
 		if (msg) {
-			this.trace?.(`${this.name} → server ${msg.t}${msg.t === "subscribe" ? ` after ${msg.after}` : msg.t === "snapshot" ? ` ${msg.doc.slice(0, 6)} base ${msg.base}` : msg.t === "mark" ? ` ${msg.state}${msg.last ? " last" : ""} ${msg.tags.length}` : "name" in msg ? ` ${msg.name}` : ` ${msg.entry.doc.slice(0, 6)}`}`);
+			this.trace?.(`${this.name} → server ${msg.t}${msg.t === "subscribe" ? ` after ${msg.after}` : msg.t === "snapshot" ? ` ${msg.doc.slice(0, 6)} base ${msg.base}` : msg.t === "mark" ? ` ${msg.state}${msg.start ? " start" : ""}${msg.last ? " last" : ""} ${msg.tags.length}` : "name" in msg ? ` ${msg.name}` : ` ${msg.entry.doc.slice(0, 6)}`}`);
 			this.server.handle(this, msg);
 		}
 		return !!msg;
@@ -310,6 +335,7 @@ export class Device {
 		if (msg) {
 			this.trace?.(`${this.name} ← server ${msg.t}${"seq" in msg ? ` ${msg.seq}` : ""}${"entry" in msg ? ` ${msg.entry.doc.slice(0, 6)}${msg.entry.kind === "snapshot" ? " snapshot" : ""}` : ""}${"name" in msg ? ` ${msg.name}` : ""}`);
 			this.drain();
+			if (msg.t === "synced") this.server.status(this); // as the transport does, before the engine hears of it
 			void this.engine?.receive(msg);
 		}
 		return !!msg;

@@ -212,3 +212,10 @@ test("setup proof: the setup key bound to the Worker's origin, as the Worker che
 	assert.equal(await v.setupProof("https://ownsync.me.workers.dev", "correct horse battery"), expected);
 	assert.notEqual(await v.setupProof("https://look-alike.example", "correct horse battery"), expected);
 });
+
+test("a document ID may be up to 255 bytes, as a split copy under another device's version ID can be; only version IDs, a name-key input, are held to 64", async () => {
+	const long = "é".repeat(127) + "x"; // 255 bytes
+	assert.deepEqual(v.unpackEntry(v.packEntry(long, new Uint8Array([7]))), { docId: long, update: new Uint8Array([7]) });
+	assert.throws(() => v.packEntry(long + "x", new Uint8Array(0)), /document ID too long/);
+	await assert.rejects(v.scopedChunkName(new Uint8Array(32), new Uint8Array(16), "x".repeat(65), 0, new Uint8Array(0)), /version ID too long/);
+});
