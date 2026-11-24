@@ -4,7 +4,7 @@ Real-time sync for Obsidian, end-to-end encrypted, through your own Cloudflare a
 
 <picture>
 <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/humanglitch191/ownsync/main/docs/images/hero-dark.png">
-<img src="https://raw.githubusercontent.com/humanglitch191/ownsync/main/docs/images/hero.png" alt="The Ownsync dashboard, and the page a phone opens to join">
+<img src="https://raw.githubusercontent.com/humanglitch191/ownsync/main/docs/images/hero.png" alt="The Ownsync dashboard's Storage page, and the page a phone opens to join">
 </picture>
 
 I wanted my notes on my laptop and my phone, in sync as I type, without handing them to anyone. Ownsync runs on a free Cloudflare Worker in your own account. Every edit is encrypted on your device before it leaves, so your Worker only ever holds scrambled data. It couldn't read a note if it tried.

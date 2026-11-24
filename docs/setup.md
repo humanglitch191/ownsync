@@ -50,12 +50,12 @@ Each code works once, for 2 minutes, and a fresh one appears while the screen is
 
 ## Your dashboard
 
-Your Worker's address is your dashboard. It opens with a one-line summary, then how much of Cloudflare's free plan you use over the last two weeks, and each vault's devices by the names you gave them in Obsidian (Settings → Ownsync → Device name), or their random ID until you do; click a name on the dashboard to rename it there: phone or computer, notes only or not, when each was last online, which version it runs, and any conflict copies. From Obsidian: Settings → Ownsync → **Open dashboard**.
+Your Worker's address is your dashboard. Pick a vault at the top of the sidebar. **Overview** sums it up in one line and lists its devices by the names you gave them in Obsidian (Settings → Ownsync → Device name), or their random ID until you do: phone or computer, when each was last online, which version it runs, and any conflict copies. **Devices** lets you rename them and add one. **Storage** shows what the vault takes up on your Worker, turns snapshots and history backup on or off, and cleans up old attachment history. Under **Your Worker**: all vaults, how much of Cloudflare's free plan you use, updates and passkeys. From Obsidian: Settings → Ownsync → **Open dashboard**.
 
 <p>
 <picture>
 <source media="(prefers-color-scheme: dark)" srcset="images/dashboard-dark.png">
-<img src="images/dashboard.png" width="560" alt="The dashboard">
+<img src="images/dashboard.png" width="660" alt="The dashboard: a vault's overview">
 </picture>
 </p>
 
