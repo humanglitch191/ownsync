@@ -36,8 +36,9 @@
 //     made concurrently both stay in the document. The first keeps the attachment; each other one becomes
 //     an attachment of its own named "(conflict …)", under an ID the version carries, so every device that
 //     splits them makes the same copy.
-//   - Attachments claiming one path with exactly the same content are one file: the smallest ID keeps it, the
-//     others are deleted. Identical bytes never make a "(conflict …)" copy.
+//   - Attachments claiming one path with exactly the same content are one file: the smallest ID keeps it, and
+//     the others' versions move into it before they are deleted, so a version that replaces it meanwhile
+//     elsewhere still leaves theirs as a copy. Identical bytes never make a "(conflict …)" copy.
 //   - At startup, an attachment is matched to a file by exact content only.
 //   - From 0.2.0 a version's chunks can be its own (Ref.s, DESIGN.md section 10), so the owner can remove old
 //     versions on the dashboard (Clean up). Every device reports which versions stop or start being current, and
@@ -1211,6 +1212,12 @@ export class Engine {
 				// Only a recorded deletion removes the file. A note missing from the index altogether is one whose index
 				// entry hasn't arrived yet (it waits inside Yjs for an update this device lacks): leave it be until then.
 				if (this.notes.get(id) === undefined) return true;
+				// A file an editor left behind (step 3 below) may hold typing that was never recorded: deleted elsewhere,
+				// it would go with the file, so it stays as its own note.
+				if (mode !== "merge" && isNote(m.diskPath) && seen) {
+					const current = await this.disk.read(m.diskPath);
+					if (await this.unrecorded(id, mode, current, (await this.text(id)) ?? "")) await this.keepCopy(m.diskPath, id, current);
+				}
 				// The deletion on record before the file goes: else, after a crash here, a new file the user puts
 				// at this path would be taken for this note, rewritten, and its edit would erase a later restore.
 				await this.flush();
@@ -1258,7 +1265,7 @@ export class Engine {
 			// document never had was edited from outside since. Either is about to be overwritten: keep it as its own note.
 			// A save the document has only typed past holds nothing new. (The agreed hash can't say: an editor's save that the
 			// document had already moved past when it was taken in never updates it.)
-			if (mode !== "merge" && !grewFrom(current, text) && (mode === "doc" || (await this.opts.hash(current)) !== m.baseHash)) await this.keepCopy(want, id, current);
+			if (mode !== "merge" && (await this.unrecorded(id, mode, current, text))) await this.keepCopy(want, id, current);
 		} else if (m.diskPath !== want) {
 			if (!(await this.vacate(want, id))) return this.deferred.has(id) || "blocked"; // waiting, or places shifted: look again
 			if (m.diskPath === want) return true; // the file there turned out to be this note
@@ -1347,6 +1354,11 @@ export class Engine {
 		this.put(`note:${id}`, m);
 		if ((await this.text(id)) === text) this.del(`base:${id}`);
 		else this.put(`base:${id}`, forked); // the file now shows the fork; the merged document still has to be written
+	}
+
+	/** Whether a file an editor left (`current`) may hold typing the document (`text`) never recorded. */
+	private async unrecorded(id: string, mode: "doc" | "recover", current: string, text: string): Promise<boolean> {
+		return !grewFrom(current, text) && (mode === "doc" || (await this.opts.hash(current)) !== this.metaOf(id).baseHash);
 	}
 
 	/** Save `text` next to the note as its own note, so nothing typed is lost when the two can't be merged. */
@@ -1525,28 +1537,33 @@ export class Engine {
 
 	/**
 	 * Attachments claiming one path with exactly the same content are one file, not a conflict: the smallest ID keeps
-	 * it and the others are deleted (on every device alike), so no "(conflict …)" copy is made of identical bytes.
-	 * Their versions are their own (other `u`), so only theirs are retired; a version only they hold brings them back.
+	 * it (on every device alike), so no "(conflict …)" copy is made of identical bytes. Each other one's versions move
+	 * into the one kept, beside its own, and the other is deleted. Identical versions side by side are one content
+	 * (split leaves them be), and a new version replaces them all at once (publish). But if a device that hasn't seen
+	 * this replaces the kept version meanwhile, the moved one is still there, and split makes it a copy: identical
+	 * now is no promise the kept one stays so, and its content must not go with the deleted one.
 	 */
 	private async dropDuplicates(id: string): Promise<void> {
 		const v = this.notes.get(id), group = v && v.d === undefined ? this.places().groups.get(v.p) : undefined;
 		if (!group || group.length < 2) return;
-		const kept = new Set<string>();
+		const kept = new Map<string, string>(); // content → the attachment keeping it
 		for (const other of [...group].sort()) {
 			if (await this.read(`up:${other}`)) continue; // its file is ahead of the vault here
 			const state = await this.state(other);
 			if (!state) continue;
-			const doc = this.load(state), hs = new Set(doc.getArray<Ref>("v").toArray().map((r) => r.h));
+			const doc = this.load(state), refs = doc.getArray<Ref>("v").toArray(), hs = new Set(refs.map((r) => r.h));
 			doc.destroy();
 			if (hs.size !== 1) continue; // no content yet, or versions still to split
-			const h = [...hs][0]!;
-			if (!kept.has(h)) kept.add(h);
-			else {
-				await this.tombstone(other);
-				// Published in this same input, its version was never counted current: retire it here (track won't see it go).
-				for (const u of await this.scopedVersions(other)) if (!this.holders.has(u)) this.report(u, "deleted");
-				if (other !== id) this.deferred.add(other); // its file goes too
-			}
+			const h = [...hs][0]!, keeper = kept.get(h);
+			if (!keeper) { kept.set(h, other); continue; }
+			const into = this.load(await this.state(keeper), this.clientId), to = into.getArray<Ref>("v"), before = Y.encodeStateVector(into);
+			const have = new Set(to.toArray().map((r) => r.u));
+			into.transact(() => { for (const r of refs) if (!have.has(r.u)) to.push([r]); });
+			const update = Y.encodeStateAsUpdate(into, before);
+			into.destroy();
+			await this.merge(keeper, update, true, true);
+			await this.tombstone(other);
+			if (other !== id) this.deferred.add(other); // its file goes too
 		}
 	}
 

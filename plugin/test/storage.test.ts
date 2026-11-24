@@ -284,7 +284,7 @@ test("a deleted attachment whose head is old-style is listed and restored, thoug
 	for (const d of devs) assert.deepEqual(missingChunks(server, d), []);
 });
 
-test("of two identical attachments at one path, only the dropped one's version is retired and cleaned up", async () => {
+test("of two identical attachments at one path, both versions stay until a new one replaces them, then both are cleaned up", async () => {
 	const { server, devs } = world();
 	const [a, b] = devs as [Device, Device];
 	await quiesce(devs);
@@ -298,8 +298,14 @@ test("of two identical attachments at one path, only the dropped one's version i
 	assert.deepEqual(disk(b), disk(a));
 	await nextDay(server, devs);
 	await nextDay(server, devs);
-	const n = PIC.length / 4; // each upload's own scoped chunks: the dropped one's go, the kept one's stay
-	assert.equal(server.cleanUp(0, server.clock), Math.ceil(n));
+	// The dropped one's version moved into the kept one: both current, nothing to clean up.
+	assert.equal(server.cleanUp(0, server.clock), 0);
+	a.write("p.png", bytes(PIC2));
+	await quiesce(devs);
+	assert.deepEqual(disk(b), { "p.png": PIC2 });
+	await nextDay(server, devs);
+	await nextDay(server, devs);
+	assert.equal(server.cleanUp(0, server.clock), 2 * Math.ceil(PIC.length / 4)); // each upload's own scoped chunks
 	for (const d of devs) assert.deepEqual(missingChunks(server, d), []);
 	const c = new Device("d2", server, rng(9));
 	c.overrides = { ...SCOPED };
