@@ -489,6 +489,52 @@ test("the same new attachment name on two devices keeps both, and both stay that
 	noProblems([a!, b!]);
 });
 
+test("the same new attachment, byte for byte, on two devices at one path is one file, not a conflict copy", async () => {
+	const { devs: [a, b] } = world();
+	await quiesce([a!, b!]);
+	a!.disconnect();
+	a!.write("scan.pdf", bytes("one scan"));
+	b!.write("scan.pdf", bytes("one scan"));
+	await quiesce([a!, b!]);
+	a!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), { "scan.pdf": "one scan" });
+	assert.deepEqual(disk(b!), disk(a!));
+	noProblems([a!, b!]);
+});
+
+test("an orphan conflict copy moved back to its original name on both devices comes back as one file", async () => {
+	const { devs: [a, b] } = world();
+	const P = "Templates/Bases/People.base";
+	a!.write(P, bytes("orig"));
+	await quiesce([a!, b!]);
+	a!.disconnect();
+	b!.disconnect();
+	a!.write(P, bytes("from A"));
+	b!.write(P, bytes("from B"));
+	a!.connect();
+	b!.connect();
+	await quiesce([a!, b!]);
+	a!.remove(P); // the original is gone: only the copy is left
+	await quiesce([a!, b!]);
+	const [copy] = Object.keys(disk(a!));
+	assert.match(copy!, /People \(conflict [0-9a-f]{6}\)\.base$/);
+	const content = disk(a!)[copy!];
+	// A's app is closed while the copy is renamed back on disk. On B the same move reaches the engine as a deletion
+	// and a new file (another program moved it): the engine sees new bytes at the path, not the copy.
+	a!.crash();
+	a!.rename(copy!, P);
+	const bytesOnB = b!.files.get(copy!)!.content;
+	b!.remove(copy!);
+	b!.write(P, bytesOnB);
+	a!.boot();
+	a!.connect();
+	await quiesce([a!, b!]);
+	assert.deepEqual(disk(a!), { [P]: content });
+	assert.deepEqual(disk(b!), disk(a!));
+	noProblems([a!, b!]);
+});
+
 test("deleting an attachment doesn't destroy a version the deleter never saw", async () => {
 	const { devs: [a, b] } = world();
 	a!.write("p.png", bytes(PIC));
