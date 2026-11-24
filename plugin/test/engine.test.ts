@@ -710,6 +710,30 @@ test("a crash with a note open whose typing is on record leaves no recovery copy
 	noProblems([a!, b!]);
 });
 
+test("a note open when the app was killed, before this device ever caught up, keeps typing its file never got", async () => {
+	const { devs: [a, b] } = world();
+	a!.write("Note.md", "hello");
+	await quiesce([a!, b!]);
+	const id = b!.engine!.noteAt("Note.md")!;
+	// As if the first catch-up never finished: startup doesn't look at the files, and file events wait for it.
+	b!.crash();
+	b!.data.set("meta", { ...(b!.data.get("meta") as object), synced: false });
+	b!.boot();
+	const t = (await b!.engine!.open(id))!.getText("t");
+	t.insert(t.length, " world");
+	await b!.idle();
+	b!.write("Note.md", t.toString()); // the editor saves
+	t.insert(t.length, " again"); // typing on record, never saved
+	await b!.idle();
+	b!.crash();
+	b!.boot();
+	assert.equal((await b!.engine!.open(id))!.getText("t").toString(), "hello world again");
+	b!.connect();
+	await quiesce([a!, b!]);
+	assert.equal(a!.files.get("Note.md")?.content, "hello world again");
+	noProblems([a!, b!]);
+});
+
 test("a note deleted elsewhere while open here, its typing synced, stays deleted with no copy, even if this app was killed", async () => {
 	for (const killed of [false, true]) {
 		const { devs: [a, b] } = world();

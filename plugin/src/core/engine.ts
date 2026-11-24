@@ -915,11 +915,6 @@ export class Engine {
 	private async scan(): Promise<void> {
 		const files = (await this.disk.list()).filter((f) => !this.notesOnly || isNote(f.path));
 		const onDisk = new Map(files.map((f) => [f.path, f]));
-		const atStart = async (id: string) => {
-			// A note still marked open was in an editor when the app stopped: its file is that editor's last save.
-			if (this.metaOf(id).open && !this.opened.has(id)) this.owe(id, "recover");
-			await this.settle(id);
-		};
 		const todo = new Set<string>();
 
 		// Notes that can't be sure of their file, and files that can't be sure of their note.
@@ -1018,7 +1013,7 @@ export class Engine {
 		for (const [key] of await this.store.list("base:")) todo.add(key.slice(5)); // a write was pending
 		for (const [id, v] of this.notes) if (v.d === undefined && !this.metaOf(id).diskPath) todo.add(id); // never written
 		for (const [id, m] of this.metas) if (m.diskPath !== this.effectivePath(id) || m.open || m.owed) todo.add(id);
-		for (const id of todo) await atStart(id);
+		for (const id of todo) await this.settle(id);
 	}
 
 	/**
@@ -1178,6 +1173,9 @@ export class Engine {
 	/** True: settled. False: the file changed meanwhile. "blocked": another file occupies the note's place. */
 	private async settleOnce(id: string): Promise<boolean | "blocked"> {
 		const m = this.metaOf(id);
+		// A note still marked open was in an editor when the app stopped: its file is that editor's last save. Here, not
+		// only at startup's scan, which waits for the first catch-up: an editor can open the note before that.
+		if (m.open && !this.opened.has(id)) this.owe(id, "recover");
 		const mode: Mode = m.owed ?? "merge";
 		const open = this.opened.get(id);
 		if (m.diskPath && this.dirty.has(m.diskPath)) {

@@ -153,19 +153,23 @@ async function run(seed: number, steps: number): Promise<void> {
 				log.push(`${d.name} restores ${note.path}${path ? ` → ${path}` : ""} (${note.id.slice(0, 6)})`);
 				const text = (await engine.deletedText(note.id)) ?? "";
 				await engine.restoreDeleted(note.id, path);
-				// A peer that still sees the old live note can reconcile an unprocessed delete and recreate
-				// as a text replacement. Its legitimate CRDT text deletion can merge after this restore.
-				const livePeers = devs.filter((peer) => {
-					if (peer === d) return false;
-					const entry = peer.storedIndex().get(note.id);
-					return entry && entry.d === undefined;
-				}).map((peer) => {
-					const path = (peer.data.get(`note:${note.id}`) as NoteMeta | undefined)?.diskPath;
-					const content = path ? peer.files.get(path)?.content : undefined;
-					return { peer, text: typeof content === "string" ? content : "" };
+				// A peer can have reconciled a delete and recreate as a text replacement, a legitimate CRDT text
+				// deletion that merges after this restore if this device hadn't seen it yet; whether the peer still
+				// sees the note live (its file) or has deleted it again since (its stored copy).
+				const peers = devs.filter((peer) => peer !== d && peer.storedIndex().has(note.id)).map((peer) => {
+					if (peer.storedIndex().get(note.id)!.d === undefined) {
+						const path = (peer.data.get(`note:${note.id}`) as NoteMeta | undefined)?.diskPath;
+						const content = path ? peer.files.get(path)?.content : undefined;
+						return { peer, text: typeof content === "string" ? content : "" };
+					}
+					const doc = new Y.Doc(), state = peer.data.get(`state:${note.id}`) as Uint8Array | undefined;
+					if (state) Y.applyUpdate(doc, state);
+					const kept = doc.getText("t").toString();
+					doc.destroy();
+					return { peer, text: kept };
 				});
 				for (const t of tokensIn(text)) {
-					if (!livePeers.some(({ peer, text }) => removedBy.get(peer)!.has(t) && !text.includes(t))) restored.set(t, note.id);
+					if (!peers.some(({ peer, text }) => removedBy.get(peer)!.has(t) && !text.includes(t))) restored.set(t, note.id);
 				}
 			}
 		}
