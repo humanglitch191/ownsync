@@ -307,7 +307,7 @@ const FIXED = [
 const FAILED = [
 	1610460, 1621736, 1645185, 1661421, 1691034, 1703746, 1724336, 1743398, 1762951, 1781044, 1803511, 1820440,
 	1843276, 1860490, 1880494, 1901034, 1957125, 1971785, 1986257, 2003566, 2031220, 2046034, 2061343, 2102409,
-	2170737, 2192509
+	2170737, 2192509, 2281409
 ];
 test(`fuzz: ${FAILED.length} seeds that failed with restores and Clean up`, { skip: !!process.env.FUZZ_SEED || !!process.env.FUZZ_FIRST }, async () => {
 	for (const seed of FAILED) await run(seed, 250);

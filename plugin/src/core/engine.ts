@@ -874,6 +874,7 @@ export class Engine {
 	 * `path` is simply where the index already puts the note (its own conflict-suffixed name included).
 	 */
 	private movedTo(id: string, path: string, file?: DiskFile): void {
+		this.metaOf(id).writing = undefined; // a file of this note's was there to move: its write landed
 		this.place(id, path, file);
 		if (this.effectivePath(id) !== path) this.notes.set(id, { p: path });
 	}
