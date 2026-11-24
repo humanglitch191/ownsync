@@ -203,6 +203,27 @@ test("a notes-only device's daily list keeps what is current from being cleaned 
 	noProblems(devs);
 });
 
+test("a notes-only device includes the hidden member in its full list", async () => {
+	const { server, devs } = world(3, 1, (d, i) => { if (i === 2) d.overrides = { ...SCOPED, attachments: false }; });
+	const [a, b, phone] = devs as [Device, Device, Device];
+	await quiesce(devs);
+	a.disconnect();
+	a.write("p.png", bytes(PIC));
+	b.write("p.png", bytes(PIC));
+	await quiesce(devs);
+	a.connect();
+	await quiesce(devs);
+	assert.equal(server.versions.size, 2);
+	assert.deepEqual(disk(phone), {});
+	for (const version of server.versions.values()) version.retiredAt = server.clock;
+	a.disconnect();
+	b.disconnect();
+	await nextDay(server, devs, [phone], 31);
+	assert.ok([...server.versions.values()].every((v) => v.retiredAt === null));
+	assert.equal(server.cleanUp(0, server.clock), 0);
+	noProblems(devs);
+});
+
 test("the simulator confirms as the Worker does: seen on status and close only, lists only after status, the newest 64, open connections seen", () => {
 	const server = new Server(), random = rng(1);
 	const dev = (n: string) => { const d = new Device(n, server, random); server.conns.set(d, { up: [], down: [], live: true }); return d; };
@@ -298,10 +319,22 @@ test("of two identical attachments at one path, both versions stay until a new o
 	assert.deepEqual(disk(b), disk(a));
 	await nextDay(server, devs);
 	await nextDay(server, devs);
-	// The dropped one's version moved into the kept one: both current, nothing to clean up.
+	// The hidden attachment still owns its version. Both are current.
 	assert.equal(server.cleanUp(0, server.clock), 0);
+	const ids = [...a.storedIndex()].filter(([, v]) => v.d === undefined && v.p === "p.png");
+	assert.equal(ids.length, 2);
+	const hidden = ids.find(([id]) => id !== a.engine!.noteAt("p.png"))![0];
+	const hiddenState = new Y.Doc();
+	Y.applyUpdate(hiddenState, a.data.get(`state:${hidden}`) as Uint8Array);
+	const hiddenRef = hiddenState.getArray<Ref>("v").get(0);
+	hiddenState.destroy();
+	server.chunks.delete(hiddenRef.c[0]!); // only the visible file has the bytes to repair this scoped version
+	await nextDay(server, devs);
+	assert.ok(server.chunks.has(hiddenRef.c[0]!));
 	a.write("p.png", bytes(PIC2));
 	await quiesce(devs);
+	assert.deepEqual(await listed(b, devs), []);
+	assert.equal(await b.engine!.restoreAttachment(hidden), undefined);
 	assert.deepEqual(disk(b), { "p.png": PIC2 });
 	await nextDay(server, devs);
 	await nextDay(server, devs);
@@ -314,4 +347,31 @@ test("of two identical attachments at one path, both versions stay until a new o
 	await quiesce([a, b, c]);
 	assert.deepEqual(disk(c), disk(a));
 	noProblems([a, b, c]);
+});
+
+test("deletion groups restore from a surviving member when the smallest member's chunks are gone", async () => {
+	const { server, devs } = world();
+	const [a, b] = devs as [Device, Device];
+	await quiesce(devs);
+	a.disconnect();
+	a.write("p.png", bytes(PIC));
+	b.write("p.png", bytes(PIC));
+	await quiesce(devs);
+	a.connect();
+	await quiesce(devs);
+	const rep = a.engine!.noteAt("p.png")!;
+	const doc = new Y.Doc();
+	Y.applyUpdate(doc, a.data.get(`state:${rep}`) as Uint8Array);
+	const chunk = doc.getArray<Ref>("v").get(0).c[0]!;
+	doc.destroy();
+	b.remove("p.png");
+	await quiesce(devs);
+	server.chunks.delete(chunk);
+	assert.deepEqual(await listed(a, devs), ["p.png"]);
+	const back = b.engine!.restoreAttachment(rep);
+	await quiesce(devs);
+	assert.equal(await back, "p.png");
+	assert.deepEqual(disk(a), { "p.png": PIC });
+	assert.deepEqual(await listed(a, devs), []);
+	noProblems(devs);
 });

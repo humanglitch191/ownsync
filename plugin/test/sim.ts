@@ -2,13 +2,14 @@
 // the mailbox rules, and a network the test moves one message at a time. A device can crash in the middle
 // of any operation; whatever it hadn't committed is gone, and its disk is as it was at that instant.
 
+import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
 // The plugin uses window's timers (they work in Obsidian's pop-out windows); in Node, the global ones are those.
 (globalThis as { window?: unknown }).window ??= globalThis;
 import * as Y from "yjs";
 import { Engine, type EngineOptions } from "../src/core/engine";
-import type { ClientMsg, Disk, DiskFile, Entry, ServerMsg, Store } from "../src/core/ports";
+import type { ClientMsg, Disk, DiskFile, Entry, Ref, ServerMsg, Store } from "../src/core/ports";
 import type { KeyPorts, KeyState } from "../src/keys";
 
 /** A note's text, or an attachment's bytes. */
@@ -169,7 +170,23 @@ export class Device {
 	private clock = 1;
 	private life = { dead: true, fuse: Infinity };
 
-	constructor(readonly name: string, readonly server: Server, private readonly random: () => number) {}
+	reachedHidden = false;
+	constructor(readonly name: string, readonly server: Server, private readonly random: () => number, readonly engineType = Engine) {}
+
+	checkHeads(): void {
+		if (!this.engine || this.engineType !== Engine) return;
+		const heads = this.engine["heads"];
+		const shared = new Set([...this.engine["places"]().groups.values()].filter((ids) => ids.length > 1).flat());
+		for (const [id, v] of this.storedIndex()) {
+			if (v.d !== undefined || v.p.endsWith(".md") || (!shared.has(id) && !heads.has(id))) continue;
+			assert.ok(heads.has(id), `missing cached head for shared claim on ${this.name}: ${id}`);
+			const doc = new Y.Doc(), state = this.data.get(`state:${id}`) as Uint8Array | undefined;
+			if (state) Y.applyUpdate(doc, state);
+			const refs = doc.getArray<Ref>("v").toArray(), h = refs[0]?.h;
+			assert.equal(heads.get(id), refs.every((r) => r.h === h) ? h : undefined, `cached head on ${this.name} for ${id}`);
+			doc.destroy();
+		}
+	}
 
 	get alive(): boolean {
 		if (this.engine && this.life.dead) this.crash();
@@ -203,11 +220,11 @@ export class Device {
 		if (state) Y.applyUpdate(doc, state);
 		return doc.getText("t").toString();
 	}
-	storedIndex(): Map<string, { p: string; d?: string }> {
+	storedIndex(): Map<string, { p: string; d?: string; t?: number; g?: string; r?: 1 }> {
 		const state = this.data.get("index") as Uint8Array | undefined;
 		const doc = new Y.Doc();
 		if (state) Y.applyUpdate(doc, state);
-		const index = new Map(doc.getMap<{ p: string; d?: string }>("notes"));
+		const index = new Map(doc.getMap<{ p: string; d?: string; t?: number; g?: string; r?: 1 }>("notes"));
 		doc.destroy();
 		return index;
 	}
@@ -278,7 +295,7 @@ export class Device {
 				for (const [k, v] of puts) this.data.set(k, structuredClone(v));
 			},
 		};
-		const engine = (this.engine = new Engine(store, disk, {
+		const engine = (this.engine = new this.engineType(store, disk, {
 			hash: async (text) => text, // exact, and readable in failures
 			chunkName: async (data, scope) => createHash("sha256").update(scope ? `${scope.u} ${scope.i} ` : "").update(data).digest("hex").slice(0, 12),
 			chunkSize: 4, // so most attachments are several chunks
@@ -291,6 +308,14 @@ export class Device {
 			defer: (start) => this.events.push(start),
 			...this.overrides,
 		}));
+		if (this.engineType === Engine && this.overrides.attachments !== false) {
+			const places = engine["places"].bind(engine);
+			engine["places"] = () => {
+				const view = places();
+				if (view.hidden.size) this.reachedHidden = true;
+				return view;
+			};
+		}
 		this.trace?.(`${this.name} session client ${(engine as unknown as { clientId: number }).clientId}`);
 		void engine.start();
 	}
@@ -379,4 +404,5 @@ export async function quiesce(devs: Device[]): Promise<void> {
 		}
 		quiet = moved ? 0 : quiet + 1;
 	}
+	for (const d of devs) d.checkHeads();
 }

@@ -25,14 +25,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     env:
       FUZZ_RUNS: ${{ inputs.runs || '20000' }}
       FUZZ_STEPS: ${{ inputs.steps || '250' }}
       SHARD: ${{ matrix.shard }}
+      FUZZ_MIXED: ${{ matrix.shard == 8 && '1' || '0' }}
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: ${{ matrix.shard == 8 && '0' || '1' }}
           persist-credentials: false # no token on disk while dependency install scripts run
       - uses: actions/setup-node@v7
         with:
@@ -43,6 +45,6 @@ jobs:
       - name: Fuzz one seed range
         working-directory: plugin
         run: |
-          export FUZZ_FIRST=$(( (GITHUB_RUN_NUMBER * 8 + SHARD) * FUZZ_RUNS + 1 ))
+          export FUZZ_FIRST=$(( (GITHUB_RUN_NUMBER * 9 + SHARD) * FUZZ_RUNS + 1 ))
           echo "seeds $FUZZ_FIRST to $(( FUZZ_FIRST + FUZZ_RUNS - 1 )), $FUZZ_STEPS steps each"
           node --import jiti/register --test test/engine.fuzz.test.ts
