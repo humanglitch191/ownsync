@@ -1325,6 +1325,9 @@ export class Engine {
 		const text = await this.disk.read(path);
 		const hash = await this.opts.hash(text);
 		if ((await this.text(id)) === text) return this.agree(id, file, hash);
+		// The engine stopped before writing this note's first file here, and another file was put here since: not
+		// this note's, so not an edit of it. Step 3 makes room for the note, taking that file in as a note of its own.
+		if (m.writing && m.baseHash === undefined) return this.forget(id);
 		if (hash === m.baseHash || mode !== "merge") {
 			// Same text as last agreed, or an editor's older save: the document is ahead and will be written.
 			Object.assign(m, { mtime: file.mtime, size: file.size });
@@ -1593,7 +1596,8 @@ export class Engine {
 	private async fetch(id: string, ref: Ref): Promise<Uint8Array | undefined> {
 		let f = this.fetching;
 		if (f && f.id !== id) return void this.toFetch.add(id); // one at a time
-		if (!f || f.ref.h !== ref.h) this.fetching = f = { id, ref, asked: new Set(), got: new Map([...(f?.got ?? [])].filter(([name]) => ref.c.includes(name))) };
+		// The same content can be another version's chunks (scoped to it): what to ask for is the chunks, not the content.
+		if (!f || f.ref.h !== ref.h || f.ref.c.join() !== ref.c.join()) this.fetching = f = { id, ref, asked: new Set(), got: new Map([...(f?.got ?? [])].filter(([name]) => ref.c.includes(name))) };
 		if (ref.c.some((name) => !f.got.has(name))) return undefined; // pump asks for them
 		this.fetching = null;
 		const parts = ref.c.map((name) => f.got.get(name)!);
