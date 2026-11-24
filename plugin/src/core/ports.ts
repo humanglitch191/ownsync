@@ -127,6 +127,8 @@ export interface Upload {
 	ref: Ref;
 	/** The version it replaces (its `h`), if any. */
 	base?: string;
+	/** Hidden copies the original save replaced, even if the file was saved again while uploading. */
+	seen?: { id: string; u: string[] }[];
 }
 
 /** What this device knows about one note's (or attachment's) file. */
@@ -143,6 +145,8 @@ export interface NoteMeta {
 	copyOf?: string;
 	/** The engine is about to write, or has just written, this note's file, and hasn't recorded the result. */
 	writing?: boolean;
+	/** This attachment's identical projected file was verified and is about to be unlinked. */
+	removingHidden?: boolean;
 	/** The file is an editor's save that the document must overwrite (after a close, or after a crash). */
 	owed?: "doc" | "recover";
 }
