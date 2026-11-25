@@ -329,6 +329,45 @@ test("the snapshot ledger skips malformed entries and forgets all entries across
 	noProblems(devs);
 });
 
+test("an open waits for startup scan and binds only if the path still belongs to that note", async () => {
+	for (const moved of [true, false]) {
+		const { server, devs: [a] } = world(1);
+		a!.write("Note.md", "original"); await quiesce([a!]);
+		const id = a!.engine!.noteAt("Note.md")!;
+		a!.remove("Note.md"); await quiesce([a!]);
+
+		// The entries arrived, but this device has never received the end of its first catch-up.
+		const b = new Device("reader", server, rng(42));
+		b.boot();
+		for (const row of server.rows) await b.engine!.receive({ t: "entry", ...row });
+		assert.equal(await b.engine!.restoreDeleted(id), "Note.md");
+		b.crash();
+		if (moved) { b.rename("Note.md", "Moved.md"); b.write("Note.md", "replacement"); }
+		b.boot(); await b.idle();
+		const engine = b.engine!, before = disk(b);
+		const opening = engine.open(id);
+		await b.idle();
+		assert.deepEqual(disk(b), before);
+		assert.equal(engine.isOpen(id), false);
+		b.connect(); await quiesce([a!, b]);
+		const doc = await opening;
+		if (moved) {
+			assert.equal(doc, undefined);
+			assert.equal(engine.isOpen(id), false);
+			assert.equal(engine.noteAt("Moved.md"), id);
+			const replacement = engine.noteAt("Note.md")!;
+			assert.notEqual(replacement, id);
+			assert.equal((await engine.open(replacement))?.getText("t").toString(), "replacement");
+		} else {
+			assert.equal(doc?.getText("t").toString(), "original");
+			assert.equal(engine.isOpen(id), true);
+		}
+		assert.deepEqual(disk(b), before);
+		assert.deepEqual(disk(a!), before);
+		noProblems([a!, b]);
+	}
+});
+
 test("typing in an editor reaches the other device's editor and file", async () => {
 	const { devs: [a, b] } = world();
 	a!.write("Note.md", "one");
@@ -796,10 +835,6 @@ test("a note open when the app was killed, before this device ever caught up, ke
 	a!.write("Note.md", "hello");
 	await quiesce([a!, b!]);
 	const id = b!.engine!.noteAt("Note.md")!;
-	// As if the first catch-up never finished: startup doesn't look at the files, and file events wait for it.
-	b!.crash();
-	b!.data.set("meta", { ...(b!.data.get("meta") as object), synced: false });
-	b!.boot();
 	const t = (await b!.engine!.open(id))!.getText("t");
 	t.insert(t.length, " world");
 	await b!.idle();
@@ -807,10 +842,15 @@ test("a note open when the app was killed, before this device ever caught up, ke
 	t.insert(t.length, " again"); // typing on record, never saved
 	await b!.idle();
 	b!.crash();
+	// Older releases could leave this editor state before the first catch-up finished.
+	b!.data.set("meta", { ...(b!.data.get("meta") as object), synced: false });
 	b!.boot();
-	assert.equal((await b!.engine!.open(id))!.getText("t").toString(), "hello world again");
+	await b!.idle();
+	const opening = b!.engine!.open(id);
+	assert.equal(b!.files.get("Note.md")?.content, "hello world");
 	b!.connect();
 	await quiesce([a!, b!]);
+	assert.equal((await opening)!.getText("t").toString(), "hello world again");
 	assert.equal(a!.files.get("Note.md")?.content, "hello world again");
 	noProblems([a!, b!]);
 });

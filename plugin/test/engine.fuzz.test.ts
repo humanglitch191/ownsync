@@ -102,6 +102,7 @@ async function run(seed: number, steps: number): Promise<void> {
 		for (const t of typed) if (!kept.includes(t)) fate.set(t, "may");
 	};
 
+	let tabsClosed = false;
 	for (const d of devs) { d.boot(); d.connect(); }
 	for (let step = 0; step < steps; step++) {
 		const d = pick(devs)!;
@@ -129,7 +130,21 @@ async function run(seed: number, steps: number): Promise<void> {
 		else if (r < 27) { const p = pick(closedFiles(d)); if (p) { log.push(`${d.name} deletes ${p}`); remove(d, p); } }
 		else if (r < 32) {
 			const id = pick([...d.files.keys()].filter(isNote).map((p) => d.engine!.noteAt(p)).filter((x): x is string => !!x && !d.editors.has(x)));
-			if (id) { log.push(`${d.name} opens ${d.pathOf(id)}`); closing = id; d.drain(); const doc = await d.engine!.open(id); if (doc && d.alive) d.editors.set(id, doc); }
+			if (id) {
+				log.push(`${d.name} opens ${d.pathOf(id)}`); closing = id; d.drain();
+				const engine = d.engine!, path = d.pathOf(id)!;
+				const bind = async () => {
+					if (tabsClosed || !d.alive || d.engine !== engine) return;
+					const owner = engine.noteAt(path);
+					if (!owner) return;
+					const doc = await engine.open(owner);
+					if (!doc || !d.alive || d.engine !== engine) return;
+					if (!tabsClosed && engine.noteAt(path) === owner) d.editors.set(owner, doc);
+					else if (!d.editors.has(owner)) await engine.close(owner);
+				};
+				if (engine.readyForEditors) await bind();
+				else void engine.startupScan.then(ready => { if (ready) return bind(); });
+			}
 		} else if (r < 47) { const e = pick([...d.editors]); if (e) { log.push(`${d.name} types in ${d.pathOf(e[0])}`); const before = fate.size; typeIn(d, e[1]); typed.add([...fate.keys()][before]!); } }
 		else if (r < 53) { const id = pick([...d.editors.keys()]); if (id) { log.push(`${d.name} autosaves ${d.pathOf(id)}`); autosave(d, id); } }
 		else if (r < 57) { const id = pick([...d.editors.keys()]); if (id) { log.push(`${d.name} closes ${d.pathOf(id)}`); autosave(d, id); const engine = d.engine!; d.editors.delete(id); closing = id; d.drain(); void engine.close(id); } }
@@ -213,6 +228,7 @@ async function run(seed: number, steps: number): Promise<void> {
 
 	// Calm down: close editors, start everything, connect everything, let it all drain.
 	log.push("calm down");
+	tabsClosed = true;
 	for (const d of devs) {
 		d.onRead = null;
 		d.crash(1e9); // disarm any pending fuse
@@ -307,7 +323,7 @@ const FIXED = [
 const FAILED = [
 	1610460, 1621736, 1645185, 1661421, 1691034, 1703746, 1724336, 1743398, 1762951, 1781044, 1803511, 1820440,
 	1843276, 1860490, 1880494, 1901034, 1957125, 1971785, 1986257, 2003566, 2031220, 2046034, 2061343, 2102409,
-	2170737, 2192509, 2281409, 2561205, 2644373, 2680806, 2719789, 2923193, 3244949
+	2170737, 2192509, 2281409, 2561205, 2644373, 2680806, 2719789, 2923193, 3244949, 3287775
 ];
 test(`fuzz: ${FAILED.length} seeds that failed with restores and Clean up`, { skip: !!process.env.FUZZ_SEED || !!process.env.FUZZ_FIRST }, async () => {
 	for (const seed of FAILED) await run(seed, 250);

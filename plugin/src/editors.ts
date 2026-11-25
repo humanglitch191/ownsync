@@ -31,7 +31,10 @@ export class Editors {
 	constructor(
 		private readonly app: App, private readonly engine: Engine, private readonly onProblem: (what: string, err: unknown) => void,
 		private readonly sendPresence: (note: string, update: Uint8Array) => void, private name: string,
-	) {}
+	) {
+		// Re-read the visible tabs and their paths after offline moves have been reconciled.
+		void engine.startupScan.then(ready => { if (ready) this.refresh(); });
+	}
 
 	/** Another device's presence in a note. Dropped unless an editor here shows the note. */
 	receivePresence(note: string, update: Uint8Array): void {
@@ -58,6 +61,7 @@ export class Editors {
 
 	/** Bring the bindings in line with what is on screen. Calls are handled one after another. */
 	refresh(): void {
+		if (!this.engine.readyForEditors || this.stopped) return;
 		this.queue = this.queue.then(() => (this.stopped ? undefined : this.sync())).catch((err) => this.onProblem("connecting an editor to sync", err));
 	}
 

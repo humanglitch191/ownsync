@@ -182,6 +182,11 @@ export class Engine {
 	private metas = new Map<string, NoteMeta>();
 	private byPath = new Map<string, string>(); // disk path → note ID
 	private opened = new Map<string, Y.Doc>();
+	private scanned = false;
+	private finishStartup!: (ready: boolean) => void;
+	readonly startupScan = new Promise<boolean>(resolve => { this.finishStartup = resolve; });
+	private waitingOpens = new Map<string, Promise<Y.Doc | undefined>>();
+	get readyForEditors() { return this.scanned; }
 	private outbox: { id: number; entry: Entry }[] = [];
 	private liveOut: Entry[] = []; // this input's edits, to relay to other devices right away
 	private lastPublish = 0;
@@ -367,8 +372,24 @@ export class Engine {
 
 	/** Load a note for an editor. Edits to the returned document are synced; remote edits appear in it. */
 	open(id: string): Promise<Y.Doc | undefined> {
+		if (this.scanned) return this.openAfterScan(id);
+		const waiting = this.waitingOpens.get(id);
+		if (waiting) return waiting;
+		const path = this.metas.get(id)?.diskPath;
+		// Wait outside the input queue so catch-up can run the scan that resolves this open.
+		const pending = this.startupScan.then(ready => {
+			if (this.waitingOpens.get(id) !== pending) return undefined;
+			this.waitingOpens.delete(id);
+			return ready ? this.openAfterScan(id, path) : undefined;
+		});
+		this.waitingOpens.set(id, pending);
+		return pending;
+	}
+
+	private openAfterScan(id: string, requestedPath?: string): Promise<Y.Doc | undefined> {
 		let doc: Y.Doc | undefined;
 		return this.run(`open ${id}`, async () => {
+			if (requestedPath !== undefined && this.noteAt(requestedPath) !== id) return;
 			if (this.opened.has(id)) return void (doc = this.opened.get(id));
 			await this.settle(id); // the editor is about to show the file: take in what's on disk first
 			if (this.effectivePath(id) === undefined) return;
@@ -384,6 +405,7 @@ export class Engine {
 	}
 
 	close(id: string): Promise<void> {
+		this.waitingOpens.delete(id);
 		return this.run(`close ${id}`, async () => {
 			const doc = this.opened.get(id);
 			if (!doc) return;
@@ -566,6 +588,8 @@ export class Engine {
 
 	/** Stop timers. The engine must not be used afterwards. */
 	stop(): void {
+		this.waitingOpens.clear();
+		this.finishStartup(false);
 		if (this.paceTimer) window.clearTimeout(this.paceTimer);
 	}
 
@@ -592,7 +616,7 @@ export class Engine {
 			} else if (msg.t === "synced") {
 				if (msg.seq > this.meta.cursor) this.setCursor(msg.seq);
 				this.live = true;
-				if (!this.meta.synced) {
+				if (!this.scanned) {
 					this.meta.synced = true;
 					this.put("meta", this.meta);
 					this.joining = true;
@@ -1102,6 +1126,8 @@ export class Engine {
 		for (const [id, v] of this.notes) if (v.d === undefined && !this.metaOf(id).diskPath) todo.add(id); // never written
 		for (const [id, m] of this.metas) if (m.diskPath !== this.effectivePath(id) || m.open || m.owed) todo.add(id);
 		for (const id of todo) await this.settle(id);
+		this.scanned = true;
+		this.finishStartup(true);
 	}
 
 	/**
