@@ -4,9 +4,6 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { VaultKeys, newRecovery, shortId, vaultIdOf } from "../src/keys";
 import { Transport, fetchRecords } from "../src/transport";
 import { hex, unhex, sha256, unpackPairing } from "../../protocol/ownsync";
@@ -365,22 +362,17 @@ test("a live legacy vault migrates through the transport, then an updated peer d
 });
 
 test("the device reports a failed migration and waits without running legacy sync", async () => {
-	const dir = join(dev.persistDir, "v3/do/ownsync-Vault"), before = new Set(readdirSync(dir));
 	const old = await device("legacy", "write-limit");
 	await old.link.connect(); await until([old.d], () => old.link.status === "synced");
-	const file = readdirSync(dir).find(f => /^[0-9a-f]{64}\.sqlite$/.test(f) && !before.has(f));
-	assert.ok(file);
-	const db = new DatabaseSync(join(dir, file));
-	try {
-		db.exec("CREATE TRIGGER refuse_format BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
-		const a = await device("capable","write-limit",key,{},undefined,undefined,true);
-		await a.link.connect();
-		await until([a.d], () => a.problems.some(p => p.includes("Migration could not complete today")));
-		assert.equal(a.d.engine!.tableActive, false);
-		old.d.write("still-legacy.md", "after a refused migration");
-		await until([old.d], () => !!old.d.engine!.noteAt("still-legacy.md"));
-		assert.equal(a.d.files.has("still-legacy.md"),false);
-	} finally { db.close(); }
+	const fault = await fetch(`${host}/test-fail-genesis/${hex(old.keys.vaultId)}`, { method: "POST" });
+	assert.equal(fault.status, 204, await fault.text());
+	const a = await device("capable","write-limit",key,{},undefined,undefined,true);
+	await a.link.connect();
+	await until([a.d], () => a.problems.some(p => p.includes("Migration could not complete today")));
+	assert.equal(a.d.engine!.tableActive, false);
+	old.d.write("still-legacy.md", "after a refused migration");
+	await until([old.d], () => !!old.d.engine!.noteAt("still-legacy.md"));
+	assert.equal(a.d.files.has("still-legacy.md"),false);
 });
 
 test("table note rows bind the placed document and typing crosses the encrypted live channel", async () => {

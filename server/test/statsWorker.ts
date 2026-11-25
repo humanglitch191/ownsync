@@ -2,11 +2,22 @@
 // production only the owner's dashboard reaches (over RPC), and headers standing in for a redeploy:
 // `x-test-deployed-ago` (ms since this version was deployed) and `x-test-setup-key` (a new SETUP_KEY). `wrangler dev` runs this file in place of src/index.ts.
 
-import worker, { type Vault } from "../src/index";
-export { Owner, Pairing, Vault } from "../src/index";
+import worker, { Vault as ProductionVault } from "../src/index";
+export { Owner, Pairing } from "../src/index";
+
+export class Vault extends ProductionVault {
+	failGenesisWrite() {
+		this.ctx.storage.sql.exec("CREATE TRIGGER refuse_format BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
+	}
+}
 
 export default {
 	async fetch(req: Request, env: { VAULT: DurableObjectNamespace<Vault> }): Promise<Response> {
+		const failGenesis = new URL(req.url).pathname.match(/^\/test-fail-genesis\/([0-9a-f]{32})$/);
+		if (req.method === "POST" && failGenesis) {
+			await env.VAULT.get(env.VAULT.idFromName(failGenesis[1]!)).failGenesisWrite();
+			return new Response(null, { status: 204 });
+		}
 		const stats = new URL(req.url).pathname.match(/^\/test-stats\/([0-9a-f]{32})$/);
 		if (stats) return Response.json(await env.VAULT.get(env.VAULT.idFromName(stats[1]!)).stats());
 		// Clean up as the dashboard asks for it, with the Worker's clock and the per-request limit set by the test.
