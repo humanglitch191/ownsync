@@ -16,7 +16,13 @@ export function onlyInserts(prev: string, next: string): boolean {
 	return textEdits(prev, next).every(([, remove]) => remove === 0);
 }
 
-function textEdits(prev: string, next: string): [at: number, remove: number, insert: string][] {
+// Legacy startup infers identity from intact words. Refining a known note's
+// merge within a word must not also claim an unrelated file after a crash.
+export function onlyInsertsWords(prev: string, next: string): boolean {
+	return textEdits(prev, next, false).every(([, remove]) => remove === 0);
+}
+
+function textEdits(prev: string, next: string, refine = true): [at: number, remove: number, insert: string][] {
 	if (prev === next) return [];
 	const split = (text: string) => text.split(/(\s+)/).filter((u) => u !== ""); // words and the whitespace between them
 	const a = split(prev), b = split(next);
@@ -30,9 +36,26 @@ function textEdits(prev: string, next: string): [at: number, remove: number, ins
 	const hunks: [at: number, remove: number, insert: string][] = [];
 	let i = 0, j = 0, at = a.slice(0, start).join("").length;
 	for (const [x, y] of kept) {
-		const remove = am.slice(i, x).join("").length, insert = bm.slice(j, y).join("");
-		if (remove || insert) hunks.push([at, remove, insert]);
-		at += remove + (am[x]?.length ?? 0);
+		const old = am.slice(i, x).join(""), insert = bm.slice(j, y).join("");
+		if (old || insert) {
+			// Yjs offsets are UTF-16. Preserve whole code points at each edge.
+			let left = 0, right = 0;
+			if (refine) {
+				while (left < old.length && old.codePointAt(left) === insert.codePointAt(left))
+					left += old.codePointAt(left)! > 0xffff ? 2 : 1;
+				while (right < old.length - left && right < insert.length - left &&
+					old.charCodeAt(old.length - right - 1) === insert.charCodeAt(insert.length - right - 1)) right++;
+				if (right && /[\uDC00-\uDFFF]/.test(old.charAt(old.length - right))) right--;
+				// A pure insertion retains all the old text. For a multiword replacement,
+				// retaining edges can anchor a new word across an old inter-word insertion.
+				if (left + right < old.length && (x - i > 1 || y - j > 1)) {
+					left = 0;
+					right = 0;
+				}
+			}
+			hunks.push([at + left, old.length - left - right, insert.slice(left, insert.length - right)]);
+		}
+		at += old.length + (am[x]?.length ?? 0);
 		i = x + 1;
 		j = y + 1;
 	}

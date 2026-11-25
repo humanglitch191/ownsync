@@ -54,7 +54,7 @@ import type { DiskPort } from "./table/disk";
 import { restorePath } from "../historyRules";
 import type { NoteRows, NoteRow } from "./table/notes";
 import { legacyBases } from "./table/migration";
-import { applyText, onlyInserts } from "./text";
+import { applyText, onlyInsertsWords } from "./text";
 import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, MarkState, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
 
 const INDEX: DocId = "index";
@@ -152,7 +152,7 @@ function grewFrom(older: string, text: string): boolean {
 	return true;
 }
 function matchesFirstWrite(intended: string | undefined, disk: string, otherAgreements: string[]): boolean {
-	return intended === disk || (!otherAgreements.length && intended !== undefined && onlyInserts(intended, disk));
+	return intended === disk || (!otherAgreements.length && intended !== undefined && onlyInsertsWords(intended, disk));
 }
 /**
  * How much of the smaller text is in the larger one: a note that grew or shrank a lot is still the same note.
@@ -219,6 +219,7 @@ export class Engine {
 	private settling = new Set<string>();
 	private unknown = new Map<string, string>(); // within one input: hashes of files read while looking for a moved note
 	private dirty = new Map<string, number>(); // paths with file events announced but not handled yet
+	private waitingTablePaths = new Map<string, Set<string>>();
 	private deferred = new Set<string>(); // notes waiting for those events before their file is touched
 	private losing = new Set<string>();
 	private joining = false; // the first look at this device's files after it first caught up with the vault
@@ -277,7 +278,19 @@ export class Engine {
 	private mark(path: string, by: number): void {
 		const n = (this.dirty.get(path) ?? 0) + by;
 		if (n > 0) this.dirty.set(path, n);
-		else this.dirty.delete(path);
+		else {
+			this.dirty.delete(path);
+			for (const id of this.waitingTablePaths.get(path) ?? []) this.deferred.add(id);
+			this.waitingTablePaths.delete(path);
+		}
+	}
+
+	private tablePathBusy(id: string, path: string) {
+		if (!this.dirty.has(path)) return false;
+		const waiting = this.waitingTablePaths.get(path) ?? new Set<string>();
+		waiting.add(id);
+		this.waitingTablePaths.set(path, waiting);
+		return true;
 	}
 
 	private later(start: () => void): void {
@@ -1298,6 +1311,7 @@ export class Engine {
 		const state = Y.encodeStateAsUpdate(doc);
 		doc.destroy();
 		this.put("state:" + id, state);
+		if (recoveredFrom) this.metaOf(id).copyOf = recoveredFrom;
 		this.metaOf(id).firstText = this.send(id, state);
 		this.metaOf(id).tableNote = true;
 		this.structure(id, { t: "set", path: want });
@@ -1319,7 +1333,7 @@ export class Engine {
 		}
 		this.structure(id, { t: "del", path: m.diskPath, snapshot });
 		this.place(id, undefined);
-		if (row?.deleted != null) this.del("table/note-change/" + id);
+		if (row?.deleted != null && !await this.read("table/note-request/" + id)) this.del("table/note-change/" + id);
 	}
 
 	private async finishTableMove(id: string) {
@@ -1385,7 +1399,7 @@ export class Engine {
 			await this.takeTableFile(path);
 		}
 		const owner = this.byPath.get(path);
-		if (!owner || owner === id || this.opened.has(owner) || this.dirty.has(path)) return false;
+		if (!owner || owner === id || this.opened.has(owner) || this.tablePathBusy(id, path)) return false;
 		const local = await this.read<NoteStructure>("table/note-change/" + owner);
 		const other = rows.get(owner);
 		if (other?.deleted === null && other.path === path) return false; // its newer row is still in flight
@@ -1419,12 +1433,14 @@ export class Engine {
 			this.releaseDocument(id);
 			this.opts.onClosed?.(id);
 		}
-		if (m.diskPath && this.dirty.has(m.diskPath)) return;
+		if (m.diskPath && this.tablePathBusy(id, m.diskPath)) return;
 		const key = "table/note-write/" + id;
 		const intended = await this.read<Uint8Array>(key);
 		const change = await this.read<NoteStructure>("table/note-change/" + id);
 		if (!row && !m.tableNote) return;
-		if (await this.read("table/note-request/" + id)) return;
+		// A row answer gates placement. The placed file can still be edited or deleted.
+		const request = await this.read<NoteRequest>("table/note-request/" + id);
+		if (request && !m.diskPath) return;
 		if (change?.t === "del" && !m.diskPath && row?.deleted == null) return;
 		if (await this.read("table/note-remove/" + id)) {
 			await this.finishTableRemove(id);
@@ -1436,7 +1452,7 @@ export class Engine {
 		}
 		let want = row?.path ?? m.diskPath;
 		if (change?.t === "set" && (!row || row.path === change.basePath)) want = change.path;
-		if (!want || this.dirty.has(want)) return;
+		if (!want || (!m.diskPath && this.tablePathBusy(id, want))) return;
 		const at = m.diskPath ?? want;
 		const holder = this.byPath.get(at);
 		if (holder && holder !== id && row?.deleted == null && !await this.freeTablePath(at, id)) return;
@@ -1472,7 +1488,7 @@ export class Engine {
 		if (m.open) this.owe(id, "recover");
 		const plan = planNoteContent(seen?.text, latest, agreed, intended);
 		if (plan.kind === "wait") return;
-		const separate = seen && (editor ? await this.unrecorded(id, editor, seen.text, latest) : plan.kind === "separate");
+		const separate = seen && (editor ? seen.text !== completeText(agreed) && await this.unrecorded(id, editor, seen.text, latest) : plan.kind === "separate");
 		if (seen && separate) {
 			// Transfer the observed file and its new ID in the same commit. Replaying
 			// cannot allocate a second copy before the old note is materialized.
@@ -1500,6 +1516,7 @@ export class Engine {
 			await this.flush();
 			return this.settleTableNote(id);
 		}
+		if (request || this.tablePathBusy(id, want)) return;
 		if (row && row.deleted !== null) {
 			if (change?.t === "restore" && change.base === row.seq) return;
 			if (change?.t === "set" && change.legacyRestore && row.vector) {

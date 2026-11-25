@@ -22,7 +22,7 @@ export function rng(seed: number): () => number {
 	return () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 0x100000000;
 }
 
-class Crashed extends Error {}
+export class Crashed extends Error {}
 
 export class Server {
 	rows: { seq: number; entry: Entry }[] = [];
@@ -162,6 +162,7 @@ export class Device {
 	onRead: ((path: string) => void) | null = null;
 	/** Set by a test to see what the engine does to the disk and database. */
 	trace: ((line: string) => void) | null = null;
+	afterCommit?: (puts: ReadonlyMap<string, unknown>) => void;
 	/** Engine options a test wants different from the simulator's defaults. */
 	overrides: Partial<EngineOptions> = {};
 	/** How many of the next database commits fail, as a full or broken IndexedDB would. */
@@ -276,6 +277,7 @@ export class Device {
 				this.trace?.(`${this.name} commits ${[...puts].map(([k, v]) => (k.startsWith("note:") ? `${k}@${(v as { diskPath?: string }).diskPath ?? "-"}` : k)).join(" ")}${[...deletes].length ? ` del ${[...deletes].join(" ")}` : ""}`);
 				for (const k of deletes) this.data.delete(k);
 				for (const [k, v] of puts) this.data.set(k, structuredClone(v));
+				this.afterCommit?.(puts);
 			},
 		};
 		const engine = (this.engine = new Engine(store, disk, {

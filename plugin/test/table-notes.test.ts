@@ -7,7 +7,7 @@ import type { NoteRow } from "../src/core/table/notes";
 import type { VaultKeys } from "../src/keys";
 import { attachmentFs } from "./table-fs";
 import { Files, enc, hash } from "./table-sim";
-import { planNoteContent, completeText, type NoteStructure } from "../src/core/table/noteDisk";
+import { planNoteContent, completeText, type NoteRequest, type NoteStructure } from "../src/core/table/noteDisk";
 import { Device, Server, quiesce, rng } from "./sim";
 
 const key = new Uint8Array(32), keys = { vmk: key, epoch: 0, vaultId: new Uint8Array(16),
@@ -96,13 +96,13 @@ function version(text: string, base?: Uint8Array) {
 	return state;
 }
 
-async function planner() {
+async function planner(defer = (f: () => void) => f()) {
 	const d = new Device("planner", new Server(), rng(123)), disk = new Files();
 	const hashText = async (text: string) => hash(enc.encode(text));
 	d.data.set("table/migrated", true);
 	const boot = async () => {
 		const t = table(d);
-		d.overrides = { tableNotes: t.notes, noteDisk: disk, hash: hashText, defer: f => f(), onNoteChanges: ids => t.noteChanges(ids) };
+		d.overrides = { tableNotes: t.notes, noteDisk: disk, hash: hashText, defer, onNoteChanges: ids => t.noteChanges(ids) };
 		d.boot(); await d.idle();
 		return t;
 	};
@@ -253,7 +253,14 @@ test("a stale editor save with unrecorded typing gets one recovered note", async
 	const kept = [...disk.files.keys()].filter(p => p.includes(" (recovered "));
 	assert.equal(kept.length, 1);
 	assert.equal(disk.text(kept[0]!), "last unrecorded save");
-	assert.notEqual(d.engine!.noteAt(kept[0]!), note.id);
+	const copyId = d.engine!.noteAt(kept[0]!)!;
+	assert.notEqual(copyId, note.id);
+	assert.equal((d.data.get("note:" + copyId) as { copyOf?: string }).copyOf, note.id);
+	disk.files.set("renamed.md", disk.files.get(kept[0]!)!);
+	disk.files.delete(kept[0]!);
+	d.engine!.diskRenamed(kept[0]!, "renamed.md"); await d.idle();
+	assert.equal(d.engine!.noteAt("renamed.md"), copyId);
+	assert.equal((d.data.get("note:" + copyId) as { copyOf?: string }).copyOf, note.id);
 	assert.deepEqual(d.problems, []);
 });
 
@@ -490,4 +497,54 @@ test("closing after a disk delete uses the open editor's full deletion snapshot"
 	await t.notes.receive({...note,seq:2,deleted:1,snapshot:expected}); await d.engine!.tableNoteChanged(note.id);
 	assert.equal(change(note.id),undefined); assert.equal(disk.text(note.path),undefined);
 	assert.equal(await d.engine!.deletedText(note.id),"keep");
+});
+
+test("a pending restore preserves a later edit and deletion before its row echo", async () => {
+	const { d, disk, t, change } = await planner();
+	const state = version("base");
+	d.data.set("state:" + note.id, state);
+	await d.engine!.startTableNoteFiles(false);
+	const restore = { t: "restore", path: note.path, base: 2 } as const;
+	const req: NoteRequest = { req: "01".repeat(16), file: note.file, action: "restore", path: note.path, base: 2, accepted: 3, change: restore };
+	d.data.set("table/note-request/" + note.id, req);
+	d.data.set("table/note-change/" + note.id, restore);
+	await t.notes.receive({ ...note, seq: 2, deleted: 1, vector: Buffer.from(Y.encodeStateVectorFromUpdate(state)).toString("base64") });
+	disk.edit(note.path, "base edited"); d.engine!.diskChanged(note.path, false); await d.idle();
+	assert.equal(d.storedText(note.id), "base edited");
+	disk.files.delete(note.path); d.engine!.diskChanged(note.path, true); await d.idle();
+	const deletion = change(note.id);
+	assert.ok(deletion?.t === "del" && deletion.snapshot);
+	assert.ok(Y.snapshotContainsUpdate(Y.decodeSnapshot(Buffer.from(deletion.snapshot, "base64")), d.data.get("state:" + note.id) as Uint8Array));
+	disk.edit(note.path, "new file"); d.engine!.diskChanged(note.path, false); await d.idle();
+	await t.notes.receive({ ...note, seq: 3 });
+	await d.engine!.finishNoteChange(note.id, restore, req);
+	assert.deepEqual(change(note.id), deletion);
+	assert.equal(d.storedText(note.id), "base edited");
+	assert.equal(disk.text(note.path), "new file");
+	assert.deepEqual(d.problems, []);
+});
+
+test("a row waiting on a dirty empty path is placed when the last event drains", async () => {
+	const events: (() => void)[] = [];
+	const { d, disk, t } = await planner(f => events.push(f));
+	await d.engine!.startTableNoteFiles(false);
+	const row = { ...note, path: "free.md", seq: 2 };
+	d.engine!.diskChanged(row.path, false); d.engine!.diskChanged(row.path, false);
+	await t.notes.receive(row); d.data.set("state:" + note.id, version("waiting"));
+	await d.engine!.tableNoteChanged(note.id);
+	events.shift()!(); await d.idle(); assert.equal(disk.text(row.path), undefined);
+	events.shift()!(); await d.idle(); assert.equal(disk.text(row.path), "waiting");
+	assert.deepEqual(d.problems, []);
+});
+
+test("closing an editor whose file still matches the agreement creates no recovery copy", async () => {
+	const { d, disk } = await planner();
+	d.data.set("state:" + note.id, version("before")); await d.engine!.startTableNoteFiles(false);
+	const doc = await d.engine!.open(note.id); assert.ok(doc);
+	const text = doc.getText("t");
+	doc.transact(() => { text.delete(0, text.length); text.insert(0, "after"); });
+	await d.idle(); await d.engine!.close(note.id);
+	assert.deepEqual([...disk.files.keys()], [note.path]);
+	assert.equal(disk.text(note.path), "after");
+	assert.deepEqual(d.problems, []);
 });

@@ -49,3 +49,38 @@ test("applyText makes only the real edits, so two devices' edits to one note mer
 		assert.equal(t.toString(), to);
 	}
 });
+
+test("concurrent extensions of one word keep the shared characters exactly once", () => {
+	for (const [base, first, second, outcomes] of [
+		["cat", "cats", "cat!", ["cats!", "cat!s"]],
+		["cat", "cats sleep", "cat! yes", ["cats sleep! yes", "cat! yess sleep"]],
+		["🐈", "a🐈", "b🐈", ["ab🐈", "ba🐈"]],
+	] as const) {
+		const a = new Y.Doc(), b = new Y.Doc();
+		a.getText("t").insert(0, base);
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+		applyText(a.getText("t"), first);
+		applyText(b.getText("t"), second);
+		Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+		const merged = a.getText("t").toString();
+		assert.ok(outcomes.some(outcome => outcome === merged), merged);
+		assert.equal(b.getText("t").toString(), merged);
+		a.destroy(); b.destroy();
+	}
+});
+
+test("a replacement for several words stays intact across a concurrent insertion between them", () => {
+	const base = "cat in a cot", replacement = "cart";
+	const a = new Y.Doc(), b = new Y.Doc();
+	a.getText("t").insert(0, base);
+	Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+	applyText(a.getText("t"), replacement);
+	b.getText("t").insert("cat ".length, "new ");
+	Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+	Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+	const merged = a.getText("t").toString();
+	assert.ok(merged === "cartnew " || merged === "new cart", merged);
+	assert.equal(b.getText("t").toString(), merged);
+	a.destroy(); b.destroy();
+});

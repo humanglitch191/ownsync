@@ -3,6 +3,7 @@
 // planner and the messages in flight. All choices, including IDs, are local to the seed.
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { runNoteSeed, noteCoverage } from "./table-note-fuzz";
 import { decodeClient } from "../../server/src/wire";
 import { restore, type Answer } from "../src/core/table/device";
 import { LegacyProjection } from "../src/core/table/migration";
@@ -302,4 +303,17 @@ const first = Number(seed ?? process.env.FUZZ_FIRST ?? 1), steps = Number(proces
 test(`table fuzz: seeds ${first}–${first+count-1}, ${steps} steps`, async t => {
 	try { for (let n=first; n<first+count; n++) await run(n,steps); }
 	finally { t.diagnostic(JSON.stringify(coverage)); }
+});
+
+test(`all-files table note fuzz: seeds ${first}–${first+count-1}, ${steps} steps`, async t => {
+	const failures: number[] = [];
+	for (let n=first; n<first+count; n++) {
+		try { await runNoteSeed(n, steps); }
+		catch (error) {
+			if (count === 1) throw error;
+			failures.push(n); t.diagnostic(String(error));
+		}
+	}
+	t.diagnostic(JSON.stringify(noteCoverage));
+	assert.equal(failures.length,0,"Failing note seeds: " + failures.join(", "));
 });
