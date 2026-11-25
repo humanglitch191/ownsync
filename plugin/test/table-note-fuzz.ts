@@ -77,10 +77,12 @@ class NoteWorker {
 	}
 }
 
-export async function runNoteSeed(seed: number, steps: number | "held conflict") {
+export async function runNoteSeed(seed: number, steps: number | "held conflict" | "delete held") {
 	const random = rng(seed), pick = <T>(xs: T[]) => xs[Math.floor(random() * xs.length)]!;
 	const server = new Server(), worker = new NoteWorker(server), peers: Peer[] = [], log: string[] = [];
 	const required = new Set<string>();
+	// A disk-only insertion can be inherited by successive copies before it ever enters Yjs.
+	const diskAuthor = new Map<string, string>();
 	const copied = new Map<string, { parent: string; markers: Set<string> }>();
 	let offlineMove: { parent: string; file: string; child: string; markers: Set<string> } | undefined;
 	const userRestores: { peer: Peer; base: number; head: number }[] = [];
@@ -106,7 +108,7 @@ export async function runNoteSeed(seed: number, steps: number | "held conflict")
 				const id = k.slice("table/note-state/".length), parent = (v as {copyOf?: string}).copyOf;
 				if (parent && puts.has("state:" + id) && !copied.has(id)) {
 					const source = markers(d.storedText(parent));
-					const inherited = [...markers(d.storedText(id))].filter(marker => source.has(marker));
+					const inherited = [...markers(d.storedText(id))].filter(marker => source.has(marker) || diskAuthor.get(marker) === parent);
 					copied.set(id, { parent, markers: new Set(inherited) });
 				}
 			}
@@ -202,6 +204,8 @@ export async function runNoteSeed(seed: number, steps: number | "held conflict")
 	const write = async (p: Peer, path: string) => {
 		const before = p.d.files.get(path)?.content ?? ""; assert.equal(typeof before, "string");
 		const suffix = token(); log.push(p.d.name + " types " + suffix + " at " + path);
+		const placed = p.sync.notes.state?.byPath.get(path);
+		if (placed) diskAuthor.set(suffix, placed);
 		p.d.write(path, before + suffix); p.d.drain(); await p.d.idle();
 	};
 	async function check() {
@@ -330,7 +334,7 @@ export async function runNoteSeed(seed: number, steps: number | "held conflict")
 		for (const [path,file] of a.d.files) if (visible(path)) joined.d.files.set(path,structuredClone(file));
 		await wire(joined); await drain();
 		assert.equal(joined.d.engine!.noteAt("draft.md"),id); noteCoverage.copiedJoins++;
-		if (steps === "held conflict") {
+		if (steps === "held conflict" || steps === "delete held") {
 			const notices = noteCoverage.heldNotices;
 			for (const local of [token(),token()]) {
 				await write(a,"draft.md");
@@ -338,13 +342,31 @@ export async function runNoteSeed(seed: number, steps: number | "held conflict")
 				// remote edit while its last agreed bytes are still the old ones.
 				const file = b.d.files.get("draft.md")!;
 				assert.equal(typeof file.content,"string");
+				diskAuthor.set(local, id);
 				b.d.files.set("draft.md",{ content: file.content + local, mtime: file.mtime + 1 });
 				await drain();
 				b.d.engine!.diskChanged("draft.md"); await drain();
 			}
 			assert.equal(b.sync.notes.state!.notes.get(id)?.held,true);
 			assert.equal(noteCoverage.heldNotices,notices + 1);
-			await check(); // resolve the first copy and verify all three texts on every disk
+			if (steps === "delete held") {
+				await write(b, "draft.md");
+				const latest = b.d.files.get("draft.md")!.content;
+				disconnect(b); b.d.crash(); b.d.remove("draft.md");
+				await wire(b); await drain();
+				// A peer can list, preview and explicitly restore the exact last save.
+				const engine = a.d.engine!;
+				const deleted = await engine.deletedNotes();
+				const saved = [];
+				for (const row of deleted) if (await engine.deletedText(row.id) === latest) saved.push(row);
+				assert.equal(saved.length, 1);
+				const row = saved[0]!;
+				const restored = await engine.restoreDeleted(row.id, undefined, row.deletionSeq);
+				assert.ok(restored);
+				await drain();
+				for (const p of peers) assert.equal(p.d.files.get(restored)?.content, latest);
+			}
+			await check();
 			return;
 		}
 		const sharedPath = "independent.md";

@@ -111,6 +111,8 @@ export interface NoteEntry {
 	/** Hash of disk text already preserved in a newly created conflict copy while awaiting rewrite. */
 	forkedHash?: string;
 	held?: boolean;
+	/** Latest readable outside save while the conflict-copy limit prevents publication. */
+	heldText?: string;
 	change?: NoteStructure;
 	legacy?: NoteStructure; // fallback for a legacy row omitted from genesis
 	inFlight?: NoteRequest;
@@ -322,6 +324,7 @@ function cloneState(s: VaultNoteState): VaultNoteState {
 }
 
 function setEntry(s: VaultNoteState, next: NoteEntry): void {
+	if (!next.held && next.heldText !== undefined) next = { ...next, heldText: undefined };
 	const old = s.notes.get(next.id);
 	if (old?.diskPath && s.byPath.get(old.diskPath) === next.id && old.diskPath !== next.diskPath) {
 		s.byPath.delete(old.diskPath);
@@ -438,6 +441,17 @@ function markMissingNote(state: VaultNoteState, n: NoteEntry, path: string, env:
 	}
 	const snap = captureSnapshot(state, n, env);
 	if (snap === undefined) return;
+	// A held save has never entered the original Yjs document. Use the usual
+	// create-then-delete flow so both it and concurrent typing remain restorable.
+	if (n.heldText !== undefined && n.heldText !== cachedText(env.crdt, state.docs.get(n.id))) {
+		const id = env.newId(), doc = env.crdt.create(n.heldText, env.clientId);
+		state.docs.set(id, doc);
+		setEntry(state, {
+			id, file: env.newId(), editor: "closed", copyOf: n.id,
+			firstTextPending: true, needsInitialPublish: true, unpublished: { update: doc },
+			change: { t: "del", path: pickCopyPath(state, path, n.id, true), snapshot: cachedSnap(env.crdt, doc) },
+		});
+	}
 	const dropChange = n.row?.deleted != null && !n.inFlight;
 	setEntry(state, {
 		...n,
@@ -693,7 +707,9 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				for (const key of ids) held.add(key);
 				for (const n of s.notes.values()) {
 					if (n.change?.t === "del" && !n.inFlight && selected.has(noteDeletionKey(n, false))) {
-						setEntry(s, { ...n, change: undefined, missing: undefined, diskPath: undefined, forkedHash: undefined });
+						// Undoing a delete before its first set still needs a row for the saved body.
+						const change = n.row ? undefined : { t: "set" as const, path: n.change.path };
+						setEntry(s, { ...n, change, missing: undefined, diskPath: undefined, forkedHash: undefined });
 					}
 				}
 			}
@@ -1016,6 +1032,9 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 						intendedHash: undefined,
 						editor: n.editor === "owed-doc" || n.editor === "owed-recover" ? "closed" : n.editor,
 					});
+				} else if (n.held && obs.text !== undefined && n.heldText !== obs.text) {
+					// Capture the save even when catch-up or a queued event defers next().
+					setEntry(s, { ...n, heldText: obs.text, missing: undefined });
 				} else if (n.missing?.path === n.diskPath) {
 					// File seen again (03fe617 fix).
 					setEntry(s, { ...n, missing: undefined });
@@ -1240,7 +1259,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 			}
 		}
 
-		if (n.held && !hasUnresolvedConflict(s, n.id)) {
+		if (n.held && n.diskPath && s.observed.get(n.diskPath)?.text !== undefined && !isDirty(s, n.diskPath) && !hasUnresolvedConflict(s, n.id)) {
 			n = { ...n, held: false };
 			s.emittedNotices.delete("held:" + n.id);
 			setEntry(s, n);
@@ -1453,8 +1472,8 @@ function handleConflictOrHold(
 ): NoteEntry {
 	if (hasUnresolvedConflict(s, n.id)) {
 		if (s.intent?.id === n.id && s.intent.kind === "write") s.intent = undefined;
-		if (!n.held) {
-			const heldEntry: NoteEntry = { ...n, held: true, forkedHash: undefined, intended: undefined, intendedHash: undefined };
+		if (!n.held || n.heldText !== diskText) {
+			const heldEntry: NoteEntry = { ...n, held: true, heldText: diskText, forkedHash: undefined, intended: undefined, intendedHash: undefined };
 			setEntry(s, heldEntry);
 			const heldKey = "held:" + n.id;
 			if (!s.emittedNotices.has(heldKey)) {

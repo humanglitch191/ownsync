@@ -870,8 +870,8 @@ function canonicalKey(w: World): string {
 		d1: [...w.devices[1].disk.files].map(([k, v]) => [k, v.text]),
 		j0: w.devices[0].disk.journal ? [w.devices[0].disk.journal.kind, w.devices[0].disk.effectApplied] : null,
 		j1: w.devices[1].disk.journal ? [w.devices[1].disk.journal.kind, w.devices[1].disk.effectApplied] : null,
-		n0: [...w.devices[0].state.notes.values()].map(n => [n.id, n.diskPath, n.editor, n.held, n.change?.t, n.inFlight?.action, n.row?.seq, n.intendedHash]),
-		n1: [...w.devices[1].state.notes.values()].map(n => [n.id, n.diskPath, n.editor, n.held, n.change?.t, n.inFlight?.action, n.row?.seq, n.intendedHash]),
+		n0: [...w.devices[0].state.notes.values()].map(n => [n.id, n.diskPath, n.editor, n.held, n.heldText, n.change?.t, n.inFlight?.action, n.row?.seq, n.intendedHash]),
+		n1: [...w.devices[1].state.notes.values()].map(n => [n.id, n.diskPath, n.editor, n.held, n.heldText, n.change?.t, n.inFlight?.action, n.row?.seq, n.intendedHash]),
 		i0: w.devices[0].state.intent?.kind,
 		i1: w.devices[1].state.intent?.kind,
 		b0: [...w.devices[0].state.blocked.keys()],
@@ -1309,6 +1309,36 @@ test("exhaustive checker: 2x2 async interleavings, crash points, exact-set oracl
 		quiesceWorld(w);
 		assert.equal(standInCrdt.completeText(w.devices[1].state.docs.get(idA)), "alpha r3");
 		assert.equal(w.devices[1].disk.files.get("a.md")?.text, "alpha c2");
+		// Branch before resolution: another outside save, followed by removal of the held file.
+		// Exercise both a live delete event and a restart whose inventory discovers it.
+		for (const restart of [false, true]) {
+			const branch = cloneWorld(w), holder = branch.devices[1];
+			userOutsideEdit(branch, 1, "a.md", "alpha c2 latest");
+			runAsyncStep(branch, { t: "deliverDiskEvent", dev: 1 });
+			userDelete(branch, 1, "a.md");
+			if (restart) crashAndRestart(holder, branch);
+			else {
+				runAsyncStep(branch, { t: "deliverDiskEvent", dev: 1 });
+				const declined = cloneWorld(branch);
+				declined.brake = { minCount: 0, minFraction: 0 };
+				dispatchDevice(declined.devices[1], declined, { t: "recheck" });
+				assert.ok(declined.devices[1].state.brakePaused?.awaiting);
+				runAsyncStep(declined, { t: "brakeDecline", dev: 1 });
+				declined.brake = branch.brake;
+				quiesceWorld(declined);
+				verifyWorld(declined);
+				assert.ok([...declined.devices[0].disk.files.values()].some(f => f.text === "alpha c2 latest"));
+			}
+			quiesceWorld(branch);
+			verifyWorld(branch);
+			for (const device of branch.devices) {
+				const archived = [...device.state.notes.values()].filter(n => n.row?.deleted != null &&
+					standInCrdt.completeText(device.state.docs.get(n.id)) === "alpha c2 latest");
+				assert.equal(archived.length, 1);
+				assert.equal(standInCrdt.completeText(device.state.docs.get(idA)), "alpha r3");
+				assert.equal(device.disk.files.get(copy.diskPath!)?.text, "alpha c1");
+			}
+		}
 		// Resolve conflict copy by deleting it -> held clears and c2 forks once cleanly, converging!
 		userDelete(w, 1, copy.diskPath!);
 		quiesceWorld(w);
