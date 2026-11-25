@@ -414,6 +414,32 @@ test("an interrupted first write retains the note ID for an extension and preser
 	}
 });
 
+test("a new file at an interrupted restore's path cannot delete any of the restored text", async () => {
+	// The shared prefix also exercises the fallback that recognizes files by word overlap.
+	for (const prefix of ["", "shared words "]) {
+		const { devs } = world(), [a, b] = devs as [Device, Device];
+		const path = "Note.md", intended = prefix + "<d0.5>", local = prefix + "<d0.57>";
+		a.write(path, intended); await quiesce(devs);
+		const id = a.engine!.noteAt(path)!;
+		a.remove(path); await quiesce(devs);
+		b.trace = line => {
+			if (line.includes("commits ") && line.includes("@Note.md")) b.crash(1);
+		};
+		await b.engine!.restoreDeleted(id);
+		assert.equal(b.alive, false);
+		assert.equal(b.files.has(path), false);
+		assert.deepEqual(b.data.get("base:" + id), b.data.get("state:" + id));
+		b.trace = null; b.write(path, local);
+		b.boot(); b.connect(); await quiesce(devs);
+		for (const d of devs) {
+			const files = disk(d);
+			assert.equal(files[d.engine!.pathOf(id)!], intended);
+			assert.deepEqual(Object.values(files).sort(), [intended, local].sort());
+		}
+		noProblems(devs);
+	}
+});
+
 test("a first write cannot claim another note's agreed bytes as an extension", async () => {
 	for (const moved of [true, false]) {
 		const { devs } = world(), [author, reader] = devs as [Device, Device];

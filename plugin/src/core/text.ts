@@ -6,8 +6,18 @@ import type * as Y from "yjs";
  * would be duplicated, and an edit cut through the middle of a word would shred it.
  */
 export function applyText(ytext: Y.Text, next: string): void {
-	const prev = ytext.toString();
-	if (prev === next) return;
+	for (const [pos, remove, insert] of textEdits(ytext.toString(), next).reverse()) {
+		if (remove) ytext.delete(pos, remove);
+		if (insert) ytext.insert(pos, insert);
+	}
+}
+
+export function onlyInserts(prev: string, next: string): boolean {
+	return textEdits(prev, next).every(([, remove]) => remove === 0);
+}
+
+function textEdits(prev: string, next: string): [at: number, remove: number, insert: string][] {
+	if (prev === next) return [];
 	const split = (text: string) => text.split(/(\s+)/).filter((u) => u !== ""); // words and the whitespace between them
 	const a = split(prev), b = split(next);
 	let start = 0;
@@ -26,10 +36,7 @@ export function applyText(ytext: Y.Text, next: string): void {
 		i = x + 1;
 		j = y + 1;
 	}
-	for (const [pos, remove, insert] of hunks.reverse()) { // from the end, so earlier positions stay valid
-		if (remove) ytext.delete(pos, remove);
-		if (insert) ytext.insert(pos, insert);
-	}
+	return hunks;
 }
 
 /** Myers diff: the index pairs of units that `a` and `b` keep in common, or null when they differ too much. */

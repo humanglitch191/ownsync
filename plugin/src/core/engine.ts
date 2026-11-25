@@ -50,7 +50,7 @@
 import * as Y from "yjs";
 import { conflictName, places, type IndexValue } from "./places";
 import { legacyBases } from "./table/migration";
-import { applyText } from "./text";
+import { applyText, onlyInserts } from "./text";
 import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, MarkState, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
 
 const INDEX: DocId = "index";
@@ -143,7 +143,7 @@ function grewFrom(older: string, text: string): boolean {
 	return true;
 }
 function matchesFirstWrite(intended: string | undefined, disk: string, otherAgreements: string[]): boolean {
-	return intended === disk || (!otherAgreements.length && !!intended?.trim() && grewFrom(intended, disk));
+	return intended === disk || (!otherAgreements.length && intended !== undefined && onlyInserts(intended, disk));
 }
 /**
  * How much of the smaller text is in the larger one: a note that grew or shrank a lot is still the same note.
@@ -905,7 +905,8 @@ export class Engine {
 	 */
 	private movedTo(id: string, path: string, file?: DiskFile): void {
 		const from = this.metaOf(id).diskPath;
-		this.metaOf(id).writing = undefined; // a file of this note's was there to move: its write landed
+		// A move alone cannot prove that an interrupted first note write landed.
+		if (!isNote(path) || this.metaOf(id).baseHash !== undefined) this.metaOf(id).writing = undefined;
 		this.place(id, path, file);
 		if (this.effectivePath(id) !== path) {
 			if (from && !isNote(path) && !this.renameSources.has(id)) this.renameSources.set(id, from);
@@ -966,8 +967,9 @@ export class Engine {
 		// ahead (typing that was never saved, a remote edit), the file is closer to the latter.
 		const adrift = new Map<string, Set<string>[]>(); // note → the words of those texts
 		const like = (mine: Set<string>[], theirs: Set<string>) => Math.max(...mine.map((m) => alike(m, theirs)));
-		const loose = new Map<string, Set<string>>(); // path → the words of the file's text
-		const contested = new Map<string, string | undefined>(); // first-write path → exact missing owner, if unique
+		const loose = new Map<string, { text: string; words: Set<string> }>();
+		const firstWrites = new Map<string, string | undefined>();
+		const contested = new Map<string, { rejected: string; exact?: string }>();
 		const home = new Map<string, string>(); // note → its path, when a file is still there
 		const changed = new Map<string, string>(); // attachment → its path, where its file now has other content
 		for (const [path, id] of [...this.byPath]) {
@@ -983,6 +985,7 @@ export class Engine {
 			}
 			const base = await this.read<Uint8Array>(`base:${id}`);
 			const current = await this.text(id), intended = this.textFrom(base);
+			if (m.writing && m.baseHash === undefined) firstWrites.set(id, intended ?? current);
 			const mine = [units(current ?? "")];
 			if (intended !== undefined) mine.push(units(intended));
 			if (f) {
@@ -990,16 +993,14 @@ export class Engine {
 				if (m.writing && m.baseHash === undefined) {
 					const others = this.otherNoteAgreements(id, await this.opts.hash(disk));
 					if (matchesFirstWrite(intended ?? current, disk, others)) { todo.add(id); continue; }
-					if (others.length) {
-						const missing = others.filter(other => {
-							const from = this.metaOf(other).diskPath;
-							return from !== undefined && !onDisk.has(from);
-						});
-						contested.set(path, missing.length === 1 ? missing[0] : undefined);
-					}
+					const missing = others.filter(other => {
+						const from = this.metaOf(other).diskPath;
+						return from !== undefined && !onDisk.has(from);
+					});
+					contested.set(path, { rejected: id, exact: missing.length === 1 ? missing[0] : undefined });
 				}
 				if (!contested.has(path) && like(mine, theirs) >= ALIKE) { todo.add(id); continue; } // an ordinary edit, or an editor's save
-				loose.set(path, theirs); // perhaps a different file now sits at the note's path
+				loose.set(path, { text: disk, words: theirs }); // perhaps a different file now sits at the note's path
 				// Only a note whose file was here can claim it however much it changed. One that was only about to be
 				// written here (the engine stopped first) has no file yet: a different text here is someone else's.
 				// A deleted note's file had to go: a different text there is a new note.
@@ -1007,7 +1008,10 @@ export class Engine {
 			}
 			adrift.set(id, mine);
 		}
-		for (const f of files) if (isNote(f.path) && !this.byPath.has(f.path)) loose.set(f.path, units(await this.disk.read(f.path)));
+		for (const f of files) if (isNote(f.path) && !this.byPath.has(f.path)) {
+			const text = await this.disk.read(f.path);
+			loose.set(f.path, { text, words: units(text) });
+		}
 		// An attachment's file with other content is a new version of it, unless that content is exactly another
 		// attachment's whose file isn't where it was: then that one moved here (two swapped places, say), and this
 		// one's own file is looked for like any that is gone.
@@ -1032,8 +1036,11 @@ export class Engine {
 			const m = this.metaOf(id);
 			if (m.diskPath === path && contested.has(path)) continue;
 			// A recovery copy holds its note's text too: when both match a file, the file is the note's.
-			const score = contested.get(path) === id ? Infinity : like(mine, theirs) - (m.copyOf ? 0.01 : 0);
-			if (score >= ALIKE) pairs.push([score, id, path]);
+			const score = contested.get(path)?.exact === id ? Infinity : like(mine, theirs.words) - (m.copyOf ? 0.01 : 0);
+			if (score < ALIKE) continue;
+			if (firstWrites.has(id) && !matchesFirstWrite(firstWrites.get(id), theirs.text,
+				this.otherNoteAgreements(id, await this.opts.hash(theirs.text)))) continue;
+			pairs.push([score, id, path]);
 		}
 		pairs.sort((x, y) => y[0] - x[0] || (x[1] + x[2] < y[1] + y[2] ? -1 : 1));
 		const moved = new Map<string, string>(swapped);
@@ -1087,7 +1094,7 @@ export class Engine {
 		}
 		// A file that is nobody's is a new note (or, on a device joining the vault, a note it already has).
 		for (const f of files) {
-			const id = this.byPath.has(f.path) ? undefined : await this.takeUnknown(f.path);
+			const id = this.byPath.has(f.path) ? undefined : await this.takeUnknown(f.path, contested.get(f.path)?.rejected);
 			if (id) todo.add(id);
 		}
 
@@ -1167,14 +1174,14 @@ export class Engine {
 	 * with exactly this text, it is that note. Otherwise it is a new note. Returns the note's ID, or nothing
 	 * for an attachment too large to sync.
 	 */
-	private async takeUnknown(path: string): Promise<string | undefined> {
+	private async takeUnknown(path: string, rejected?: string): Promise<string | undefined> {
 		// Stat first: if the file changes while it's being read, the older timestamp makes the next look catch it.
 		const file = (await this.disk.stat(path))!;
 		if (!isNote(path)) return this.notesOnly ? undefined : this.takeAttachment(file);
 		const text = await this.disk.read(path);
 		const hash = await this.opts.hash(text);
 		const owner = this.ownerOf(path);
-		const mine = owner && !this.metaOf(owner).diskPath ? await this.text(owner) : undefined;
+		const mine = owner && owner !== rejected && !this.metaOf(owner).diskPath ? await this.text(owner) : undefined;
 		if (owner && mine === text) {
 			this.place(owner, path);
 			this.agree(owner, file, hash);
@@ -1402,7 +1409,6 @@ export class Engine {
 		const m = this.metaOf(id);
 		const text = await this.disk.read(path);
 		const hash = await this.opts.hash(text);
-		if ((await this.text(id)) === text) return this.agree(id, file, hash);
 		const firstWrite = m.writing && m.baseHash === undefined;
 		let base: Uint8Array | undefined;
 		if (firstWrite) {
@@ -1412,8 +1418,8 @@ export class Engine {
 			const intended = this.textFrom(base);
 			if (!matchesFirstWrite(intended, text, this.otherNoteAgreements(id, hash))) {
 				await this.forget(id);
-				if (path !== this.effectivePath(id) && await this.disk.stat(path)) {
-					const other = await this.takeUnknown(path);
+				if (await this.disk.stat(path)) {
+					const other = await this.takeUnknown(path, id);
 					if (other) this.deferred.add(other);
 				}
 				return;
@@ -1421,6 +1427,7 @@ export class Engine {
 			if (text === intended) m.baseHash = hash;
 			m.writing = undefined;
 		}
+		if ((await this.text(id)) === text) return this.agree(id, file, hash);
 		if (hash === m.baseHash || mode !== "merge") {
 			// Same text as last agreed, or an editor's older save: the document is ahead and will be written.
 			Object.assign(m, { mtime: file.mtime, size: file.size });
