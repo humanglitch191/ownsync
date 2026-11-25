@@ -4,7 +4,9 @@
 //
 // Table-capable peers send table immediately after hello and receive format. A migration stages
 // rows numbered from 1 on that connection and commits genesis(base, rows) at the legacy head.
-// Table versions on the wire are the opaque storage tags used by vput. File and request IDs are
+// Table versions on the wire are the opaque storage tags used by vput.
+// A presence byte precedes a version tag in a row or set; absent means note. Note del carries a
+// sealed replacement record with the deleting device's state vector. File and request IDs are
 // 16 bytes each. A zero set base means create. stageRow, set and restore prefix the payload with a scoped count or a legacy marker. since/tableMore/tableSynced have their own cursor.
 //
 // device → Worker
@@ -48,14 +50,14 @@
 
 /** The Worker compares opaque file and path keys. Only a device can open record. */
 export type AttachmentRow = {
-	file: Uint8Array; version: Uint8Array; pathkey: Uint8Array; record: Uint8Array;
+	file: Uint8Array; version: Uint8Array | null; pathkey: Uint8Array; record: Uint8Array;
 	deleted: number | null; seq: number;
 };
 
 export type AttachmentMutation =
-	| { t: "del"; req: Uint8Array; file: Uint8Array; base: number }
+	| { t: "del"; req: Uint8Array; file: Uint8Array; base: number; record?: Uint8Array }
 	| { t: "restore"; req: Uint8Array; file: Uint8Array; base: number; expectedChunks: number | null; pathkey: Uint8Array; record: Uint8Array }
-	| { t: "set"; req: Uint8Array; file: Uint8Array; base: number | null; expectedChunks: number | null; version: Uint8Array; pathkey: Uint8Array; record: Uint8Array };
+	| { t: "set"; req: Uint8Array; file: Uint8Array; base: number | null; expectedChunks: number | null; version: Uint8Array | null; pathkey: Uint8Array; record: Uint8Array };
 
 export type AttachmentAnswer =
 	| { t: "ok"; req: Uint8Array; seq: number }
@@ -204,13 +206,19 @@ function chunkDeclaration(n: number | null): Uint8Array {
 	return build(1, [2, n]);
 }
 
+function versionField(tag: Uint8Array | null): Uint8Array {
+	if (tag === null) return Uint8Array.of(0);
+	if (tag.length !== TAG_BYTES) throw new RangeError("invalid version tag");
+	return build(1, tag);
+}
+
 function readRow(r: Reader): AttachmentRow {
-	return { file: r.take(DOC_TAG_BYTES), version: r.take(TAG_BYTES), pathkey: r.take(TAG_BYTES),
+	return { file: r.take(DOC_TAG_BYTES), version: r.bool() ? r.take(TAG_BYTES) : null, pathkey: r.take(TAG_BYTES),
 		seq: r.seq(), deleted: r.bool() ? r.seq() : null, record: r.record() };
 }
 
 function rowFrame(type: number, row: AttachmentRow, ...prefix: Uint8Array[]): Uint8Array {
-	return build(type, ...prefix, id(row.file), row.version, row.pathkey, [8, row.seq], [1, Number(row.deleted !== null)], ...(row.deleted === null ? [] : [[8, row.deleted] as [8, number]]), row.record);
+	return build(type, ...prefix, id(row.file), versionField(row.version), row.pathkey, [8, row.seq], [1, Number(row.deleted !== null)], ...(row.deleted === null ? [] : [[8, row.deleted] as [8, number]]), row.record);
 }
 
 export function encodeClient(f: ClientFrame): Uint8Array {
@@ -221,8 +229,8 @@ export function encodeClient(f: ClientFrame): Uint8Array {
 		case "forget": return build(CLIENT.forget, id(f.req));
 		case "table": return build(CLIENT.table);
 		case "since": return build(CLIENT.since, [8, f.after]);
-		case "set": return build(CLIENT.set, chunkDeclaration(f.expectedChunks), id(f.req), id(f.file), [8, f.base ?? 0], f.version, f.pathkey, f.record);
-		case "del": return build(CLIENT.del, id(f.req), id(f.file), [8, f.base]);
+		case "set": return build(CLIENT.set, chunkDeclaration(f.expectedChunks), id(f.req), id(f.file), [8, f.base ?? 0], versionField(f.version), f.pathkey, f.record);
+		case "del": return build(CLIENT.del, id(f.req), id(f.file), [8, f.base], ...(f.record ? [f.record] : []));
 		case "restore": return build(CLIENT.restore, chunkDeclaration(f.expectedChunks), id(f.req), id(f.file), [8, f.base], f.pathkey, f.record);
 		case "hello": return f.owner ? build(CLIENT.hello, f.token, f.owner) : build(CLIENT.hello, f.token);
 		case "subscribe": return build(CLIENT.subscribe, [8, f.after]);
@@ -249,8 +257,13 @@ export function decodeClient(bytes: Uint8Array): ClientFrame {
 		case CLIENT.forget: return r.end({ t: "forget", req: r.take(DOC_TAG_BYTES) });
 		case CLIENT.table: return r.end({ t: "table" });
 		case CLIENT.since: return r.end({ t: "since", after: r.seq() });
-		case CLIENT.set: return { t: "set", expectedChunks: r.expectedChunks(), req: r.take(DOC_TAG_BYTES), file: r.take(DOC_TAG_BYTES), base: r.seq() || null, version: r.take(TAG_BYTES), pathkey: r.take(TAG_BYTES), record: r.record() };
-		case CLIENT.del: return r.end({ t: "del", req: r.take(DOC_TAG_BYTES), file: r.take(DOC_TAG_BYTES), base: r.seq() });
+		case CLIENT.set: return { t: "set", expectedChunks: r.expectedChunks(), req: r.take(DOC_TAG_BYTES), file: r.take(DOC_TAG_BYTES), base: r.seq() || null, version: r.bool() ? r.take(TAG_BYTES) : null, pathkey: r.take(TAG_BYTES), record: r.record() };
+		case CLIENT.del: {
+			const req = r.take(DOC_TAG_BYTES), file = r.take(DOC_TAG_BYTES), base = r.seq();
+			const record = r.rest();
+			if (record.length > MAX_ENVELOPE) throw new RangeError("bad deletion record");
+			return record.length ? { t: "del", req, file, base, record } : { t: "del", req, file, base };
+		}
 		case CLIENT.restore: return { t: "restore", expectedChunks: r.expectedChunks(), req: r.take(DOC_TAG_BYTES), file: r.take(DOC_TAG_BYTES), base: r.seq(), pathkey: r.take(TAG_BYTES), record: r.record() };
 		case CLIENT.hello: {
 			const token = r.take(32), owner = r.rest();

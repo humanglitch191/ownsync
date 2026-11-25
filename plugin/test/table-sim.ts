@@ -125,7 +125,8 @@ export class WorkerModel {
 		}
 		if (r.t === "restore" && (!row || row.deleted === null)) return refuse();
 		if (r.t === "del" && (!row || row.deleted !== null)) return refuse();
-		const version = r.t === "set" ? hex(r.version) : old!.version;
+		if (r.t === "set" && r.version === null) throw new Error("Unexpected note in attachment model");
+		const version = r.t === "set" ? hex(r.version!) : old!.version;
 		if (r.t === "set" && row?.deleted != null && version === old?.version) return refuse();
 		if (r.t !== "del") {
 			const n = r.expectedChunks, declared = this.declarations.get(version);

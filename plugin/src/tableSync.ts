@@ -56,6 +56,7 @@ export class TableSync {
 		return { file: unhex(r.file), version: await this.version(r.bytes), pathkey: await this.pathkey(r.path), record: await this.seal(r.file, r), deleted: r.deleted, seq: r.seq };
 	}
 	private async openRow(f: AttachmentRow): Promise<Row> {
+		if (f.version === null) throw new Error("Expected an attachment row");
 		const opened = await openEnvelope(f.record, this.keys.vaultId, f.file, this.keys.keyFor);
 		if (opened.kind !== KIND.attachmentRecord) throw new Error("Invalid attachment envelope kind");
 		const { path, bytes, mtime } = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(opened.plaintext)) as RecordData;

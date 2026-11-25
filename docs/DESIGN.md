@@ -239,6 +239,7 @@ The list shows ledger entries whose data is absent from the Worker. With its lis
 - when a note is open in an editor and its cursor moves (presence frames), though not where or by whom
 - attachment chunk count and sizes, when chunks are uploaded and which device fetches which; for chunks uploaded before every device ran 0.2.0, that two files in the vault hold the same content (same chunk names)
 - for version-scoped chunks (section 10): which chunks make up one version, when each version stops being current and whether because its attachment was deleted, and when each device last listed the versions it holds
+- after table migration, which rows are notes, when files move or are deleted or restored, and when a path key is reused. The same opaque path keys cover note titles. A removed device that retains the name key could test guessed titles with the Worker’s help. Note text and paths remain encrypted.
 - which note tags get history copies, the padded sizes and upload times, and which device's connection sends them
 - whole-vault snapshot IDs, upload days and times, epochs, part counts and padded envelope sizes
 - the number and size of membership records, when the epoch changes, whether there is a recovery key, and for each rotation the IDs of the devices it wraps the key to and the rotating device's ID and public key (in clear so a recovering device can open its wrap). Device IDs are also in every envelope header.

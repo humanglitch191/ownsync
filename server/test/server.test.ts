@@ -989,6 +989,61 @@ test("genesis checks the legacy head and complete row count, switches once and c
 	} finally { legacy.ws.close(); a.ws.close(); b.ws.close(); }
 });
 
+test("notes share path CAS and keep text across deletion, replay and restore", async () => {
+	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+	const a = await tablePeer(v, tok, false);
+	const send = async (f: ClientFrame) => { a.send(f); return a.next(); };
+	const note = { file: doc(1), version: null, pathkey: name(1), record: bytes("sealed note identity and path"), seq: 1, deleted: null };
+	const deleted = { ...note, file: doc(2), record: bytes("sealed prior deletion vector"), seq: 2, deleted: 123 };
+	try {
+		const head = await legacy.publish(doc(22), "original Yjs state");
+		await migrateNow(`http://localhost:${PORT}`, v);
+		for (const row of [note, deleted])
+			assert.deepEqual(await send({ t: "stageRow", expectedChunks: null, row }), { t: "stagedRow", seq: row.seq });
+		assert.deepEqual(await send({ t: "genesis", base: head, rows: 2 }), { t: "format", table: true });
+		assert.equal(await legacy.closed, CLOSE.updateNeeded);
+		const peer = await tablePeer(v, tok, true);
+		try {
+			peer.send({ t: "since", after: 0 });
+			for (const row of [note, deleted]) assert.deepEqual(await peer.next(), { t: "row", row });
+			assert.deepEqual(await peer.next(), { t: "tableSynced", seq: 2 });
+			const set = { t: "set", file: doc(3), req: doc(3), base: null, expectedChunks: null, version: null,
+				pathkey: note.pathkey, record: bytes("independently created note") } as const;
+			const refused = (req: Uint8Array, row: typeof note | typeof deleted) => ({ t: "refused", row, req, missing: false });
+			assert.deepEqual(await send(set), refused(set.req, note));
+			assert.deepEqual(await send({ ...set, version: name(4), expectedChunks: 0 }), refused(set.req, note));
+			const pathkey = name(3);
+			assert.deepEqual(await send({ ...set, pathkey }), { t: "ok", req: set.req, seq: 3 });
+			const created = { ...note, file: set.file, pathkey, record: set.record, seq: 3 };
+			assert.deepEqual(await peer.next(), { t: "row", row: created });
+			// A file ID has one kind for life. Only attachments declare chunks.
+			const rename = { ...set, req: doc(4), base: 3, pathkey: name(4), record: bytes("sealed new path") };
+			assert.deepEqual(await send({ ...rename, expectedChunks: 0 }), refused(rename.req, created));
+			assert.deepEqual(await send({ ...rename, expectedChunks: 0, version: name(4) }), refused(rename.req, created));
+			assert.deepEqual(await send(rename), { t: "ok", req: rename.req, seq: 4 });
+			const live = { ...created, seq: 4, pathkey: rename.pathkey, record: rename.record };
+			assert.deepEqual(await peer.next(), { t: "row", row: live });
+			const del = { t: "del", file: live.file, req: doc(5), base: 4 } as const;
+			assert.deepEqual(await send(del), refused(del.req, live));
+			const tombstone = { ...del, record: bytes("sealed note identity, path and deleter vector") };
+			const ok = { t: "ok", req: del.req, seq: 5 };
+			assert.deepEqual(await send(tombstone), ok);
+			assert.deepEqual(await send(tombstone), ok);
+			const gone = await peer.next();
+			assert.ok(gone.t === "row" && typeof gone.row.deleted === "number");
+			assert.deepEqual(gone.row, { ...live, seq: 5, record: tombstone.record, deleted: gone.row.deleted });
+			assert.equal((await send({ ...rename, base: 5, req: doc(6) })).t, "refused");
+			await a.publish(doc(22), "concurrent Yjs update");
+			const restore = { t: "restore", req: doc(7), file: live.file, pathkey: live.pathkey, record: live.record, base: 5, expectedChunks: null } as const;
+			assert.deepEqual(await send(restore), { t: "ok", req: restore.req, seq: 6 });
+			assert.deepEqual(await peer.next(), { t: "row", row: { ...live, seq: 6 } });
+			assert.deepEqual(await send({ ...restore, req: doc(8) }), refused(doc(8), { ...live, seq: 6 }));
+			assert.deepEqual((await a.catchUp(0)).got, ["1:22:u:original Yjs state", "2:22:u:concurrent Yjs update"]);
+			assert.equal(db.prepare("SELECT COUNT(*) AS n FROM versions").get()!.n, 0);
+		} finally { peer.ws.close(); }
+	} finally { db.close(); a.ws.close(); legacy.ws.close(); }
+});
+
 test("genesis waits for a recently disconnected legacy device to upgrade or age out", async () => {
 	for (const upgrade of [true, false]) {
 		const { v, tok, a: legacy, db } = await snapshotVaultWithDb();

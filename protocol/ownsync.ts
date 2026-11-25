@@ -6,7 +6,7 @@ const te = new TextEncoder();
 
 export const VERSION = 1;
 export const SUITE = 1; // AES-256-GCM, HKDF-SHA256, HMAC-SHA256, ECDH P-256
-export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5, history: 6, vaultSnapshot: 7, attachmentRecord: 8 } as const;
+export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5, history: 6, vaultSnapshot: 7, attachmentRecord: 8, noteRecord: 9 } as const;
 export const RECOVERY_ID = new Uint8Array(16); // member ID of the recovery key pair
 const ZERO_NONCE = new Uint8Array(12); // only for keys that seal exactly one message
 

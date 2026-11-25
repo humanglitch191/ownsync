@@ -25,8 +25,11 @@ const MIN_SETUP_KEY = 12;
 type Session = { token: string | null; live: boolean; device?: string; listFrom?: number; table?: string; subscribed?: boolean; wantsMigration?: boolean; tableLive?: boolean };
 const toHex = (b: ArrayBuffer | Uint8Array) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
 type StoredAttachment = { file: ArrayBuffer; version: ArrayBuffer; pathkey: ArrayBuffer; record: ArrayBuffer; deleted: number | null; seq: number };
+// The existing BLOB column uses an empty blob for a note, outside the fixed-width version-tag space.
+const NO_VERSION = new Uint8Array(0);
+const storedVersion = (v: ArrayBuffer) => v.byteLength ? new Uint8Array(v) : null;
 const attachmentRow = (r: StoredAttachment): AttachmentRow => ({
-	file: new Uint8Array(r.file), version: new Uint8Array(r.version), pathkey: new Uint8Array(r.pathkey), record: new Uint8Array(r.record), deleted: r.deleted, seq: r.seq,
+	file: new Uint8Array(r.file), version: storedVersion(r.version), pathkey: new Uint8Array(r.pathkey), record: new Uint8Array(r.record), deleted: r.deleted, seq: r.seq,
 });
 type Row = { seq: number; doc: ArrayBuffer; snapshot: number; envelope: ArrayBuffer };
 
@@ -461,7 +464,8 @@ export class Vault extends DurableObject<Env> {
 				if (f.t === "genesis") return this.genesis(ws, session.table, f.base, f.rows);
 				if (this.migrated || !f.row.seq) return ws.close(CLOSE.badMessage, "invalid genesis row");
 				const r = f.row;
-				this.write("INSERT INTO attachment_stage(session, ordinal, expected_chunks, file, version, pathkey, record, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", session.table, r.seq, f.expectedChunks ?? LEGACY_CHUNKS, r.file, r.version, r.pathkey, r.record, f.dateAtCommit ? -1 : r.deleted);
+				if (r.version === null && f.expectedChunks !== null) return ws.close(CLOSE.badMessage, "note cannot declare chunks");
+				this.write("INSERT INTO attachment_stage(session, ordinal, expected_chunks, file, version, pathkey, record, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", session.table, r.seq, f.expectedChunks ?? LEGACY_CHUNKS, r.file, r.version ?? NO_VERSION, r.pathkey, r.record, f.dateAtCommit ? -1 : r.deleted);
 				return ws.send(encodeServer({ t: "stagedRow", seq: r.seq }));
 			}
 			if (f.t === "forget" || f.t === "since" || f.t === "set" || f.t === "del" || f.t === "restore") {
@@ -555,7 +559,7 @@ export class Vault extends DurableObject<Env> {
 					this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) SELECT file, version, pathkey, record, CASE deleted WHEN -1 THEN ? ELSE deleted END, ordinal FROM attachment_stage WHERE session = ?", now, session);
 					this.write(`INSERT INTO versions(tag, expected_chunks, retired_at, deleted)
 						SELECT version, MIN(expected_chunks), CASE WHEN COUNT(*) = COUNT(deleted) THEN CASE WHEN MIN(deleted) = -1 THEN ? ELSE MAX(deleted) END END, COUNT(*) = COUNT(deleted)
-						FROM attachment_stage WHERE session = ? GROUP BY version
+						FROM attachment_stage WHERE session = ? AND version != x'' GROUP BY version
 						ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, deleted = excluded.deleted,
 						retired_at = CASE WHEN excluded.deleted THEN CASE WHEN excluded.retired_at = ? THEN excluded.retired_at
 							ELSE COALESCE(versions.retired_at, excluded.retired_at) END END`, now, session, now);
@@ -581,7 +585,7 @@ export class Vault extends DurableObject<Env> {
 	private genesisVersionsAvailable(session: string): boolean {
 		const bad = this.sql.exec(`WITH staged AS (
 				SELECT version, MIN(expected_chunks) AS expected, MAX(expected_chunks) AS largest, COUNT(*) > COUNT(deleted) AS live
-				FROM attachment_stage WHERE session = ? GROUP BY version
+				FROM attachment_stage WHERE session = ? AND version != x'' GROUP BY version
 			) SELECT 1 FROM staged s LEFT JOIN version_chunks vc ON vc.tag = s.version LEFT JOIN chunks c ON c.name = vc.name
 			GROUP BY s.version HAVING expected != largest OR
 				(expected = ? AND COUNT(vc.name) != 0) OR
@@ -613,20 +617,24 @@ export class Vault extends DurableObject<Env> {
 			}
 			if (f.t === "del" && (!current || current.deleted !== null)) return refused();
 			if (f.t === "restore" && (!current || current.deleted === null)) return refused();
-			const version = f.t === "set" ? f.version : new Uint8Array(current!.version);
-			const sameVersion = !!current && toHex(version) === toHex(current.version);
+			const version = f.t === "set" ? f.version : storedVersion(current!.version);
+			const note = version === null;
+			if (current && note !== (current.version.byteLength === 0)) return refused();
+			if (f.t === "del" && note !== !!f.record) return refused();
+			if (f.t !== "del" && note && f.expectedChunks !== null) return refused();
+			const sameVersion = !!current && (note || toHex(version) === toHex(current.version));
 			if (f.t === "set" && current?.deleted != null && sameVersion) return refused();
-			if (f.t !== "del" && !this.hasAttachmentChunks(version, f.expectedChunks, sameVersion)) return refused(current, true);
+			if (f.t !== "del" && version !== null && !this.hasAttachmentChunks(version, f.expectedChunks, sameVersion)) return refused(current, true);
 			const now = Date.now();
 			const seq = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM attachments").one().seq;
 			changed = { seq, file: f.file, version, pathkey: f.t === "del" ? new Uint8Array(current!.pathkey) : f.pathkey,
-				record: f.t === "del" ? new Uint8Array(current!.record) : f.record, deleted: f.t === "del" ? now : null };
+				record: f.record ?? new Uint8Array(current!.record), deleted: f.t === "del" ? now : null };
 			this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(file) DO UPDATE SET version=excluded.version, pathkey=excluded.pathkey, record=excluded.record, deleted=excluded.deleted, seq=excluded.seq",
-				changed.file, changed.version, changed.pathkey, changed.record, changed.deleted, seq);
-			if (current && current.deleted === null && (f.t === "del" || !sameVersion)) {
+				changed.file, changed.version ?? NO_VERSION, changed.pathkey, changed.record, changed.deleted, seq);
+			if (!note && current && current.deleted === null && (f.t === "del" || !sameVersion)) {
 				this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = versions.tag AND deleted IS NULL)", now, Number(f.t === "del"), current.version);
 			}
-			if (f.t !== "del") this.write(`INSERT INTO versions(tag, expected_chunks) VALUES (?, ?)
+			if (!note && f.t !== "del") this.write(`INSERT INTO versions(tag, expected_chunks) VALUES (?, ?)
 				ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, retired_at = NULL, deleted = 0
 				WHERE versions.expected_chunks IS NULL OR versions.retired_at IS NOT NULL`, version, f.expectedChunks ?? LEGACY_CHUNKS);
 			return { t: "ok", req: f.req, seq };
