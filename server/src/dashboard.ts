@@ -28,6 +28,7 @@ export interface VaultStats {
 	deleted: boolean;
 	devices: { id: string; name: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
 	settings: VaultSettings;
+	migration?: "legacy" | "requested" | "complete";
 	/** Complete vault snapshots, newest first: when the last part arrived, and their size. */
 	snapshots: { at: number; size: number }[];
 	/** History backup copies, all devices together. */
@@ -48,6 +49,7 @@ export interface VaultRpc {
 	stats(): Promise<VaultStats>;
 	cleanupSizes(): Promise<{ at: number; old: number; deleted: number }[]>;
 	cleanUp(ranges: unknown, zone: unknown, months: unknown): Promise<{ removed: number; more: boolean } | { error: string }>;
+	requestMigration(): Promise<{ ok?: boolean; error?: string }>;
 	setSettings(settings: unknown): Promise<{ ok: true } | { error: string }>;
 	clearHistory(): Promise<{ ok: true } | { error: string }>;
 	clearSnapshots(): Promise<{ ok: true } | { error: string }>;
@@ -212,6 +214,12 @@ export class Dashboard {
 			if (name) this.sql.exec("INSERT OR REPLACE INTO device_labels (vault, device, label) VALUES (?, ?, ?)", device[1]!, device[2]!, name);
 			else this.sql.exec("DELETE FROM device_labels WHERE vault = ? AND device = ?", device[1]!, device[2]!);
 			return json({ ok: true });
+		}
+		const migrate = path.match(/^\/api\/vaults\/([0-9a-f]{32})\/migrate$/);
+		if (migrate) {
+			if (!this.vaults().some(v => v.id === migrate[1])) return fail(404, "no such vault");
+			const result = await this.vault(migrate[1]!).requestMigration();
+			return result.error ? fail(400, result.error) : json(result);
 		}
 		// Clean up (DESIGN.md section 10): what can be removed, and removing it. The Vault checks the ranges on its own clock.
 		const cleanup = path.match(/^\/api\/vaults\/([0-9a-f]{32})\/cleanup(\/sizes)?$/);
@@ -455,7 +463,7 @@ export class Dashboard {
 				bytes: v.stats!.bytes,
 				lastActivity: v.stats!.lastActivity,
 				conflicts: Math.max(0, ...v.stats!.devices.map((d) => d.conflicts)),
-				settings: v.stats!.settings,
+				settings: v.stats!.settings, migration: v.stats!.migration,
 				snapshots: v.stats!.snapshots ?? [],
 				historyCopies: v.stats!.historyCopies ?? { copies: 0, bytes: 0 },
 				devices: v.stats!.devices.map((d) => ({ ...d, label: labels.get(`${v.id}/${d.id}`) ?? "", behind: !!newest && d.version !== newest && d.version.localeCompare(newest, undefined, { numeric: true }) < 0, lost: !d.online && now - d.lastOnline > LOST_AFTER_MS })),

@@ -486,6 +486,19 @@ function when(t) {
 	return `${back === 0 ? "Today" : back === 1 ? "Yesterday" : dayLabel(t)}, ${time}`;
 }
 
+function migrationCard(v) {
+	const error = h("p", { class: "error cerr", hidden: true }, FAILED);
+	const button = h("button", { class: "btn primary", onclick: async () => {
+		button.disabled = true;
+		try { await api(`/api/vaults/${v.id}/migrate`, {}); await dashboard("storage"); }
+		catch { error.hidden = false; button.disabled = false; }
+	} }, "Migrate now");
+	return h("section", { class: "card" }, h("h3", {}, "Attachment sync migration"),
+		h("p", {}, v.migration === "requested" ? "Waiting for an updated device to complete migration." :
+			"Migration normally waits until every recently active device has updated. Migrating now requires older devices to update before syncing again."),
+		v.migration === "requested" ? null : button, error);
+}
+
 function storagePage(v, buckets) {
 	const view = VIEWS.find(([, m]) => m === months)[0];
 	const current = period(Date.now(), months), periods = new Map([[current.start, { ...current, old: 0, deleted: 0 }]]);
@@ -524,6 +537,7 @@ function storagePage(v, buckets) {
 		h("p", { class: "lede" }, h("b", {}, size(v.bytes)), " on your Worker.",
 			removable.length ? [" ", h("b", {}, size(sum(removable, bytes))), ` of it is attachment history from ${listed(removable.map((r) => r.label).reverse())} that you can remove.`] : null),
 		sizeBar(v, buckets),
+		...(v.migration === "legacy" || v.migration === "requested" ? [migrationCard(v)] : []),
 		h("div", { class: "cols" },
 			h("section", { class: "card" },
 				h("div", { class: "ch col" }, h("div", {}, h("h3", {}, "Clean up"), h("p", {}, "Old versions of attachments and attachments you deleted, by period. Notes and current attachments are never touched.")),

@@ -48,12 +48,13 @@
 //     only with one of their snapshots. Edits built on it wait (inside Yjs) until then.
 
 import * as Y from "yjs";
+import { conflictName, places, type IndexValue } from "./places";
+import { legacyBases } from "./table/migration";
 import { applyText } from "./text";
 import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, MarkState, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
 
 const INDEX: DocId = "index";
 const REMOTE = "ownsync-remote"; // transaction origin for changes that didn't start on this device
-type IndexValue = { p: string; d?: string; t?: number };
 const SNAPSHOT_ID = /^[0-9a-f]{32}$/;
 const PART_HASH = /^[0-9a-f]{64}$/i;
 // Recently deleted lists at most this many notes, from at most this many days back (as local history keeps them).
@@ -64,6 +65,10 @@ const WINDOW = 4;
 const MAX_MARK = 1024;
 
 export interface EngineOptions {
+	tableHistory?: {
+		deleted(): Promise<DeletedNote[]>;
+		restore(id: string): Promise<string | undefined>;
+	};
 	hash(text: string): Promise<string>;
 	/**
 	 * Names content by a keyed hash (the server can't test guesses): a chunk, and an attachment's version. With
@@ -148,8 +153,6 @@ function alike(a: Set<string>, b: Set<string>): number {
 	for (const u of a) if (b.has(u)) shared++;
 	return shared / Math.min(a.size, b.size) + shared / Math.max(a.size, b.size) / 1000;
 }
-// Before the extension, so a copy keeps its file type.
-const conflictName = (path: string, id: string) => path.replace(/(\.[^./]*)?$/, ` (conflict ${id.slice(0, 6)})$1`);
 /** Everything else is an attachment. Exactly Obsidian's rule, so a file is the same kind everywhere. */
 const isNote = (path: string) => path.endsWith(".md");
 
@@ -225,6 +228,8 @@ export class Engine {
 	private tags = new Map<string, Promise<string>>();
 	// One Yjs client ID per run, so a crash or a copied profile can never reuse an ID with different edits.
 	private clientId: number;
+	private table = false;
+	get tableActive() { return this.table; }
 
 	constructor(private readonly store: Store, private readonly disk: Disk, private readonly opts: EngineOptions) {
 		this.clientId = this.newClientId();
@@ -265,6 +270,7 @@ export class Engine {
 
 	start(): Promise<void> {
 		return this.run("start", async () => {
+			this.table = !!await this.store.get("table/migrated");
 			this.meta = (await this.store.get<Meta>("meta")) ?? this.meta;
 			this.committedCursor = this.meta.cursor;
 			const index = await this.store.get<Uint8Array>("index");
@@ -272,19 +278,40 @@ export class Engine {
 			this.indexDirty = false;
 			for (const [key, m] of await this.store.list<NoteMeta>("note:")) {
 				this.metas.set(key.slice(5), m);
-				if (m.diskPath) this.byPath.set(m.diskPath, key.slice(5));
+				if (m.diskPath && (!this.table || isNote(m.diskPath))) this.byPath.set(m.diskPath, key.slice(5));
 			}
-			if (this.notesOnly) for (const [id, m] of this.metas) if (m.diskPath && !isNote(m.diskPath)) await this.forget(id);
+			if (this.notesOnly && !this.table) for (const [id, m] of this.metas) if (m.diskPath && !isNote(m.diskPath)) await this.forget(id);
 			this.outbox = (await this.store.list<Entry>("out:")).map(([key, entry]) => ({ id: Number(key.slice(4)), entry })).sort((a, b) => a.id - b.id);
-			for (const [key] of await this.store.list("up:")) this.ups.add(key.slice(3));
-			for (const [key, us] of await this.store.list<string[]>("cur:")) {
-				this.cur.set(key.slice(4), us);
-				for (const u of us) this.holders.set(u, (this.holders.get(u) ?? 0) + 1);
+			if (!this.table) {
+				for (const [key] of await this.store.list("up:")) this.ups.add(key.slice(3));
+				for (const [key, us] of await this.store.list<string[]>("cur:")) {
+					this.cur.set(key.slice(4), us);
+					for (const u of us) this.holders.set(u, (this.holders.get(u) ?? 0) + 1);
+				}
+				for (const [key, state] of await this.store.list<MarkState>("mark:")) this.marks.set(key.slice(5), state);
 			}
-			for (const [key, state] of await this.store.list<MarkState>("mark:")) this.marks.set(key.slice(5), state);
 			// Before the first catch-up, local files can't be told apart from the vault's notes yet.
 			if (this.meta.synced) await this.scan();
 		});
+	}
+
+	/** Capture the old agreements while the legacy input queue is stopped at this boundary. */
+	useTable(nameKey: Uint8Array): Promise<void> {
+		const work = this.queue.then(async () => {
+			if (this.table) return;
+			await this.flush();
+			const bases = await legacyBases(this.store,nameKey);
+			const obsolete = this.outbox.filter(o => this.isAttachment(o.entry.doc));
+			await this.store.commit(bases,obsolete.map(o => "out:" + o.id));
+			this.table = true;
+			for (const path of this.byPath.keys()) if (!isNote(path)) this.byPath.delete(path);
+			this.uploading = null; this.fetching = null; this.ups.clear(); this.toFetch.clear(); this.retry.clear();
+			this.cur.clear(); this.holders.clear(); this.marks.clear();
+			this.outbox = this.outbox.filter(o => !this.isAttachment(o.entry.doc));
+			this.unmark();
+		});
+		this.queue = work.catch(err => this.opts.onProblem?.("switching attachments",err));
+		return work;
 	}
 
 	/**
@@ -297,6 +324,7 @@ export class Engine {
 		this.mark(path, 1);
 		this.later(() => void this.run(`disk ${path}`, async () => {
 			this.mark(path, -1);
+			if (this.table && !isNote(path)) return;
 			if (!this.meta.synced || this.dirty.has(path)) return; // a later event covers this path
 			const id = this.byPath.get(path);
 			if (id) await this.settle(id);
@@ -318,6 +346,7 @@ export class Engine {
 		this.later(() => void this.run(`rename ${from}`, async () => {
 			this.mark(from, -1);
 			this.mark(to, -1);
+			if (this.table && !isNote(from) && !isNote(to)) return;
 			if (!this.meta.synced) return;
 			const id = this.byPath.get(from), occupant = this.byPath.get(to);
 			if (occupant && occupant !== id) await this.lost(occupant);
@@ -397,7 +426,11 @@ export class Engine {
 			const gone = new Set((await Promise.all(answers)).flatMap((missing) => missing ?? []));
 			for (const note of held) if (!tags.get(note.id)?.some((tag) => gone.has(tag))) deleted.push(note);
 		}
-		return deleted;
+		if (this.table && this.opts.attachments !== false && this.opts.tableHistory) {
+			deleted.push(...await this.opts.tableHistory.deleted());
+			deleted.sort((a,b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity));
+		}
+		return deleted.slice(0,MAX_DELETED);
 	}
 
 	/** The text of a deleted note, if this device holds it. */
@@ -429,6 +462,7 @@ export class Engine {
 	 * "gone" (its file is no longer stored: nothing was restored), or "offline".
 	 */
 	async restoreAttachment(id: string): Promise<string | "gone" | "offline" | undefined> {
+		if (this.table) return this.opts.attachments === false ? undefined : this.opts.tableHistory?.restore(id);
 		let us: string[] = [], head: string | undefined, answer: Promise<string[] | undefined> | undefined, offline = false, ours = false;
 		await this.run(`check ${id}`, async () => {
 			const v = this.notes.get(id);
@@ -542,7 +576,7 @@ export class Engine {
 					this.tail.set(msg.entry.doc, msg.entry.kind === "snapshot" ? 0 : (this.tail.get(msg.entry.doc) ?? 0) + 1);
 				}
 				if (msg.entry.doc === INDEX) await this.applyIndex(msg.entry.data);
-				else {
+				else if (!this.table || !this.isAttachment(msg.entry.doc)) {
 					await this.merge(msg.entry.doc, msg.entry.data, false);
 					if (this.meta.synced) await this.settle(msg.entry.doc);
 				}
@@ -584,6 +618,7 @@ export class Engine {
 			if (!this.link || !this.live) return;
 			await this.flush(); // the cursor they name must be on record first
 			for (const doc of [INDEX, ...this.notes.keys()]) {
+				if (this.table && this.isAttachment(doc)) continue;
 				const data = doc === INDEX ? Y.encodeStateAsUpdate(this.index) : await this.state(doc);
 				if (!data) continue;
 				this.tail.set(doc, 0);
@@ -701,8 +736,8 @@ export class Engine {
 		const live = this.liveOut;
 		this.liveOut = [];
 		if (!this.link || !this.live) return;
-		for (const entry of live) this.link.send({ t: "live", entry });
-		this.sendChunks();
+		for (const entry of live) if (!this.table || !this.isAttachment(entry.doc)) this.link.send({ t: "live", entry });
+		if (!this.table) this.sendChunks();
 		const wait = this.lastPublish + (this.opts.pace ?? 0) - Date.now();
 		if (wait > 0) {
 			this.paceTimer ??= window.setTimeout(() => {
@@ -713,6 +748,7 @@ export class Engine {
 		}
 		const groups = new Map<DocId, { id: number; kind: Entry["kind"]; data: Uint8Array[] }>();
 		for (const o of this.outbox) {
+			if (this.table && this.isAttachment(o.entry.doc)) continue;
 			if (o.id <= this.sent) continue;
 			const g = groups.get(o.entry.doc);
 			if (g) {
@@ -735,6 +771,7 @@ export class Engine {
 
 	// Once enough small entries have piled up for a document, give the server the whole thing so it can drop them.
 	private async offerSnapshot(doc: DocId): Promise<void> {
+		if (this.table && this.isAttachment(doc)) return;
 		if (!this.link || !this.live || (this.tail.get(doc) ?? 0) < (this.opts.snapshotAfter ?? 50)) return;
 		if (this.outbox.some((o) => o.entry.doc === doc)) return; // wait until our own edits are acknowledged
 		const data = doc === INDEX ? Y.encodeStateAsUpdate(this.index) : await this.state(doc);
@@ -830,25 +867,7 @@ export class Engine {
 
 	private places() {
 		if (this.layout) return this.layout;
-		const groups = new Map<string, string[]>(); // index path → the notes claiming it
-		for (const [id, v] of this.notes) {
-			if (v.d !== undefined) continue;
-			const g = groups.get(v.p);
-			if (g) g.push(id);
-			else groups.set(v.p, [id]);
-		}
-		// The smallest ID keeps the path; the others get a suffix, and again if that name is itself claimed.
-		const paths = new Map<string, string>(), owners = new Map<string, string>();
-		for (const [path, g] of groups) owners.set(path, g.sort()[0]!);
-		for (const path of [...groups.keys()].sort()) {
-			for (const id of groups.get(path)!.slice(1)) {
-				let name = conflictName(path, id);
-				while (owners.has(name)) name = conflictName(name, id);
-				owners.set(name, id);
-			}
-		}
-		for (const [path, id] of owners) paths.set(id, path);
-		return (this.layout = { paths, owners, groups });
+		return (this.layout = places(this.notes));
 	}
 
 	private effectivePath(id: string): string | undefined {
@@ -932,6 +951,7 @@ export class Engine {
 		const home = new Map<string, string>(); // note → its path, when a file is still there
 		const changed = new Map<string, string>(); // attachment → its path, where its file now has other content
 		for (const [path, id] of [...this.byPath]) {
+			if (this.table && !isNote(path)) continue;
 			const f = onDisk.get(path), m = this.metaOf(id);
 			if (f && m.mtime === f.mtime && m.size === f.size) continue; // untouched
 			// An attachment changed in place is a new version of it. One that's gone is matched by exact content
@@ -1418,8 +1438,10 @@ export class Engine {
 	// --- attachments ---
 
 	private get notesOnly(): boolean {
-		return this.opts.attachments === false;
+		return this.table || this.opts.attachments === false;
 	}
+
+	legacyAttachment(id: string) { return this.isAttachment(id); }
 
 	private isAttachment(id: string): boolean {
 		const v = this.notes.get(id);
@@ -1593,6 +1615,7 @@ export class Engine {
 
 	/** Downloads waiting for their turn, and an upload to start (its file is read again: only one is in memory). */
 	private async nextTransfers(): Promise<void> {
+		if (this.table) return;
 		await this.nextUpload();
 		if (!this.uploading && this.link && this.live) await this.nextRepair();
 	}
@@ -1692,6 +1715,7 @@ export class Engine {
 	 * no attachment holds any more is retired; one that joins any is current again. On record as reports ("mark:").
 	 */
 	private async track(all = false): Promise<void> {
+		if (this.table) return;
 		const ids = all ? new Set([...this.notes.keys(), ...this.cur.keys()]) : this.touched;
 		this.touched = new Set();
 		for (const id of ids) {
@@ -1736,6 +1760,7 @@ export class Engine {
 	 * report lost or overtaken is put right, and the Worker knows which retirements are confirmed. Counted afresh.
 	 */
 	private async listDue(): Promise<void> {
+		if (this.table) return;
 		const now = this.opts.now?.() ?? Date.now();
 		if (!this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.() || now - (this.meta.listedAt ?? -Infinity) < DAY_MS) return;
 		await this.track(true);
@@ -1746,6 +1771,7 @@ export class Engine {
 
 	/** Reports not answered yet, then the daily list if it's due. Only once caught up. */
 	private async sendMarks(): Promise<void> {
+		if (this.table) return;
 		const listing = this.listing;
 		this.listing = false;
 		if (!this.link || !this.live || !this.opts.versionTag || !this.opts.reports?.()) return;

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SNAPSHOT_BUDGET, snapshotsToPrune } from "../src/snapshots.ts";
 import { CLOSE, type ClientFrame, type ServerFrame, decodeClient, decodeServer, encodeClient, encodeServer } from "../src/wire.ts";
-import { type Stats, claim, startDev, stats } from "./devServer.ts";
+import { type Stats, claim, migrateNow, startDev, stats } from "./devServer.ts";
 
 const dev = await startDev();
 after(() => dev.stop());
@@ -959,6 +959,13 @@ test("genesis checks the legacy head and complete row count, switches once and c
 			a.send({ t: "stageRow", expectedChunks: null, row });
 			assert.deepEqual(await a.next(), { t: "stagedRow", seq: 1 });
 		};
+		a.send({ t: "migrationCheck" });
+		assert.deepEqual(await a.next(), { t: "migrationEligible", ready: false });
+		await stage();
+		a.send({ t: "genesis", base: 0, rows: 1 });
+		assert.deepEqual(await a.next(), { t: "format", table: false });
+		await migrateNow(`http://localhost:${PORT}`, v);
+		assert.deepEqual(await a.next(), { t: "migrationEligible", ready: true });
 		await stage();
 		const base = await legacy.publish(doc(8), "a note changed");
 		a.send({ t: "genesis", base: 0, rows: 1 });
@@ -982,10 +989,30 @@ test("genesis checks the legacy head and complete row count, switches once and c
 	} finally { legacy.ws.close(); a.ws.close(); b.ws.close(); }
 });
 
+test("genesis waits for a recently disconnected legacy device to upgrade or age out", async () => {
+	for (const upgrade of [true, false]) {
+		const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+		const a = await tablePeer(v, tok, false);
+		const id = doc(1).slice(0,4);
+		try {
+			legacy.send({ t: "status", id, version: "0.2.5", conflicts: 0 });
+			await legacy.catchUp(0); legacy.ws.close(); await legacy.closed;
+			const eligible = async () => { a.send({ t: "migrationCheck" }); return a.next(); };
+			assert.deepEqual(await eligible(), { t: "migrationEligible", ready: false });
+			if (upgrade) a.send({ t: "status", id, version: "updated", conflicts: 0 });
+			else db.exec("UPDATE devices SET last_online = 0");
+			assert.deepEqual(await eligible(), { t: "migrationEligible", ready: true });
+			a.send({ t: "genesis", base: 0, rows: 0 });
+			assert.deepEqual(await a.next(), { t: "format", table: true });
+		} finally { a.ws.close(); legacy.ws.close(); db.close(); }
+	}
+});
+
 test("table CAS includes renames, replays exact answers and distinguishes restoring from reviving", async () => {
 	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
 	const a = await tablePeer(v, tok, false);
 	try {
+		await migrateNow(`http://localhost:${PORT}`, v);
 		a.send({ t: "genesis", base: 0, rows: 0 });
 		assert.deepEqual(await a.next(), { t: "format", table: true });
 		assert.equal(await legacy.closed, CLOSE.updateNeeded);
@@ -1085,31 +1112,38 @@ test("genesis checks scoped live versions, preserves cleaned tombstones, and gra
 		for (const [row, expectedChunks] of [[scoped, 2], [legacy, null], [tombstone, 1]] as const) {
 			assert.deepEqual(await send({ t: "stageRow", row, expectedChunks }), { t: "stagedRow", seq: row.seq });
 		}
+		assert.deepEqual(await send({ t:"stageRow", row:{...tombstone,file:doc(20),version:name(21),seq:4,deleted:null},
+			expectedChunks:1,dateAtCommit:true }), {t:"stagedRow",seq:4});
 	};
 	try {
+		await migrateNow(`http://localhost:${PORT}`, v);
 		old.send({ t: "put", name: name(10), envelope: bytes("old-style bytes") });
 		assert.equal((await old.next()).t, "stored");
 		old.send({ t: "vput", tag: scoped.version, name: name(11), envelope: bytes("a") });
 		assert.equal((await old.next()).t, "stored");
 		await stage();
-		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 3 }), { t: "format", table: false });
+		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 4 }), { t: "format", table: false });
 		old.send({ t: "vput", tag: scoped.version, name: name(12), envelope: bytes("b") });
 		assert.equal((await old.next()).t, "stored");
 		await stage();
-		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 3 }), { t: "format", table: true });
+		const before = Date.now();
+		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 4 }), { t: "format", table: true });
+		const at = Number(db.prepare("SELECT deleted FROM attachments WHERE file = ?").get(doc(20))!.deleted);
+		assert.ok(at >= before && at <= Date.now());
+		assert.equal(db.prepare("SELECT retired_at FROM versions WHERE tag = ?").get(name(21))!.retired_at,at);
 		assert.equal(await old.closed, CLOSE.updateNeeded);
 
 		const restore = { t: "restore", req: doc(13), base: tombstone.seq, file: tombstone.file, pathkey: tombstone.pathkey, record: tombstone.record } as const;
 		for (const [req, expectedChunks] of [[13, 0], [14, 1], [15, null]] as const) {
 			assert.deepEqual(await send({ ...restore, req: doc(req), expectedChunks }), { t: "refused", missing: true, req: doc(req), row: tombstone });
 		}
-		assert.deepEqual(await send({ t: "set", req: doc(16), file: legacy.file, version: legacy.version, pathkey: name(14), record: legacy.record, base: 2, expectedChunks: null }), { t: "ok", req: doc(16), seq: 4 });
-		assert.deepEqual(await send({ t: "del", req: doc(17), file: legacy.file, base: 4 }), { t: "ok", req: doc(17), seq: 5 });
+		assert.deepEqual(await send({ t: "set", req: doc(16), file: legacy.file, version: legacy.version, pathkey: name(14), record: legacy.record, base: 2, expectedChunks: null }), { t: "ok", req: doc(16), seq: 5 });
+		assert.deepEqual(await send({ t: "del", req: doc(17), file: legacy.file, base: 5 }), { t: "ok", req: doc(17), seq: 6 });
 		db.prepare("UPDATE chunks SET uploaded_at = ?").run(past);
 		db.prepare("UPDATE versions SET retired_at = ? WHERE tag = ?").run(past, legacy.version);
 		assert.deepEqual(await cleanupPost(v, { ranges: [[past, past + 1]], zone: "UTC", months: 1 }), { removed: 0, more: false });
 		assert.deepEqual(await send({ t: "get", name: name(10) }), { t: "chunk", name: name(10), envelope: bytes("old-style bytes") });
-		assert.deepEqual(await send({ ...restore, req: doc(18), file: legacy.file, base: 5, expectedChunks: null, pathkey: legacy.pathkey, record: legacy.record }), { t: "ok", req: doc(18), seq: 6 });
+		assert.deepEqual(await send({ ...restore, req: doc(18), file: legacy.file, base: 6, expectedChunks: null, pathkey: legacy.pathkey, record: legacy.record }), { t: "ok", req: doc(18), seq: 7 });
 		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM version_chunks WHERE tag = ?").get(legacy.version)!.n, 0);
 	} finally { db.close(); old.ws.close(); peer.ws.close(); }
 });
@@ -1118,6 +1152,7 @@ test("table paging resumes after the last row even when the reader changes a row
 	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
 	const peer = await tablePeer(v, tok, false);
 	try {
+		await migrateNow(`http://localhost:${PORT}`, v);
 		peer.send({ t: "genesis", base: 0, rows: 0 }); await peer.next();
 		const ins = db.prepare("INSERT INTO attachments(file, version, pathkey, record, seq) VALUES (?, ?, ?, ?, ?)");
 		const key = (i: number) => { const id = doc(0); new DataView(id.buffer).setUint32(0, i); return id; };

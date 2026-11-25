@@ -109,6 +109,11 @@ test("the setup key adds the first passkey: right key, in the window, once; stra
 	await rename("  ");
 	assert.equal((await named()).label, "");
 	// Clean up, like every write here: the session and this site's own pages only; the vault checks the ranges.
+	const migrate = `/api/vaults/${vault.id}/migrate`;
+	assert.equal((await call(migrate, {})).status, 401);
+	assert.equal((await call(migrate, {}, { cookie: session.cookie!, origin: "https://elsewhere.test" })).status, 403);
+	assert.equal((await call(`/api/vaults/${"0".repeat(32)}/migrate`, {}, { cookie: session.cookie! })).status, 404);
+	assert.equal((await call(migrate, {}, { cookie: session.cookie! })).status, 200);
 	const cleanup = (body: unknown, opts: { cookie: string; origin?: string } = { cookie: session.cookie! }) => call(`/api/vaults/${vault.id}/cleanup`, body, opts);
 	const lastYear = [Date.UTC(new Date().getUTCFullYear() - 1, 0, 1), Date.UTC(new Date().getUTCFullYear(), 0, 1)];
 	assert.equal((await cleanup({ ranges: [lastYear], zone: "UTC", months: 12 }, { cookie: "" })).status, 401);

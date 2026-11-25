@@ -1,4 +1,4 @@
-import { type App, type EventRef, Events, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, debounce, apiVersion, normalizePath, requestUrl, setIcon } from "obsidian";
+import { type App, type EventRef, Events, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, TFolder, debounce, apiVersion, normalizePath, requestUrl, setIcon } from "obsidian";
 import { say } from "./notice";
 import { type VaultSettings, carryOver, cleanName, deviceNames, followedSettings, vaultSettings } from "./collab";
 import { docTag, hex, randomBytes, sha256 } from "../../protocol/ownsync";
@@ -16,6 +16,8 @@ import { handlePairLink, showPairingCode } from "./pairing";
 import { SetupModal, openDashboard } from "./setup";
 import { createSnapshots } from "./snapshots";
 import { installSnapshots } from "./snapshotsView";
+import { TableDisk } from "./tableDisk";
+import { TableSync } from "./tableSync";
 import { type Status, Transport } from "./transport";
 import { VaultDisk } from "./vaultDisk";
 
@@ -329,7 +331,15 @@ export default class OwnsyncPlugin extends Plugin {
 			throw err;
 		});
 		const disk = new VaultDisk(this.app);
+		const allowed = (p: string) => !!p && normalizePath(p) === p && !p.endsWith(".md")
+			&& !p.includes("\\") && !p.split("/").some(part => !part || part.startsWith("."))
+			&& p !== vault.configDir && !p.startsWith(vault.configDir+"/");
+		const scratch = (this.manifest.dir ?? vault.configDir+"/plugins/"+this.manifest.id)+"/attachments/"+vaultId;
+		const tableDisk: TableDisk = new TableDisk(vault.adapter,store,scratch,allowed,
+			b => table.hash(b),(h,n) => table.suffix(h,n));
+		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem);
 		const engine = new Engine(store, disk, {
+			tableHistory: table,
 			hash: async (text) => hex(await sha256(new TextEncoder().encode(text))),
 			chunkName: (data, scope): Promise<string> => transport.chunkName(data, scope),
 			versionTag: (u): Promise<string> => transport.versionTag(u),
@@ -344,6 +354,11 @@ export default class OwnsyncPlugin extends Plugin {
 		});
 		const editors = new Editors(this.app, engine, problem, (note, update) => transport.presence(note, update), this.deviceName);
 		const transport = new Transport(host, keys, engine, {
+			attachments: table,
+			tableCapable: async () => {
+				const r = await requestUrl({url:trimHost(host)+"/vault/"+vaultId,method:"GET",throw:false});
+				return Object.entries(r.headers).some(([k,v]) => k.toLowerCase() === "x-ownsync-table" && v === "1");
+			},
 			// Only the device creating the vault sends the owner code: pairing joins a vault and never creates one.
 			owner: this.settings.createdHere === vaultId ? this.ownerCode : "",
 			onStatus: (s) => {
@@ -402,18 +417,26 @@ export default class OwnsyncPlugin extends Plugin {
 		});
 		const refresh = debounce(() => { editors.refresh(); report(); }, 50, true);
 		const report = debounce(() => transport.report(), 5000);
+		const changed = (path: string, deleted = false) => {
+			if (engine.tableActive && allowed(path)) void table.event({kind:deleted ? "deleted" : "changed",path});
+			else engine.diskChanged(path);
+		};
 		const refs: [{ offref(ref: EventRef): void }, EventRef][] = [
-			[vault, vault.on("create", (f) => { if (disk.synced(f)) { engine.diskChanged(f.path); refresh(); } })],
-			[vault, vault.on("modify", (f) => { if (disk.synced(f)) engine.diskChanged(f.path); })],
-			[vault, vault.on("delete", (f) => { if (disk.synced(f)) { engine.diskChanged(f.path); refresh(); } })],
+			[vault, vault.on("create", (f) => { if (disk.synced(f)) { changed(f.path); refresh(); } })],
+			[vault, vault.on("modify", (f) => { if (disk.synced(f)) changed(f.path); })],
+			[vault, vault.on("delete", (f) => { if (disk.synced(f)) { changed(f.path,true); refresh(); } })],
 			[vault, vault.on("rename", (f, from) => {
+				if (engine.tableActive && (f instanceof TFile || f instanceof TFolder)) {
+					if (f instanceof TFolder || allowed(from) || allowed(f.path))
+						void table.event({kind:"renamed",from,to:f.path});
+				}
 				if (!(f instanceof TFile)) return;
 				// A file moved into or out of the settings folder appears or disappears. (The engine takes a note
 				// renamed to an attachment, or back, for one file gone and another new.)
 				const was = !from.startsWith(`${vault.configDir}/`), is = disk.synced(f);
 				if (was && is) engine.diskRenamed(from, f.path);
 				else if (was) engine.diskChanged(from);
-				else if (is) engine.diskChanged(f.path);
+				else if (is) changed(f.path);
 				refresh();
 			})],
 			[workspace, workspace.on("layout-change", () => editors.refresh())],
@@ -421,6 +444,7 @@ export default class OwnsyncPlugin extends Plugin {
 			[workspace, workspace.on("active-leaf-change", () => editors.refresh())],
 		];
 		await engine.start();
+		if (engine.tableActive) await table.open();
 		void transport.connect().catch((err) => problem("connecting", err));
 		editors.refresh();
 		return {
@@ -433,6 +457,7 @@ export default class OwnsyncPlugin extends Plugin {
 				transport.disconnect();
 				engine.stop();
 				await engine.idle();
+				await table.idle();
 				await store.close();
 			},
 		};

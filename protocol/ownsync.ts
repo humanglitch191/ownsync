@@ -6,7 +6,7 @@ const te = new TextEncoder();
 
 export const VERSION = 1;
 export const SUITE = 1; // AES-256-GCM, HKDF-SHA256, HMAC-SHA256, ECDH P-256
-export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5, history: 6, vaultSnapshot: 7 } as const;
+export const KIND = { update: 1, snapshot: 2, presence: 3, chunk: 4, updatePart: 5, history: 6, vaultSnapshot: 7, attachmentRecord: 8 } as const;
 export const RECOVERY_ID = new Uint8Array(16); // member ID of the recovery key pair
 const ZERO_NONCE = new Uint8Array(12); // only for keys that seal exactly one message
 
@@ -126,6 +126,12 @@ export async function openEnvelope(envelope: Uint8Array, vaultId: Uint8Array, do
 	const plaintext = await open(await sealKey(vmk, vaultId, h.deviceId), envelope.slice(HEADER_LEN, HEADER_LEN + 12), envelope.slice(HEADER_LEN + 12), concat(header, vaultId, docId));
 	return { ...h, plaintext };
 }
+
+// These identities use the vault's first name key throughout its lifetime, including after rotation.
+export const tableFileId = async (key: Uint8Array, legacyId: Uint8Array) =>
+	(await hmac(key, concat(te.encode("ownsync/table-file\0"), legacyId))).slice(0, 16);
+export const tablePathKey = (key: Uint8Array, path: string) =>
+	hmac(key, concat(te.encode("ownsync/table-path\0"), te.encode(path)));
 
 export const chunkName = async (vmk: Uint8Array, vaultId: Uint8Array, plaintext: Uint8Array) => hmac(await nameKey(vmk, vaultId), await sha256(plaintext));
 // From 0.2.0 a chunk belongs to one attachment version (`Ref.u`), so an expired version can be erased without asking

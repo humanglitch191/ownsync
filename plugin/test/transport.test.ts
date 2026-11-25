@@ -7,7 +7,10 @@ import { execFileSync } from "node:child_process";
 import { VaultKeys, newRecovery, shortId, vaultIdOf } from "../src/keys";
 import { Transport, fetchRecords } from "../src/transport";
 import { hex, unhex, unpackPairing } from "../../protocol/ownsync";
-import { ownerCodes, startDev, stats } from "../../server/test/devServer";
+import { TableDisk } from "../src/tableDisk";
+import { TableSync } from "../src/tableSync";
+import { attachmentFs } from "./table-fs";
+import { migrateNow, ownerCodes, startDev, stats } from "../../server/test/devServer";
 import { Device, Server, memoryPorts, rng } from "./sim";
 
 const dev = await startDev();
@@ -23,7 +26,7 @@ after(() => {
 
 // A device that already holds the vault key (as one set up before the membership log existed): it joins the
 // log by itself. `keys` instead starts it from keys set up some other way (paired, recovered).
-async function device(name: string, vault: string, vaultKey = key, overrides: Device["overrides"] = {}, keys?: VaultKeys, ownerCode?: string) {
+async function device(name: string, vault: string, vaultKey = key, overrides: Device["overrides"] = {}, keys?: VaultKeys, ownerCode?: string, capable = false) {
 	const d = new Device(name, new Server(), rng(name.length + devices.length * 7919));
 	// Real chunk names and sizes, not the simulator's. Version-scoped only if the test says the Worker takes them.
 	d.overrides = { chunkName: (data, scope) => link.chunkName(data, scope), versionTag: (u) => link.versionTag(u), chunkSize: 2 ** 20, ...overrides };
@@ -31,7 +34,12 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	const problems: string[] = [], alerts: string[] = [], presence: [note: string, update: string][] = [];
 	const onProblem = (what: string, err: unknown) => problems.push(`${what}: ${String(err)}`);
 	keys ??= await VaultKeys.open(vault, memoryPorts(JSON.stringify({ 0: vaultKey })), { onProblem, onAlert: (m) => alerts.push(m) });
+	const { fs,store } = attachmentFs(d.files,d.data);
+	const allowed = (p: string) => !p.startsWith(".") && !p.endsWith(".md");
+	const adapter: TableDisk = new TableDisk(fs,store,".private/table",allowed,b => table.hash(b),(h,n) => table.suffix(h,n));
+	const table = new TableSync(store,keys,adapter,allowed,overrides.attachments !== false,20*2**20,onProblem);
 	const link = new Transport(host, keys, d.engine!, {
+		attachments:capable ? table : undefined, tableCapable:async () => capable,
 		owner: ownerCode ?? (await nextOwner()),
 		onProblem,
 		onPresence: (note, update) => presence.push([note, new TextDecoder().decode(update)]),
@@ -40,7 +48,7 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	});
 	links.push(link);
 	devices.push(d);
-	return { d, link, keys, problems, alerts, presence };
+	return { d, link, keys, problems, alerts, presence, table };
 }
 const disk = (d: Device) => Object.fromEntries([...d.files].map(([p, f]) => [p, f.content]).sort());
 async function until(devs: Device[], check: () => boolean, ms = 10000): Promise<void> {
@@ -302,6 +310,37 @@ test("version-scoped attachments through the Worker: real names, reports and lis
 	await c.link.connect();
 	await until([a.d, b.d, c.d], () => new TextDecoder().decode(disk(c.d)["p.png"] as Uint8Array) === "second picture");
 	assert.deepEqual([...a.problems, ...b.problems, ...c.problems, ...a.d.problems, ...b.d.problems, ...c.d.problems], []);
+});
+
+test("a live legacy vault migrates through the transport, then an updated peer downloads, edits and restores", async () => {
+	const vault = "migration", opts = {reports:()=>true,scoped:()=>true};
+	const old = await device("old",vault,key,opts);
+	await old.link.connect(); await until([old.d],() => old.link.status === "synced");
+	const a = await device("capable",vault,key,opts,undefined,undefined,true);
+	await a.link.connect(); await until([old.d,a.d],() => a.link.status === "synced");
+	const content = (s: string) => new TextEncoder().encode(s);
+	const val = (d: Device,p: string) => new TextDecoder().decode(d.files.get(p)?.content as Uint8Array | undefined);
+	old.d.write("legacy.png",content("before genesis"));
+	await until([old.d,a.d],() => val(a.d,"legacy.png") === "before genesis");
+	assert.equal(a.d.engine!.tableActive,false);
+	old.link.disconnect();
+	await migrateNow(host,hex(a.keys.vaultId));
+	await until([a.d],() => a.d.data.has("table/initialized"));
+	assert.equal(a.d.engine!.tableActive,true);
+	const b = await device("joining",vault,key,opts,undefined,undefined,true);
+	await b.link.connect();
+	await until([a.d,b.d],() => val(b.d,"legacy.png") === "before genesis");
+	b.d.write("legacy.png",content("after genesis"));
+	await b.table.event({kind:"changed",path:"legacy.png"});
+	await until([a.d,b.d],() => val(a.d,"legacy.png") === "after genesis");
+	a.d.write("migration-note.md","still text");
+	await until([a.d,b.d],() => b.d.files.get("migration-note.md")?.content === "still text");
+	a.d.remove("legacy.png"); await a.table.event({kind:"deleted",path:"legacy.png"});
+	await until([a.d,b.d],() => !b.d.files.has("legacy.png"));
+	const [gone] = await b.table.deleted(); assert.ok(gone);
+	assert.equal(await b.table.restore(gone.id),"legacy.png");
+	await until([a.d,b.d],() => val(a.d,"legacy.png") === "after genesis");
+	assert.deepEqual([...a.problems,...b.problems,...a.d.problems,...b.d.problems],[]);
 });
 
 test("the Worker's storage holds no note text, attachment content, file names, folder names or vault names", () => {

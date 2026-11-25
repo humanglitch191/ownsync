@@ -22,7 +22,7 @@ const MIN_SETUP_KEY = 12;
 
 // token: hex hash of the token this socket said hello with; null before hello. device: the short ID its status gave.
 // listFrom: when this socket's full list of current versions began (DESIGN.md section 10), until its last frame.
-type Session = { token: string | null; live: boolean; device?: string; listFrom?: number; table?: string; subscribed?: boolean; tableLive?: boolean };
+type Session = { token: string | null; live: boolean; device?: string; listFrom?: number; table?: string; subscribed?: boolean; wantsMigration?: boolean; tableLive?: boolean };
 const toHex = (b: ArrayBuffer | Uint8Array) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
 type StoredAttachment = { file: ArrayBuffer; version: ArrayBuffer; pathkey: ArrayBuffer; record: ArrayBuffer; deleted: number | null; seq: number };
 const attachmentRow = (r: StoredAttachment): AttachmentRow => ({
@@ -159,6 +159,7 @@ export class Vault extends DurableObject<Env> {
 		// Existing chunks have no known upload time. Leave it NULL so an orphan cannot be dated by guesswork.
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(chunks)").toArray().some(c => c.name === "uploaded_at")) this.sql.exec("ALTER TABLE chunks ADD COLUMN uploaded_at INTEGER");
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(versions)").toArray().some(c => c.name === "expected_chunks")) this.sql.exec("ALTER TABLE versions ADD COLUMN expected_chunks INTEGER");
+		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some(c => c.name === "table_client")) this.sql.exec("ALTER TABLE devices ADD COLUMN table_client INTEGER NOT NULL DEFAULT 0");
 		// Added in 0.1.2: a device's name, as Obsidian has it. Vaults made earlier get the column now.
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");
 		// Added in 0.2.0: when the usage counters were last written, so a wake from hibernation doesn't write them again.
@@ -207,7 +208,7 @@ export class Vault extends DurableObject<Env> {
 			await this.erase();
 			return Response.json({ deleted: true });
 		}
-		if (req.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
+		if (req.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426, headers: { "X-Ownsync-Table": "1" } });
 		const { 0: client, 1: server } = new WebSocketPair();
 		this.ctx.acceptWebSocket(server);
 		server.serializeAttachment({ token: null, live: false } satisfies Session);
@@ -450,12 +451,17 @@ export class Vault extends DurableObject<Env> {
 				return ws.send(encodeServer({ t: "format", table: this.migrated }));
 			}
 			if (this.migrated && !session.table) return ws.close(CLOSE.updateNeeded, "update needed");
+			if (f.t === "migrationCheck") {
+				if (!session.table) return ws.close(CLOSE.badMessage, "table handshake required");
+				ws.serializeAttachment({ ...session, wantsMigration: true });
+				return ws.send(encodeServer({ t: "migrationEligible", ready: !this.migrated && this.migrationEligible() }));
+			}
 			if (f.t === "stageRow" || f.t === "genesis") {
 				if (!session.table) return ws.close(CLOSE.badMessage, "table handshake required");
 				if (f.t === "genesis") return this.genesis(ws, session.table, f.base, f.rows);
 				if (this.migrated || !f.row.seq) return ws.close(CLOSE.badMessage, "invalid genesis row");
 				const r = f.row;
-				this.write("INSERT INTO attachment_stage(session, ordinal, expected_chunks, file, version, pathkey, record, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", session.table, r.seq, f.expectedChunks ?? LEGACY_CHUNKS, r.file, r.version, r.pathkey, r.record, r.deleted);
+				this.write("INSERT INTO attachment_stage(session, ordinal, expected_chunks, file, version, pathkey, record, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", session.table, r.seq, f.expectedChunks ?? LEGACY_CHUNKS, r.file, r.version, r.pathkey, r.record, f.dateAtCommit ? -1 : r.deleted);
 				return ws.send(encodeServer({ t: "stagedRow", seq: r.seq }));
 			}
 			if (f.t === "forget" || f.t === "since" || f.t === "set" || f.t === "del" || f.t === "restore") {
@@ -511,18 +517,48 @@ export class Vault extends DurableObject<Env> {
 		}
 	}
 
+	// Check again at genesis: a legacy device may have connected since staging began.
+	private migrationEligible(): boolean {
+		if (this.migrationRequested()) return true;
+		const cutoff = Date.now() - SCOPED_SINCE_MS;
+		for (const ws of this.ctx.getWebSockets()) {
+			const s = ws.deserializeAttachment() as Session;
+			if (s.token === this.token && !s.table) return false;
+		}
+		const unknown = this.sql.exec("SELECT 1 FROM settings WHERE key = 'unidentifiedLegacy' AND value >= ?", cutoff).toArray();
+		if (unknown.length) return false;
+		const recent = this.sql.exec<{ n: number; old: number }>("SELECT count(*) AS n, count(*) FILTER (WHERE table_client = 0) AS old FROM devices WHERE last_online >= ?", cutoff).one();
+		return recent.n < MAX_DEVICES && recent.old === 0;
+	}
+	private migrationRequested(): boolean {
+		return !!this.sql.exec("SELECT 1 FROM settings WHERE key = 'migrateNow'").toArray().length;
+	}
+	async requestMigration() {
+		if (this.token === null || this.deleted) return { error: "no such vault" };
+		if (!this.migrated) {
+			this.write("INSERT OR REPLACE INTO settings(key,value) VALUES ('migrateNow',1)");
+			for (const ws of this.ctx.getWebSockets()) {
+				const s = ws.deserializeAttachment() as Session;
+				if (s.token === this.token && s.wantsMigration) ws.send(encodeServer({ t: "migrationEligible", ready: true }));
+			}
+		}
+		return { ok: true };
+	}
+
 	// Staging belongs to a connection. Only a complete import at the legacy whole-vault head changes the format.
 	private genesis(ws: WebSocket, session: string, base: number, rows: number): void {
-		if (!this.migrated && base === this.head) {
+		if (!this.migrated && base === this.head && this.migrationEligible()) {
 			const staged = this.sql.exec<{ n: number; last: number }>("SELECT COUNT(*) AS n, COALESCE(MAX(ordinal), 0) AS last FROM attachment_stage WHERE session = ?", session).one();
 			if (staged.n === rows && staged.last === rows && this.genesisVersionsAvailable(session)) {
 				this.ctx.storage.transactionSync(() => {
-					this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) SELECT file, version, pathkey, record, deleted, ordinal FROM attachment_stage WHERE session = ?", session);
+					const now = Date.now();
+					this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) SELECT file, version, pathkey, record, CASE deleted WHEN -1 THEN ? ELSE deleted END, ordinal FROM attachment_stage WHERE session = ?", now, session);
 					this.write(`INSERT INTO versions(tag, expected_chunks, retired_at, deleted)
-						SELECT version, MIN(expected_chunks), CASE WHEN COUNT(*) = COUNT(deleted) THEN MAX(deleted) END, COUNT(*) = COUNT(deleted)
+						SELECT version, MIN(expected_chunks), CASE WHEN COUNT(*) = COUNT(deleted) THEN CASE WHEN MIN(deleted) = -1 THEN ? ELSE MAX(deleted) END END, COUNT(*) = COUNT(deleted)
 						FROM attachment_stage WHERE session = ? GROUP BY version
 						ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, deleted = excluded.deleted,
-						retired_at = CASE WHEN excluded.deleted THEN COALESCE(versions.retired_at, excluded.retired_at) END`, session);
+						retired_at = CASE WHEN excluded.deleted THEN CASE WHEN excluded.retired_at = ? THEN excluded.retired_at
+							ELSE COALESCE(versions.retired_at, excluded.retired_at) END END`, now, session, now);
 					this.write("INSERT INTO settings(key, value) VALUES ('attachmentTable', 1)");
 					this.write("DELETE FROM attachment_stage");
 				});
@@ -639,7 +675,8 @@ export class Vault extends DurableObject<Env> {
 	// Complete the close handshake, or the client waits for it.
 	async webSocketClose(ws: WebSocket, code: number): Promise<void> {
 		// Last online is the Worker's own record of the connection, never the device's word.
-		const { device, table } = ws.deserializeAttachment() as Session;
+		const { device, table, token } = ws.deserializeAttachment() as Session;
+		if (!this.deleted && !this.migrated && token && !device && !table) this.write("INSERT OR REPLACE INTO settings(key,value) VALUES ('unidentifiedLegacy',?)", Date.now());
 		if (table && !this.deleted && !this.migrated) this.write("DELETE FROM attachment_stage WHERE session = ?", table);
 		if (device && !this.deleted) this.write("UPDATE devices SET last_online = ? WHERE id = ?", Date.now(), device);
 		// The last device going: write the counts now, as the object may sleep before the next minute is up.
@@ -700,7 +737,7 @@ export class Vault extends DurableObject<Env> {
 		if (session.device && session.device !== id) return;
 		if (!session.device) ws.serializeAttachment({ ...session, device: id });
 		// An upsert, not a replace: the device's name (sent separately) stays.
-		this.write("INSERT INTO devices (id, last_online, version, conflicts) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_online = excluded.last_online, version = excluded.version, conflicts = excluded.conflicts", id, Date.now(), f.version, f.conflicts);
+		this.write("INSERT INTO devices (id, last_online, version, conflicts, table_client) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_online = excluded.last_online, version = excluded.version, conflicts = excluded.conflicts, table_client = excluded.table_client", id, Date.now(), f.version, f.conflicts, Number(!!session.table));
 		this.write("DELETE FROM devices WHERE id NOT IN (SELECT id FROM devices ORDER BY last_online DESC LIMIT ?)", MAX_DEVICES);
 	}
 
@@ -910,6 +947,7 @@ export class Vault extends DurableObject<Env> {
 			name: this.sql.exec<{ name: string }>("SELECT name FROM vault_name").toArray()[0]?.name ?? "",
 			deleted: this.deleted,
 			settings: this.settings(),
+			migration: this.deleted ? undefined : this.migrated ? "complete" : this.migrationRequested() ? "requested" : "legacy",
 			// Complete snapshots, newest first; history copies only as totals (the Worker doesn't know which device made one).
 			snapshots: this.sql.exec<{ at: number; size: number }>("SELECT at, size FROM snapshots WHERE received = parts ORDER BY day DESC").toArray(),
 			historyCopies: this.sql.exec<{ copies: number; bytes: number }>("SELECT COUNT(*) AS copies, COALESCE(SUM(size), 0) AS bytes FROM history").one(),

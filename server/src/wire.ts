@@ -62,10 +62,11 @@ export type AttachmentAnswer =
 	| { t: "refused"; req: Uint8Array; row: AttachmentRow | null; missing: boolean };
 
 export type ClientFrame =
+	| { t: "migrationCheck" }
 	| { t: "forget"; req: Uint8Array }
 	| AttachmentMutation
 	| { t: "genesis"; base: number; rows: number }
-	| { t: "stageRow"; expectedChunks: number | null; row: AttachmentRow }
+	| { t: "stageRow"; dateAtCommit?: true; expectedChunks: number | null; row: AttachmentRow }
 	| { t: "table" }
 	| { t: "since"; after: number }
 	| { t: "hello"; token: Uint8Array; owner?: Uint8Array }
@@ -83,6 +84,7 @@ export type ClientFrame =
 	| { t: "mark"; id: number; flags: number; tags: Uint8Array[] };
 
 export type ServerFrame =
+	| { t: "migrationEligible"; ready: boolean }
 	| { t: "forgotten"; req: Uint8Array }
 	| AttachmentAnswer
 	| { t: "format"; table: boolean }
@@ -120,8 +122,8 @@ export const TAG_BYTES = 32;
 export const MAX_MARK = 1024;
 export const MARK = { retired: 1, current: 2, last: 4, deleted: 8, start: 16 } as const;
 
-const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13, table: 14, since: 15, set: 16, del: 17, restore: 18, stageRow: 19, genesis: 20, forget: 21 } as const;
-const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedRow: 34, forgotten: 35 } as const;
+const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13, table: 14, since: 15, set: 16, del: 17, restore: 18, stageRow: 19, genesis: 20, forget: 21, migrationCheck: 22 } as const;
+const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedRow: 34, forgotten: 35, migrationEligible: 36 } as const;
 
 /** Legacy messages retain their original limit. A table record has additional fixed fields
  * and at most two fixed-width IDs; the decoder checks the record itself. */
@@ -213,8 +215,9 @@ function rowFrame(type: number, row: AttachmentRow, ...prefix: Uint8Array[]): Ui
 
 export function encodeClient(f: ClientFrame): Uint8Array {
 	switch (f.t) {
-		case "stageRow": return rowFrame(CLIENT.stageRow, f.row, chunkDeclaration(f.expectedChunks));
+		case "stageRow": return rowFrame(CLIENT.stageRow, f.row, Uint8Array.of(Number(!!f.dateAtCommit)), chunkDeclaration(f.expectedChunks));
 		case "genesis": return build(CLIENT.genesis, [8, f.base], [8, f.rows]);
+		case "migrationCheck": return build(CLIENT.migrationCheck);
 		case "forget": return build(CLIENT.forget, id(f.req));
 		case "table": return build(CLIENT.table);
 		case "since": return build(CLIENT.since, [8, f.after]);
@@ -240,8 +243,9 @@ export function encodeClient(f: ClientFrame): Uint8Array {
 export function decodeClient(bytes: Uint8Array): ClientFrame {
 	const r = new Reader(bytes);
 	switch (bytes[0]) {
-		case CLIENT.stageRow: return { t: "stageRow", expectedChunks: r.expectedChunks(), row: readRow(r) };
+		case CLIENT.stageRow: return { t: "stageRow", ...(r.bool() ? { dateAtCommit: true as const } : {}), expectedChunks: r.expectedChunks(), row: readRow(r) };
 		case CLIENT.genesis: return r.end({ t: "genesis", base: r.seq(), rows: r.seq() });
+		case CLIENT.migrationCheck: return r.end({ t: "migrationCheck" });
 		case CLIENT.forget: return r.end({ t: "forget", req: r.take(DOC_TAG_BYTES) });
 		case CLIENT.table: return r.end({ t: "table" });
 		case CLIENT.since: return r.end({ t: "since", after: r.seq() });
@@ -279,6 +283,7 @@ function tags(rest: Uint8Array): Uint8Array[] {
 
 export function encodeServer(f: ServerFrame): Uint8Array {
 	switch (f.t) {
+		case "migrationEligible": return build(SERVER.migrationEligible, [1, Number(f.ready)]);
 		case "forgotten": return build(SERVER.forgotten, id(f.req));
 		case "format": return build(SERVER.format, [1, Number(f.table)]);
 		case "row": return rowFrame(SERVER.row, f.row);
@@ -305,6 +310,7 @@ export function encodeServer(f: ServerFrame): Uint8Array {
 export function decodeServer(bytes: Uint8Array): ServerFrame {
 	const r = new Reader(bytes);
 	switch (bytes[0]) {
+		case SERVER.migrationEligible: return r.end({ t: "migrationEligible", ready: r.bool() });
 		case SERVER.forgotten: return r.end({ t: "forgotten", req: r.take(DOC_TAG_BYTES) });
 		case SERVER.format: return r.end({ t: "format", table: r.bool() });
 		case SERVER.row: return { t: "row", row: readRow(r) };
