@@ -458,8 +458,12 @@ export class Vault extends DurableObject<Env> {
 				this.write("INSERT INTO attachment_stage(session, ordinal, expected_chunks, file, version, pathkey, record, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", session.table, r.seq, f.expectedChunks ?? LEGACY_CHUNKS, r.file, r.version, r.pathkey, r.record, r.deleted);
 				return ws.send(encodeServer({ t: "stagedRow", seq: r.seq }));
 			}
-			if (f.t === "since" || f.t === "set" || f.t === "del" || f.t === "restore") {
+			if (f.t === "forget" || f.t === "since" || f.t === "set" || f.t === "del" || f.t === "restore") {
 				if (!session.table || !this.migrated) return ws.close(CLOSE.badMessage, "attachment table required");
+				if (f.t === "forget") {
+					this.write("DELETE FROM attachment_answers WHERE req = ?", f.req);
+					return ws.send(encodeServer({ t: "forgotten", req: f.req }));
+				}
 				if (f.t === "since") return this.since(ws, session, f.after);
 				return this.changeAttachment(ws, f);
 			}
@@ -558,44 +562,49 @@ export class Vault extends DurableObject<Env> {
 		return counts.owned === expected && counts.stored === expected;
 	}
 
-	// Answers include the sealed row as it was at the time of a refusal. A later edit cannot change a retry's answer.
+	// Keep a success until its device durably records it. A refused request can still apply on retry.
 	private changeAttachment(ws: WebSocket, f: AttachmentMutation): void {
 		const replay = this.sql.exec<{ answer: ArrayBuffer }>("SELECT answer FROM attachment_answers WHERE req = ?", f.req).toArray()[0];
 		if (replay) return ws.send(replay.answer);
 		let changed: AttachmentRow | undefined;
-		const answer = this.ctx.storage.transactionSync(() => {
-			const current = this.sql.exec<StoredAttachment>("SELECT * FROM attachments WHERE file = ?", f.file).toArray()[0];
-			const refused = (r = current, missing = false): AttachmentAnswer => ({ t: "refused", req: f.req, row: r ? attachmentRow(r) : null, missing });
-			const apply = (): AttachmentAnswer => {
-				if (f.t !== "del") {
-					const occupant = this.sql.exec<StoredAttachment>("SELECT * FROM attachments WHERE pathkey = ? AND deleted IS NULL AND file != ?", f.pathkey, f.file).toArray()[0];
-					if (occupant) return refused(occupant);
-				}
-				if ((current?.seq ?? null) !== f.base) return refused();
-				if (f.t === "del" && (!current || current.deleted !== null)) return refused();
-				if (f.t === "restore" && (!current || current.deleted === null)) return refused();
-				const version = f.t === "set" ? f.version : new Uint8Array(current!.version);
-				const sameVersion = !!current && toHex(version) === toHex(current.version);
-				if (f.t === "set" && current?.deleted != null && sameVersion) return refused();
-				if (f.t !== "del" && !this.hasAttachmentChunks(version, f.expectedChunks, sameVersion)) return refused(current, true);
-				const now = Date.now();
-				const seq = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM attachments").one().seq;
-				changed = { seq, file: f.file, version, pathkey: f.t === "del" ? new Uint8Array(current!.pathkey) : f.pathkey,
-					record: f.t === "del" ? new Uint8Array(current!.record) : f.record, deleted: f.t === "del" ? now : null };
-				this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(file) DO UPDATE SET version=excluded.version, pathkey=excluded.pathkey, record=excluded.record, deleted=excluded.deleted, seq=excluded.seq",
-					changed.file, changed.version, changed.pathkey, changed.record, changed.deleted, seq);
-				if (current && current.deleted === null && (f.t === "del" || !sameVersion)) {
-					this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = versions.tag AND deleted IS NULL)", now, Number(f.t === "del"), current.version);
-				}
-				if (f.t !== "del") this.write(`INSERT INTO versions(tag, expected_chunks) VALUES (?, ?)
-					ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, retired_at = NULL, deleted = 0
-					WHERE versions.expected_chunks IS NULL OR versions.retired_at IS NOT NULL`, version, f.expectedChunks ?? LEGACY_CHUNKS);
-				return { t: "ok", req: f.req, seq };
-			};
-			const bytes = encodeServer(apply());
-			this.write("INSERT INTO attachment_answers(req, answer) VALUES (?, ?)", f.req, bytes);
-			return bytes;
-		});
+		const current = this.sql.exec<StoredAttachment>("SELECT * FROM attachments WHERE file = ?", f.file).toArray()[0];
+		const refused = (r = current, missing = false): AttachmentAnswer => ({ t: "refused", req: f.req, row: r ? attachmentRow(r) : null, missing });
+		const apply = (): AttachmentAnswer => {
+			if ((current?.seq ?? null) !== f.base) return refused();
+			if (f.t !== "del") {
+				const occupant = this.sql.exec<StoredAttachment>("SELECT * FROM attachments WHERE pathkey = ? AND deleted IS NULL AND file != ?", f.pathkey, f.file).toArray()[0];
+				if (occupant) return refused(occupant);
+			}
+			if (f.t === "del" && (!current || current.deleted !== null)) return refused();
+			if (f.t === "restore" && (!current || current.deleted === null)) return refused();
+			const version = f.t === "set" ? f.version : new Uint8Array(current!.version);
+			const sameVersion = !!current && toHex(version) === toHex(current.version);
+			if (f.t === "set" && current?.deleted != null && sameVersion) return refused();
+			if (f.t !== "del" && !this.hasAttachmentChunks(version, f.expectedChunks, sameVersion)) return refused(current, true);
+			const now = Date.now();
+			const seq = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM attachments").one().seq;
+			changed = { seq, file: f.file, version, pathkey: f.t === "del" ? new Uint8Array(current!.pathkey) : f.pathkey,
+				record: f.t === "del" ? new Uint8Array(current!.record) : f.record, deleted: f.t === "del" ? now : null };
+			this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(file) DO UPDATE SET version=excluded.version, pathkey=excluded.pathkey, record=excluded.record, deleted=excluded.deleted, seq=excluded.seq",
+				changed.file, changed.version, changed.pathkey, changed.record, changed.deleted, seq);
+			if (current && current.deleted === null && (f.t === "del" || !sameVersion)) {
+				this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = versions.tag AND deleted IS NULL)", now, Number(f.t === "del"), current.version);
+			}
+			if (f.t !== "del") this.write(`INSERT INTO versions(tag, expected_chunks) VALUES (?, ?)
+				ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, retired_at = NULL, deleted = 0
+				WHERE versions.expected_chunks IS NULL OR versions.retired_at IS NOT NULL`, version, f.expectedChunks ?? LEGACY_CHUNKS);
+			return { t: "ok", req: f.req, seq };
+		};
+		let answer: Uint8Array;
+		try {
+			answer = this.ctx.storage.transactionSync(() => {
+				const outcome = apply(), bytes = encodeServer(outcome);
+				if (outcome.t === "ok") this.write("INSERT INTO attachment_answers(req, answer) VALUES (?, ?)", f.req, bytes);
+				return bytes;
+			});
+		} catch {
+			return ws.send(encodeServer(refused(current, true)));
+		}
 		ws.send(answer);
 		if (changed) {
 			this.usage.lastActivity = Date.now();
@@ -973,7 +982,7 @@ export class Vault extends DurableObject<Env> {
 			ws.send(encodeServer({ t: "entry", seq: r.seq, doc: new Uint8Array(r.doc), snapshot: r.snapshot === 1, envelope: new Uint8Array(r.envelope) }));
 		}
 		ws.send(encodeServer({ t: "synced", seq: this.head }));
-		ws.serializeAttachment({ ...session, live: true });
+		ws.serializeAttachment({ ...session, subscribed: true, live: true });
 	}
 }
 

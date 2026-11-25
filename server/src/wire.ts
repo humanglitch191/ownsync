@@ -5,7 +5,7 @@
 // Table-capable peers send table immediately after hello and receive format. A migration stages
 // rows numbered from 1 on that connection and commits genesis(base, rows) at the legacy head.
 // Table versions on the wire are the opaque storage tags used by vput. File and request IDs are
-// length-prefixed. A zero set base means create. stageRow, set and restore prefix the payload with a scoped count or a legacy marker. since/tableMore/tableSynced have their own cursor.
+// 16 bytes each. A zero set base means create. stageRow, set and restore prefix the payload with a scoped count or a legacy marker. since/tableMore/tableSynced have their own cursor.
 //
 // device → Worker
 //   hello      token(32) | owner(32)?          must be first (fetch aside); the Worker keeps only the token's hash.
@@ -62,6 +62,7 @@ export type AttachmentAnswer =
 	| { t: "refused"; req: Uint8Array; row: AttachmentRow | null; missing: boolean };
 
 export type ClientFrame =
+	| { t: "forget"; req: Uint8Array }
 	| AttachmentMutation
 	| { t: "genesis"; base: number; rows: number }
 	| { t: "stageRow"; expectedChunks: number | null; row: AttachmentRow }
@@ -82,6 +83,7 @@ export type ClientFrame =
 	| { t: "mark"; id: number; flags: number; tags: Uint8Array[] };
 
 export type ServerFrame =
+	| { t: "forgotten"; req: Uint8Array }
 	| AttachmentAnswer
 	| { t: "format"; table: boolean }
 	| { t: "row"; row: AttachmentRow }
@@ -118,16 +120,16 @@ export const TAG_BYTES = 32;
 export const MAX_MARK = 1024;
 export const MARK = { retired: 1, current: 2, last: 4, deleted: 8, start: 16 } as const;
 
-const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13, table: 14, since: 15, set: 16, del: 17, restore: 18, stageRow: 19, genesis: 20 } as const;
-const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedRow: 34 } as const;
+const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13, table: 14, since: 15, set: 16, del: 17, restore: 18, stageRow: 19, genesis: 20, forget: 21 } as const;
+const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedRow: 34, forgotten: 35 } as const;
 
 /** Legacy messages retain their original limit. A table record has additional fixed fields
- * and at most two u16-length-prefixed IDs; the decoder checks the record itself. */
+ * and at most two fixed-width IDs; the decoder checks the record itself. */
 export function validClientSize(bytes: Uint8Array): boolean {
 	if (!bytes.length) return false;
 	const type = bytes[0];
 	if (type === CLIENT.set || type === CLIENT.restore || type === CLIENT.stageRow || type === CLIENT.del)
-		return bytes.length <= MAX_ENVELOPE + 1 + 2 * (2 + 0xffff) + 2 * TAG_BYTES + 2 * 8 + 1 + 3;
+		return bytes.length <= MAX_ENVELOPE + 1 + 2 * DOC_TAG_BYTES + 2 * TAG_BYTES + 2 * 8 + 1 + 3;
 	return bytes.length <= MAX_ENVELOPE + 64;
 }
 
@@ -177,11 +179,6 @@ class Reader {
 		if (n > MAX_MARK) throw new RangeError("too many chunks");
 		return n;
 	}
-	key(): Uint8Array {
-		const key = this.take(this.u16());
-		if (!key.length) throw new RangeError("empty identifier");
-		return key;
-	}
 	end<T>(value: T): T {
 		if (this.at !== this.bytes.length) throw new RangeError("trailing bytes");
 		return value;
@@ -194,9 +191,9 @@ class Reader {
 	rest(): Uint8Array { return this.bytes.subarray(this.at); }
 }
 
-function key(value: Uint8Array): [[2, number], Uint8Array] {
-	if (!value.length || value.length > 0xffff) throw new RangeError("invalid identifier length");
-	return [[2, value.length], value];
+function id(value: Uint8Array): Uint8Array {
+	if (value.length !== DOC_TAG_BYTES) throw new RangeError("invalid identifier length");
+	return value;
 }
 
 function chunkDeclaration(n: number | null): Uint8Array {
@@ -206,23 +203,24 @@ function chunkDeclaration(n: number | null): Uint8Array {
 }
 
 function readRow(r: Reader): AttachmentRow {
-	return { file: r.key(), version: r.take(TAG_BYTES), pathkey: r.take(TAG_BYTES),
+	return { file: r.take(DOC_TAG_BYTES), version: r.take(TAG_BYTES), pathkey: r.take(TAG_BYTES),
 		seq: r.seq(), deleted: r.bool() ? r.seq() : null, record: r.record() };
 }
 
 function rowFrame(type: number, row: AttachmentRow, ...prefix: Uint8Array[]): Uint8Array {
-	return build(type, ...prefix, ...key(row.file), row.version, row.pathkey, [8, row.seq], [1, Number(row.deleted !== null)], ...(row.deleted === null ? [] : [[8, row.deleted] as [8, number]]), row.record);
+	return build(type, ...prefix, id(row.file), row.version, row.pathkey, [8, row.seq], [1, Number(row.deleted !== null)], ...(row.deleted === null ? [] : [[8, row.deleted] as [8, number]]), row.record);
 }
 
 export function encodeClient(f: ClientFrame): Uint8Array {
 	switch (f.t) {
 		case "stageRow": return rowFrame(CLIENT.stageRow, f.row, chunkDeclaration(f.expectedChunks));
 		case "genesis": return build(CLIENT.genesis, [8, f.base], [8, f.rows]);
+		case "forget": return build(CLIENT.forget, id(f.req));
 		case "table": return build(CLIENT.table);
 		case "since": return build(CLIENT.since, [8, f.after]);
-		case "set": return build(CLIENT.set, chunkDeclaration(f.expectedChunks), ...key(f.req), ...key(f.file), [8, f.base ?? 0], f.version, f.pathkey, f.record);
-		case "del": return build(CLIENT.del, ...key(f.req), ...key(f.file), [8, f.base]);
-		case "restore": return build(CLIENT.restore, chunkDeclaration(f.expectedChunks), ...key(f.req), ...key(f.file), [8, f.base], f.pathkey, f.record);
+		case "set": return build(CLIENT.set, chunkDeclaration(f.expectedChunks), id(f.req), id(f.file), [8, f.base ?? 0], f.version, f.pathkey, f.record);
+		case "del": return build(CLIENT.del, id(f.req), id(f.file), [8, f.base]);
+		case "restore": return build(CLIENT.restore, chunkDeclaration(f.expectedChunks), id(f.req), id(f.file), [8, f.base], f.pathkey, f.record);
 		case "hello": return f.owner ? build(CLIENT.hello, f.token, f.owner) : build(CLIENT.hello, f.token);
 		case "subscribe": return build(CLIENT.subscribe, [8, f.after]);
 		case "publish": return build(CLIENT.publish, [4, f.id], f.doc, f.envelope);
@@ -244,11 +242,12 @@ export function decodeClient(bytes: Uint8Array): ClientFrame {
 	switch (bytes[0]) {
 		case CLIENT.stageRow: return { t: "stageRow", expectedChunks: r.expectedChunks(), row: readRow(r) };
 		case CLIENT.genesis: return r.end({ t: "genesis", base: r.seq(), rows: r.seq() });
+		case CLIENT.forget: return r.end({ t: "forget", req: r.take(DOC_TAG_BYTES) });
 		case CLIENT.table: return r.end({ t: "table" });
 		case CLIENT.since: return r.end({ t: "since", after: r.seq() });
-		case CLIENT.set: return { t: "set", expectedChunks: r.expectedChunks(), req: r.key(), file: r.key(), base: r.seq() || null, version: r.take(TAG_BYTES), pathkey: r.take(TAG_BYTES), record: r.record() };
-		case CLIENT.del: return r.end({ t: "del", req: r.key(), file: r.key(), base: r.seq() });
-		case CLIENT.restore: return { t: "restore", expectedChunks: r.expectedChunks(), req: r.key(), file: r.key(), base: r.seq(), pathkey: r.take(TAG_BYTES), record: r.record() };
+		case CLIENT.set: return { t: "set", expectedChunks: r.expectedChunks(), req: r.take(DOC_TAG_BYTES), file: r.take(DOC_TAG_BYTES), base: r.seq() || null, version: r.take(TAG_BYTES), pathkey: r.take(TAG_BYTES), record: r.record() };
+		case CLIENT.del: return r.end({ t: "del", req: r.take(DOC_TAG_BYTES), file: r.take(DOC_TAG_BYTES), base: r.seq() });
+		case CLIENT.restore: return { t: "restore", expectedChunks: r.expectedChunks(), req: r.take(DOC_TAG_BYTES), file: r.take(DOC_TAG_BYTES), base: r.seq(), pathkey: r.take(TAG_BYTES), record: r.record() };
 		case CLIENT.hello: {
 			const token = r.take(32), owner = r.rest();
 			return owner.length ? { t: "hello", token, owner } : { t: "hello", token };
@@ -280,12 +279,13 @@ function tags(rest: Uint8Array): Uint8Array[] {
 
 export function encodeServer(f: ServerFrame): Uint8Array {
 	switch (f.t) {
+		case "forgotten": return build(SERVER.forgotten, id(f.req));
 		case "format": return build(SERVER.format, [1, Number(f.table)]);
 		case "row": return rowFrame(SERVER.row, f.row);
 		case "tableMore": case "tableSynced": case "stagedRow": return build(SERVER[f.t], [8, f.seq]);
-		case "ok": return build(SERVER.ok, ...key(f.req), [8, f.seq]);
+		case "ok": return build(SERVER.ok, id(f.req), [8, f.seq]);
 		case "refused": {
-			const header = build(SERVER.refused, ...key(f.req), [1, Number(f.missing)]);
+			const header = build(SERVER.refused, id(f.req), [1, Number(f.missing)]);
 			return f.row ? rowFrame(SERVER.refused, f.row, header.subarray(1)) : header;
 		}
 		case "entry": return build(SERVER.entry, [8, f.seq], f.doc, [1, f.snapshot ? 1 : 0], f.envelope);
@@ -305,13 +305,14 @@ export function encodeServer(f: ServerFrame): Uint8Array {
 export function decodeServer(bytes: Uint8Array): ServerFrame {
 	const r = new Reader(bytes);
 	switch (bytes[0]) {
+		case SERVER.forgotten: return r.end({ t: "forgotten", req: r.take(DOC_TAG_BYTES) });
 		case SERVER.format: return r.end({ t: "format", table: r.bool() });
 		case SERVER.row: return { t: "row", row: readRow(r) };
 		case SERVER.stagedRow: return r.end({ t: "stagedRow", seq: r.seq() });
 		case SERVER.tableMore: case SERVER.tableSynced: return r.end({ t: bytes[0] === SERVER.tableMore ? "tableMore" : "tableSynced", seq: r.seq() });
-		case SERVER.ok: return r.end({ t: "ok", req: r.key(), seq: r.seq() });
+		case SERVER.ok: return r.end({ t: "ok", req: r.take(DOC_TAG_BYTES), seq: r.seq() });
 		case SERVER.refused: {
-			const req = r.key(), missing = r.bool();
+			const req = r.take(DOC_TAG_BYTES), missing = r.bool();
 			return { t: "refused", req, missing, row: r.rest().length ? readRow(r) : null };
 		}
 		case SERVER.entry: return { t: "entry", seq: r.u64(), doc: r.take(DOC_TAG_BYTES), snapshot: r.u8() === 1, envelope: r.rest() };

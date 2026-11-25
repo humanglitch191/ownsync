@@ -110,6 +110,8 @@ test("every frame survives encoding and decoding", () => {
 		{ t: "put", name: name(6), envelope: bytes("c") }, { t: "get", name: name(7) }, { t: "status", id: Uint8Array.of(1, 2, 3, 4), conflicts: 3, version: "0.1.0-beta" },
 		{ t: "vput", tag: name(8), name: name(9), envelope: bytes("v") }, { t: "mark", id: 3, flags: 9, tags: [name(10), name(11)] }, { t: "mark", id: 4, flags: 6, tags: [] },
 	];
+	assert.throws(() => encodeClient({ t: "del", req: doc(1).slice(1), file: doc(2), base: 1 }), RangeError);
+	assert.throws(() => encodeClient({ t: "del", req: doc(1), file: name(2), base: 1 }), RangeError);
 	for (const f of client) assert.deepEqual(decodeClient(encodeClient(f)), f);
 	const server: ServerFrame[] = [
 		{ t: "format", table: true }, { t: "row", row }, { t: "stagedRow", seq: 1 }, { t: "tableMore", seq: row.seq }, { t: "tableSynced", seq: row.seq },
@@ -994,6 +996,10 @@ test("table CAS includes renames, replays exact answers and distinguishes restor
 		const change = async (f: ClientFrame) => { a.send(f); return a.next(); };
 		const set = { t: "set", expectedChunks: 1, req: doc(1), file: doc(3), base: null, version: name(10), pathkey: name(4), record: bytes("original") } as const;
 		const ok = (req: number, seq: number) => ({ t: "ok", req: doc(req), seq });
+		db.exec("CREATE TRIGGER fail_answer BEFORE INSERT ON attachment_answers BEGIN SELECT RAISE(ABORT, 'storage full'); END");
+		assert.deepEqual(await change(set), { t: "refused", missing: true, row: null, req: set.req });
+		assert.equal(db.prepare("SELECT 1 FROM attachments").get(), undefined);
+		db.exec("DROP TRIGGER fail_answer");
 		assert.deepEqual(await change(set), ok(1, 1));
 		const rename = { ...set, req: doc(2), base: 1, pathkey: name(5), record: bytes("renamed") };
 		assert.deepEqual(await change(rename), ok(2, 2));
@@ -1007,9 +1013,14 @@ test("table CAS includes renames, replays exact answers and distinguishes restor
 		const restore = { t: "restore", expectedChunks: 1, req: doc(6), file: set.file, base: 3, pathkey: rename.pathkey, record: rename.record } as const;
 		assert.deepEqual(await change(restore), ok(6, 4));
 		assert.deepEqual(await change(del), ok(5, 3));
-		assert.deepEqual(await change(stale), refusal);
+		assert.deepEqual(await change(stale), { ...refusal, row: { ...row, seq: 4 } });
 		assert.deepEqual(await change(set), ok(1, 1));
 		assert.deepEqual(await change({ ...del, req: doc(7) }), { ...refusal, req: doc(7), row: { ...row, seq: 4 } });
+		assert.deepEqual(await change({ t: "forget", req: set.req }), { t: "forgotten", req: set.req });
+		assert.equal(db.prepare("SELECT 1 FROM attachment_answers WHERE req = ?").get(set.req), undefined);
+		assert.equal(db.prepare("SELECT 1 FROM attachment_answers WHERE req = ?").get(stale.req), undefined);
+		assert.equal((await change(set)).t, "refused");
+		assert.deepEqual(await change({ ...set, req: doc(19), file: doc(20), base: 1, pathkey: rename.pathkey }), { t: "refused", req: doc(19), missing: false, row: null });
 		const vb = db.prepare("SELECT retired_at FROM versions WHERE tag = ?");
 		assert.equal(vb.get(set.version)!.retired_at, null);
 		assert.deepEqual(await change({ ...del, req: doc(8), base: 4 }), ok(8, 5));
@@ -1034,8 +1045,7 @@ test("table CAS includes renames, replays exact answers and distinguishes restor
 		assert.equal(noChunk.t === "refused" && noChunk.missing, true);
 		a.send({ t: "vput", tag: name(12), name: name(22), envelope: bytes("chunk") });
 		await a.next();
-		assert.deepEqual(await change(missing), noChunk);
-		assert.deepEqual(await change({ ...missing, req: doc(11) }), ok(11, 7));
+		assert.deepEqual(await change(missing), ok(10, 7));
 		assert.deepEqual(await change({ ...del, req: doc(12), base: 7 }), ok(12, 8));
 		db.prepare("UPDATE versions SET retired_at = ? WHERE tag = ?").run(at, name(12));
 		assert.deepEqual(await cleanupPost(v, { ranges: [[at, at + 1]], zone: "UTC", months: 1 }), { removed: 1, more: false });
@@ -1055,8 +1065,7 @@ test("scoped declarations distinguish partial uploads, complete uploads and empt
 		const refused = { t: "refused", req: set.req, row: null, missing: true };
 		assert.deepEqual(await send(set), refused);
 		assert.deepEqual(await send({ t: "vput", tag: set.version, name: name(2), envelope: bytes("b") }), { t: "stored", name: name(2) });
-		assert.deepEqual(await send(set), refused);
-		assert.deepEqual(await send({ ...set, req: doc(2) }), { t: "ok", req: doc(2), seq: 1 });
+		assert.deepEqual(await send(set), { t: "ok", req: doc(1), seq: 1 });
 		assert.deepEqual(await send({ t: "vput", tag: set.version, name: name(3), envelope: bytes("extra") }), { t: "missing", name: name(3) });
 		assert.deepEqual(await send({ ...set, req: doc(3), base: 1, version: name(5), expectedChunks: 0 }), { t: "ok", req: doc(3), seq: 2 });
 		const unscoped = await send({ ...set, req: doc(4), base: 2, expectedChunks: null, version: name(6) });
@@ -1111,11 +1120,12 @@ test("table paging resumes after the last row even when the reader changes a row
 	try {
 		peer.send({ t: "genesis", base: 0, rows: 0 }); await peer.next();
 		const ins = db.prepare("INSERT INTO attachments(file, version, pathkey, record, seq) VALUES (?, ?, ?, ?, ?)");
+		const key = (i: number) => { const id = doc(0); new DataView(id.buffer).setUint32(0, i); return id; };
 		const count = 402;
 		for (let i = 1; i <= count; i++) {
 			const pathkey = name(0);
 			new DataView(pathkey.buffer).setUint32(0, i);
-			ins.run(bytes(String(i)), name(1), pathkey, bytes("sealed"), i);
+			ins.run(key(i), name(1), pathkey, bytes("sealed"), i);
 		}
 		peer.send({ t: "since", after: 0 });
 		let last = 0;
@@ -1124,7 +1134,7 @@ test("table paging resumes after the last row even when the reader changes a row
 			if (f.t === "tableMore") { assert.equal(f.seq, last); break; }
 			assert.equal(f.t, "row"); if (f.t === "row") assert.equal(f.row.seq, ++last);
 		}
-		peer.send({ t: "del", req: doc(2), file: bytes("1"), base: 1 });
+		peer.send({ t: "del", req: doc(2), file: key(1), base: 1 });
 		assert.deepEqual(await peer.next(), { t: "ok", req: doc(2), seq: count + 1 });
 		peer.send({ t: "since", after: last });
 		for (let i = last + 1; i <= count + 1; i++) {
@@ -1132,7 +1142,7 @@ test("table paging resumes after the last row even when the reader changes a row
 			assert.equal(f.t === "row" && f.row.seq, i);
 		}
 		assert.deepEqual(await peer.next(), { t: "tableSynced", seq: count + 1 });
-		peer.send({ t: "del", req: doc(3), file: bytes("2"), base: 2 });
+		peer.send({ t: "del", req: doc(3), file: key(2), base: 2 });
 		assert.deepEqual(await peer.next(), { t: "ok", req: doc(3), seq: count + 2 });
 		const live = await peer.next();
 		assert.equal(live.t === "row" && live.row.seq, count + 2);
