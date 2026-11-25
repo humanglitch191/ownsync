@@ -222,3 +222,34 @@ test("genesis waits for a stored text entry even when the legacy index already c
 		projection.requireStoredNotes(new Set([id(1)]));
 	} finally { projection.close(); }
 });
+
+test("the device reports an over-budget estimate and sends no staged parts or commit", async t => {
+	const { importGenesis } = await import("../src/genesis");
+	const { decodeClient, encodeServer, genesisWrites } = await import("../../server/src/wire");
+	type Frame = import("../../server/src/wire").ServerFrame;
+	const sent: string[] = [];
+	class Socket {
+		onopen?: () => void;
+		onmessage?: (e: { data: ArrayBufferLike }) => void;
+		constructor() { queueMicrotask(() => this.onopen?.()); }
+		reply(f: Frame) { queueMicrotask(() => this.onmessage?.({ data: encodeServer(f).buffer })); }
+		send(packet: Uint8Array) {
+			const f = decodeClient(packet); sent.push(f.t);
+			if (f.t === "table") this.reply({t:"format", table:false});
+			if (f.t === "subscribe") this.reply({t:"synced",seq:0});
+			if (f.t === "migrationEstimate") {
+				assert.equal(f.writes, genesisWrites(0,0,0));
+				this.reply({t:"migrationBudget", allowed:false});
+			}
+		}
+		close() {}
+	}
+	const original = globalThis.WebSocket;
+	globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+	t.after(() => { globalThis.WebSocket = original; });
+	const keys = { epoch:0, vmk:key, vmks:[key], vaultId:key.slice(0,16), state:{}, token:async () => key };
+	const result = await new Promise<unknown>(resolve => importGenesis("ws://localhost",keys as never,
+		{ nameKey:async () => key } as never, (_,err) => resolve(err)));
+	assert.match(String(result),/needs 2 row writes.*remaining Free plan budget today.*legacy sync.*paid plan has no daily row-write limit/);
+	assert.deepEqual(sent,["hello","table","subscribe","subscribe","migrationEstimate"]);
+});

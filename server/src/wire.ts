@@ -65,6 +65,7 @@ export type AttachmentAnswer =
 
 export type ClientFrame =
 	| { t: "migrationCheck" }
+	| { t: "migrationEstimate"; writes: number }
 	| { t: "forget"; req: Uint8Array }
 	| AttachmentMutation
 	| { t: "stagePart"; part: number; data: Uint8Array }
@@ -91,6 +92,7 @@ export type ServerFrame =
 	| { t: "forgotten"; req: Uint8Array }
 	| AttachmentAnswer
 	| { t: "format"; table: boolean }
+	| { t: "migrationBudget"; allowed: boolean }
 	| { t: "migrationWriteFailed" }
 	| { t: "migrationFailed"; reason: string }
 	| { t: "row"; row: AttachmentRow }
@@ -127,8 +129,8 @@ export const TAG_BYTES = 32;
 export const MAX_MARK = 1024;
 export const MARK = { retired: 1, current: 2, last: 4, deleted: 8, start: 16 } as const;
 
-const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13, table: 14, since: 15, set: 16, del: 17, restore: 18, stageRow: 19, genesis: 20, forget: 21, migrationCheck: 22, stagePart: 23 } as const;
-const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedPart: 34, forgotten: 35, migrationEligible: 36, migrationWriteFailed: 37, migrationFailed: 38 } as const;
+const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13, table: 14, since: 15, set: 16, del: 17, restore: 18, stageRow: 19, genesis: 20, forget: 21, migrationCheck: 22, stagePart: 23, migrationEstimate: 24 } as const;
+const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedPart: 34, forgotten: 35, migrationEligible: 36, migrationWriteFailed: 37, migrationFailed: 38, migrationBudget: 39 } as const;
 
 /** Legacy messages retain their original limit. A table record has additional fixed fields
  * and at most two fixed-width IDs; the decoder checks the record itself. */
@@ -230,6 +232,7 @@ export function encodeClient(f: ClientFrame): Uint8Array {
 		case "stagePart": return build(CLIENT.stagePart, [8, f.part], f.data);
 		case "stageRow": return rowFrame(CLIENT.stageRow, f.row, Uint8Array.of(Number(!!f.dateAtCommit)), chunkDeclaration(f.expectedChunks));
 		case "genesis": return build(CLIENT.genesis, [8, f.base], [8, f.rows]);
+		case "migrationEstimate": return build(CLIENT.migrationEstimate, [8, f.writes]);
 		case "migrationCheck": return build(CLIENT.migrationCheck);
 		case "forget": return build(CLIENT.forget, id(f.req));
 		case "table": return build(CLIENT.table);
@@ -263,6 +266,7 @@ export function decodeClient(bytes: Uint8Array): ClientFrame {
 		}
 		case CLIENT.stageRow: return { t: "stageRow", ...(r.bool() ? { dateAtCommit: true as const } : {}), expectedChunks: r.expectedChunks(), row: readRow(r) };
 		case CLIENT.genesis: return r.end({ t: "genesis", base: r.seq(), rows: r.seq() });
+		case CLIENT.migrationEstimate: return r.end({ t: "migrationEstimate", writes: r.seq() });
 		case CLIENT.migrationCheck: return r.end({ t: "migrationCheck" });
 		case CLIENT.forget: return r.end({ t: "forget", req: r.take(DOC_TAG_BYTES) });
 		case CLIENT.table: return r.end({ t: "table" });
@@ -306,6 +310,7 @@ function tags(rest: Uint8Array): Uint8Array[] {
 
 export function encodeServer(f: ServerFrame): Uint8Array {
 	switch (f.t) {
+		case "migrationBudget": return build(SERVER.migrationBudget, [1, Number(f.allowed)]);
 		case "migrationFailed": return build(SERVER.migrationFailed, new TextEncoder().encode(f.reason));
 		case "migrationWriteFailed": return build(SERVER.migrationWriteFailed);
 		case "migrationEligible": return build(SERVER.migrationEligible, [1, Number(f.ready)]);
@@ -335,6 +340,7 @@ export function encodeServer(f: ServerFrame): Uint8Array {
 export function decodeServer(bytes: Uint8Array): ServerFrame {
 	const r = new Reader(bytes);
 	switch (bytes[0]) {
+		case SERVER.migrationBudget: return r.end({ t: "migrationBudget", allowed: r.bool() });
 		case SERVER.migrationFailed: return { t: "migrationFailed", reason: new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(r.rest()) };
 		case SERVER.migrationWriteFailed: return r.end({ t: "migrationWriteFailed" });
 		case SERVER.migrationEligible: return r.end({ t: "migrationEligible", ready: r.bool() });
@@ -368,6 +374,21 @@ export function decodeServer(bytes: Uint8Array): ServerFrame {
 // can cross part boundaries. Keep at most one part and one decoded row in memory.
 export const GENESIS_PART_BYTES = 1024 * 1024;
 type StageRow = Extract<ClientFrame, { t: "stageRow" }>;
+
+export function genesisWrites(live: number, deleted: number, parts: number) {
+	return 3 * live + 2 * deleted + 2 * parts + 2;
+}
+
+// The dry pass retains one sealed row. A second pass over the same immutable
+// projection produces fresh ciphertext of identical length when staging is granted.
+export async function estimateGenesis(rows: AsyncIterable<StageRow> | Iterable<StageRow>) {
+	let live = 0, deleted = 0, bytes = 0;
+	for await (const frame of rows) {
+		if (frame.dateAtCommit || frame.row.deleted !== null) deleted++; else live++;
+		bytes += Uint32Array.BYTES_PER_ELEMENT + encodeClient(frame).length;
+	}
+	return genesisWrites(live, deleted, Math.ceil(bytes / GENESIS_PART_BYTES));
+}
 
 export async function* packGenesis(rows: AsyncIterable<StageRow> | Iterable<StageRow>) {
 	let part = new Uint8Array(GENESIS_PART_BYTES), used = 0;

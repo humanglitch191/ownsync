@@ -28,6 +28,7 @@ export interface VaultStats {
 	deleted: boolean;
 	devices: { id: string; name: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
 	settings: VaultSettings;
+	migrationNeedsWrites?: number;
 	migration?: "legacy" | "requested" | "complete" | "failedToday";
 	/** Complete vault snapshots, newest first: when the last part arrived, and their size. */
 	snapshots: { at: number; size: number }[];
@@ -463,7 +464,7 @@ export class Dashboard {
 				bytes: v.stats!.bytes,
 				lastActivity: v.stats!.lastActivity,
 				conflicts: Math.max(0, ...v.stats!.devices.map((d) => d.conflicts)),
-				settings: v.stats!.settings, migration: v.stats!.migration,
+				settings: v.stats!.settings, migration: v.stats!.migration, migrationNeedsWrites: v.stats!.migrationNeedsWrites,
 				snapshots: v.stats!.snapshots ?? [],
 				historyCopies: v.stats!.historyCopies ?? { copies: 0, bytes: 0 },
 				devices: v.stats!.devices.map((d) => ({ ...d, label: labels.get(`${v.id}/${d.id}`) ?? "", behind: !!newest && d.version !== newest && d.version.localeCompare(newest, undefined, { numeric: true }) < 0, lost: !d.online && now - d.lastOnline > LOST_AFTER_MS })),

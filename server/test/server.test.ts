@@ -7,8 +7,8 @@ import { request } from "node:http";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SNAPSHOT_BUDGET, snapshotsToPrune } from "../src/snapshots.ts";
-import { CLOSE, GENESIS_PART_BYTES, packGenesis, unpackGenesis, type ClientFrame, type ServerFrame, decodeClient, decodeServer, encodeClient, encodeServer } from "../src/wire.ts";
-import { type Stats, claim, migrateNow, startDev, stats } from "./devServer.ts";
+import { CLOSE, GENESIS_PART_BYTES, estimateGenesis, genesisWrites, packGenesis, unpackGenesis, type ClientFrame, type ServerFrame, decodeClient, decodeServer, encodeClient, encodeServer } from "../src/wire.ts";
+import { type Stats, claim, ownerOverview, migrateNow, startDev, stats } from "./devServer.ts";
 
 const dev = await startDev();
 after(() => dev.stop());
@@ -950,6 +950,12 @@ async function tablePeer(v: string, tok: Uint8Array, migrated: boolean) {
 	return peer;
 }
 
+async function budget(peer: Awaited<ReturnType<typeof tablePeer>>, writes: number) {
+	peer.send({ t: "migrationEstimate", writes });
+	const answer = await peer.next();
+	assert.deepEqual(answer,{ t:"migrationBudget", allowed:true });
+}
+
 // A single-row part for fixtures that stage rows individually.
 async function onePart(f: Extract<ClientFrame, {t: "stageRow"}>): Promise<ClientFrame> {
 	const [data] = await Array.fromAsync(packGenesis([f]));
@@ -961,6 +967,7 @@ test("packed genesis streams across frame and length boundaries", async () => {
 	const frames = [1, 2].map(seq => ({ t: "stageRow" as const, expectedChunks: null, row: { ...row, seq } }));
 	const parts = await Array.fromAsync(packGenesis(frames));
 	assert.equal(parts.length, 3);
+	assert.equal(await estimateGenesis([frames[0]!, {...frames[1]!, dateAtCommit: true}]), genesisWrites(1,1,parts.length));
 	assert.ok(parts.every(p => p.length <= GENESIS_PART_BYTES));
 	assert.deepEqual([...unpackGenesis([parts[0]!.slice(0, 1), parts[0]!.slice(1), ...parts.slice(1)])], frames);
 	assert.throws(() => [...unpackGenesis(parts.slice(0, -1))], /truncated/);
@@ -968,7 +975,8 @@ test("packed genesis streams across frame and length boundaries", async () => {
 
 test("packed genesis pays only for parts, the format flag and required note indexes", async () => {
 	for (const deleted of [null, 1]) {
-		const v = vault(), a = await tablePeer(v, token(), false), count = 20000;
+		const v = vault(), tok = token(), a = await tablePeer(v,tok,false), count = 20000;
+		const host = `http://localhost:${PORT}`;
 		try {
 			const rows = function* () {
 				for (let seq = 1; seq <= count; seq++) {
@@ -979,8 +987,9 @@ test("packed genesis pays only for parts, the format flag and required note inde
 					yield { t: "stageRow" as const, expectedChunks: null, row };
 				}
 			};
-			await migrateNow(`http://localhost:${PORT}`, v);
-			const writes = async () => (await stats(`http://localhost:${PORT}`, v)).rowsWrittenToday;
+			await migrateNow(host,v);
+			const writes = async () => (await stats(host,v)).rowsWrittenToday;
+			const estimate = await estimateGenesis(rows()); await budget(a,estimate);
 			const before = await writes();
 			let part = 0;
 			for await (const data of packGenesis(rows())) {
@@ -990,9 +999,37 @@ test("packed genesis pays only for parts, the format flag and required note inde
 			a.send({ t: "genesis", base: 0, rows: count });
 			assert.deepEqual(await a.next(), { t: "format", table: true });
 			assert.equal(part, 4);
-			assert.equal(await writes() - before, count * (deleted ? 2 : 3) + 2 * part + 2);
-		} finally { a.ws.close(); }
+			assert.equal(await writes() - before, estimate);
+			assert.equal(estimate, count * (deleted ? 2 : 3) + 2 * part + 2);
+		} finally {
+			a.ws.close();
+			// Tear down the measured vault so the next independent measurement
+			// has room under the dashboard's shared Free plan allowance.
+			assert.ok((await fetch(host + "/vault/" + v + "/delete",{method:"POST",body:tok})).ok);
+		}
 	}
+});
+
+test("migration budget subtracts writes already used and a refusal stages nothing", async () => {
+	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+	const a = await tablePeer(v,tok,false);
+	try {
+		const host = `http://localhost:${PORT}`, other = await connect(vault(),token());
+		try {
+			await other.catchUp(0);
+			const overview = await ownerOverview(host);
+			const needed = overview.limits.rowsWrittenPerDay - overview.usage.rowsWrittenToday;
+			await budget(a,needed); // exactly fits
+			await other.publish(doc(1),"another vault spends from the same daily allowance");
+			a.send({ t: "migrationEstimate", writes: needed });
+			assert.deepEqual(await a.next(),{ t:"migrationBudget", allowed:false });
+			assert.equal((await ownerOverview(host)).vaults.find(row => row.id === v)?.migrationNeedsWrites,needed);
+		} finally { other.ws.close(); }
+		a.send({ t: "stagePart", part: 1, data: Uint8Array.of(0) });
+		assert.deepEqual(await a.next(),{ t: "migrationFailed", reason: "migration estimate required before staging" });
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM genesis_parts").get()!.n,0);
+		assert.equal(await legacy.publish(doc(1),"still on legacy sync"),1);
+	} finally { db.close(); a.ws.close(); legacy.ws.close(); }
 });
 
 test("a failed genesis write leaves legacy sync active and exposes no partial table", async () => {
@@ -1006,8 +1043,10 @@ test("a failed genesis write leaves legacy sync active and exposes no partial ta
 		const [data] = await Array.fromAsync(packGenesis(frames));
 		const part = { t: "stagePart" as const, part: 1, data: data! };
 		db.exec("CREATE TRIGGER no_stage BEFORE INSERT ON genesis_parts BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
+		await budget(a,genesisWrites(2,0,1));
 		a.send(part); assert.deepEqual(await a.next(), { t: "migrationWriteFailed" });
 		db.exec("DROP TRIGGER no_stage");
+		await budget(a,genesisWrites(2,0,1));
 		a.send(part); assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
 		db.exec("CREATE TRIGGER no_commit BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
 		a.send({ t: "genesis", base: 0, rows: 2 });
@@ -1017,8 +1056,10 @@ test("a failed genesis write leaves legacy sync active and exposes no partial ta
 		assert.equal((await (await fetch(`http://localhost:${PORT}/test-stats/${v}`)).json()).migration, "failedToday");
 		assert.equal(await legacy.publish(doc(3), "still legacy"), 1);
 		db.exec("DROP TRIGGER no_commit");
+		await budget(a,genesisWrites(2,0,1));
 		a.send({ t: "genesis", base: 0, rows: 2 });
 		assert.deepEqual(await a.next(), { t: "format", table: false });
+		await budget(a,genesisWrites(2,0,1));
 		a.send(part); assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
 		a.send({ t: "genesis", base: 1, rows: 2 });
 		assert.deepEqual(await a.next(), { t: "format", table: true });
@@ -1032,7 +1073,7 @@ test("a returning connection reclaims abandoned genesis parts and preserves a li
 	try {
 		await migrateNow(`http://localhost:${PORT}`,v);
 		const frame = { t: "stagePart" as const, part: 1, data: Uint8Array.of(0) };
-		for (const peer of [a,b]) { peer.send(frame); assert.equal((await peer.next()).t,"stagedPart"); }
+		for (const peer of [a,b]) { await budget(peer,genesisWrites(1,0,1)); peer.send(frame); assert.equal((await peer.next()).t,"stagedPart"); }
 		db.exec("CREATE TRIGGER no_delete BEFORE DELETE ON genesis_parts BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
 		a.send({ t: "genesis", base: 0, rows: 1 });
 		assert.deepEqual(await a.next(),{ t: "migrationFailed", reason: "invalid staged migration data" });
@@ -1056,6 +1097,7 @@ test("genesis checks the legacy head and complete row count, switches once and c
 	const row = { file: doc(1), version: name(2), pathkey: name(3), record: bytes("sealed"), deleted: null, seq: 1 };
 	try {
 		const stage = async () => {
+			await budget(a,genesisWrites(1,0,1));
 			a.send(await onePart({ t: "stageRow", expectedChunks: null, row }));
 			assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
 		};
@@ -1070,6 +1112,7 @@ test("genesis checks the legacy head and complete row count, switches once and c
 		const base = await legacy.publish(doc(8), "a note changed");
 		a.send({ t: "genesis", base: 0, rows: 1 });
 		assert.deepEqual(await a.next(), { t: "format", table: false });
+		await budget(a,genesisWrites(1,0,1));
 		a.send({ t: "genesis", base, rows: 1 });
 		assert.deepEqual(await a.next(), { t: "migrationFailed", reason: "incomplete genesis" });
 		await stage();
@@ -1098,6 +1141,7 @@ test("notes share path CAS and keep text across deletion, replay and restore", a
 	try {
 		const head = await legacy.publish(doc(22), "original Yjs state");
 		await migrateNow(`http://localhost:${PORT}`, v);
+		await budget(a,genesisWrites(1,1,2));
 		for (const row of [note, deleted])
 			assert.deepEqual(await send(await onePart({ t: "stageRow", expectedChunks: null, row })), { t: "stagedPart", seq: row.seq });
 		assert.deepEqual(await send({ t: "genesis", base: head, rows: 2 }), { t: "format", table: true });
@@ -1157,6 +1201,7 @@ test("genesis waits for a recently disconnected legacy device to upgrade or age 
 			if (upgrade) a.send({ t: "status", id, version: "updated", conflicts: 0 });
 			else db.exec("UPDATE devices SET last_online = 0");
 			assert.deepEqual(await eligible(), { t: "migrationEligible", ready: true });
+			await budget(a,genesisWrites(0,0,0));
 			a.send({ t: "genesis", base: 0, rows: 0 });
 			assert.deepEqual(await a.next(), { t: "format", table: true });
 		} finally { a.ws.close(); legacy.ws.close(); db.close(); }
@@ -1168,6 +1213,7 @@ test("table CAS includes renames, replays exact answers and distinguishes restor
 	const a = await tablePeer(v, tok, false);
 	try {
 		await migrateNow(`http://localhost:${PORT}`, v);
+		await budget(a,genesisWrites(0,0,0));
 		a.send({ t: "genesis", base: 0, rows: 0 });
 		assert.deepEqual(await a.next(), { t: "format", table: true });
 		assert.equal(await legacy.closed, CLOSE.updateNeeded);
@@ -1242,6 +1288,7 @@ test("scoped declarations distinguish partial uploads, complete uploads and empt
 	const send = async (f: ClientFrame) => { peer.send(f); return peer.next(); };
 	const set = { t: "set", req: doc(1), file: doc(2), base: null, version: name(3), pathkey: name(4), expectedChunks: 2, record: bytes("sealed") } as const;
 	try {
+		await budget(peer,genesisWrites(0,0,0));
 		await send({ t: "genesis", base: 0, rows: 0 });
 		assert.deepEqual(await send({ t: "vput", tag: set.version, name: name(1), envelope: bytes("a") }), { t: "stored", name: name(1) });
 		const refused = { t: "refused", req: set.req, row: null, missing: true };
@@ -1264,6 +1311,7 @@ test("genesis checks scoped live versions, preserves cleaned tombstones, and gra
 	const past = Date.UTC(new Date().getUTCFullYear() - 1, 0, 1);
 	const tombstone = { ...scoped, file: doc(7), version: name(8), pathkey: name(9), seq: 3, deleted: past };
 	const stage = async () => {
+		await budget(peer,genesisWrites(2,2,4));
 		for (const [row, expectedChunks] of [[scoped, 2], [legacy, null], [tombstone, 1]] as const) {
 			assert.deepEqual(await send(await onePart({ t: "stageRow", row, expectedChunks })), { t: "stagedPart", seq: row.seq });
 		}
@@ -1308,6 +1356,7 @@ test("table paging resumes after the last row even when the reader changes a row
 	const peer = await tablePeer(v, tok, false);
 	try {
 		await migrateNow(`http://localhost:${PORT}`, v);
+		await budget(peer,genesisWrites(0,0,0));
 		peer.send({ t: "genesis", base: 0, rows: 0 }); await peer.next();
 		const ins = db.prepare("INSERT INTO attachments(file, version, pathkey, record, seq) VALUES (?, ?, ?, ?, ?)");
 		const key = (i: number) => { const id = doc(0); new DataView(id.buffer).setUint32(0, i); return id; };

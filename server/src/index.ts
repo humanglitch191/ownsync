@@ -4,9 +4,9 @@
 // chunks are kept apart, once per name.
 
 import { DurableObject } from "cloudflare:workers";
-import { Dashboard, VERSION, type VaultRpc, type VaultSettings, type VaultStats } from "./dashboard";
+import { Dashboard, LIMITS, VERSION, type VaultRpc, type VaultSettings, type VaultStats } from "./dashboard";
 import { SNAPSHOT_BUDGET, SNAPSHOT_DAYS, snapshotsToPrune } from "./snapshots";
-import { CHUNK_OVERHEAD, CLOSE, type AttachmentAnswer, type AttachmentMutation, type AttachmentRow, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer, unpackGenesis, validClientSize } from "./wire";
+import { CHUNK_OVERHEAD, CLOSE, type AttachmentAnswer, type AttachmentMutation, type AttachmentRow, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer, genesisWrites, unpackGenesis, validClientSize } from "./wire";
 
 interface Env {
 	VAULT: DurableObjectNamespace<Vault>;
@@ -22,7 +22,7 @@ const MIN_SETUP_KEY = 12;
 
 // token: hex hash of the token this socket said hello with; null before hello. device: the short ID its status gave.
 // listFrom: when this socket's full list of current versions began (DESIGN.md section 10), until its last frame.
-type Session = { token: string | null; live: boolean; device?: string; listFrom?: number; table?: string; subscribed?: boolean; wantsMigration?: boolean; tableLive?: boolean };
+type Session = { token: string | null; live: boolean; device?: string; listFrom?: number; table?: string; subscribed?: boolean; wantsMigration?: boolean; tableLive?: boolean; migrationWrites?: number };
 const toHex = (b: ArrayBuffer | Uint8Array) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
 type StoredAttachment = { file: ArrayBuffer; version: ArrayBuffer; pathkey: ArrayBuffer; record: ArrayBuffer; deleted: number | null; seq: number };
 // The existing BLOB column uses an empty blob for a note, outside the fixed-width version-tag space.
@@ -104,6 +104,7 @@ export class Vault extends DurableObject<Env> {
 	private name: string | null = null; // this vault's ID (32 hex), from the first request's URL
 	private deleted: boolean;
 	private migrated = false;
+	private migrationNeedsWrites?: number;
 	private migrationFailureDay?: number; // Best effort: reporting a failed write must not require another write.
 	// Today's counters for the dashboard's free-plan meter, kept in memory and written at most once a minute.
 	private usage: { day: number; requests: number; rows: number; lastActivity: number | null };
@@ -475,11 +476,33 @@ export class Vault extends DurableObject<Env> {
 				ws.serializeAttachment({ ...session, wantsMigration: true });
 				return ws.send(encodeServer({ t: "migrationEligible", ready: !this.migrated && this.migrationEligible() }));
 			}
+			if (f.t === "migrationEstimate") {
+				if (!session.table) return ws.close(CLOSE.badMessage, "table handshake required");
+				if (this.migrated) return ws.send(encodeServer({ t: "format", table: true }));
+				let otherWrites: number;
+				try { otherWrites = await owner(this.env).otherVaultWritesToday(this.name!); }
+				catch { return ws.send(encodeServer({ t: "migrationFailed", reason: "could not read the Worker’s daily usage" })); }
+				// The free allowance is shared by the Worker's vaults. Use the same
+				// counters as the dashboard, exposing only this request's decision.
+				if (session.token !== this.token) return ws.close(CLOSE.unauthorized,"unauthorized");
+				if (this.migrated) return ws.send(encodeServer({ t: "format", table: true }));
+				const remaining = Math.max(0, LIMITS.rowsWrittenPerDay - otherWrites - this.rowsWrittenToday());
+				const allowed = f.writes <= remaining;
+				ws.serializeAttachment({ ...session, migrationWrites: allowed ? f.writes : undefined });
+				if (!allowed && this.migrationNeedsWrites !== f.writes) {
+					this.migrationNeedsWrites = f.writes;
+					try { this.write("INSERT OR REPLACE INTO settings(key,value) VALUES ('migrationNeedsWrites',?)",f.writes); }
+					catch (e) { if (!dailyWriteLimit(e)) throw e; }
+				}
+				return ws.send(encodeServer({ t: "migrationBudget", allowed }));
+			}
 			if (f.t === "stageRow") return ws.close(CLOSE.badMessage, "genesis rows belong inside parts");
 			if (f.t === "stagePart" || f.t === "genesis") {
 				if (!session.table) return ws.close(CLOSE.badMessage, "table handshake required");
+				if (!this.migrated && session.migrationWrites === undefined)
+					return ws.send(encodeServer({ t: "migrationFailed", reason: "migration estimate required before staging" }));
 				if (f.t === "genesis" || f.part === 1) this.cleanGenesisParts();
-				if (f.t === "genesis") return this.genesis(ws, session.table, f.base, f.rows);
+				if (f.t === "genesis") return this.genesis(ws, session.table, f.base, f.rows, session.migrationWrites);
 				if (this.migrated) return ws.send(encodeServer({ t: "format", table: true }));
 				try {
 					this.write("INSERT INTO genesis_parts(session, part, data) VALUES (?, ?, ?)", session.table, f.part, f.data);
@@ -570,7 +593,7 @@ export class Vault extends DurableObject<Env> {
 	private migrationFailed(ws: WebSocket, error: unknown) {
 		// Abandon only this attempt. The next attempt can start at part 1 even if
 		// there is no write budget left to delete its predecessor today.
-		ws.serializeAttachment({ ...ws.deserializeAttachment(), table: crypto.randomUUID() });
+		ws.serializeAttachment({ ...ws.deserializeAttachment(), table: crypto.randomUUID(), migrationWrites: undefined });
 		this.cleanGenesisParts();
 		if (dailyWriteLimit(error)) {
 			this.migrationFailureDay = today();
@@ -606,10 +629,10 @@ export class Vault extends DurableObject<Env> {
 
 	// Only stage blobs are visible before commit. The file rows, version retirements,
 	// format flag and disposal of all contenders' parts commit or roll back together.
-	private genesis(ws: WebSocket, session: string, base: number, rows: number): void {
+	private genesis(ws: WebSocket, session: string, base: number, rows: number, budget?: number): void {
 		if (!this.migrated && base === this.head && this.migrationEligible()) {
 			try {
-				this.ctx.storage.transactionSync(() => this.installGenesis(session, rows));
+				this.ctx.storage.transactionSync(() => this.installGenesis(session, rows, budget!));
 				this.migrated = true;
 			} catch (e) {
 				return this.migrationFailed(ws, e);
@@ -625,19 +648,23 @@ export class Vault extends DurableObject<Env> {
 			}
 		}
 		if (!this.migrated) {
+			ws.serializeAttachment({ ...ws.deserializeAttachment(), migrationWrites: undefined });
 			try { this.write("DELETE FROM genesis_parts WHERE session = ?", session); }
 			catch (e) { return this.migrationFailed(ws, e); }
 		}
 		ws.send(encodeServer({ t: "format", table: this.migrated }));
 	}
 
-	private installGenesis(session: string, rows: number) {
-		let seq = 0;
+	private installGenesis(session: string, rows: number, budget: number) {
+		let seq = 0, live = 0;
+		const parts = this.sql.exec<{n: number}>("SELECT COUNT(*) AS n FROM genesis_parts WHERE session=?",session).one().n;
 		const now = Date.now();
 		const versions = new Map<string, { tag: Uint8Array; count: number; retired: number | null }>();
 		for (const { row, expectedChunks, dateAtCommit } of unpackGenesis(this.genesisParts(session))) {
 			if (row.seq !== ++seq || (row.version === null && expectedChunks !== null)) throw new IncompleteGenesis("invalid genesis row");
 			const deleted = dateAtCommit ? now : row.deleted;
+			if (deleted === null) live++;
+			if (genesisWrites(live,seq-live,parts) > budget) throw new IncompleteGenesis("migration exceeds its estimate");
 			this.write("INSERT INTO attachments(file,version,pathkey,record,deleted,seq) VALUES (?,?,?,?,?,?)",
 				row.file, row.version ?? NO_VERSION, row.pathkey, row.record, deleted, seq);
 			if (row.version === null) continue;
@@ -649,6 +676,7 @@ export class Vault extends DurableObject<Env> {
 			}
 		}
 		if (seq !== rows) throw new IncompleteGenesis("incomplete genesis");
+		if (genesisWrites(live,seq-live,parts) !== budget) throw new IncompleteGenesis("migration estimate changed");
 		for (const { tag, count, retired } of versions.values()) {
 			const chunks = this.sql.exec<{ owned: number; stored: number }>(`SELECT COUNT(*) AS owned, COUNT(c.name) AS stored
 				FROM version_chunks vc LEFT JOIN chunks c ON c.name=vc.name WHERE vc.tag=?`, tag).one();
@@ -1008,6 +1036,8 @@ export class Vault extends DurableObject<Env> {
 		return { ok: true };
 	}
 
+	rowsWrittenToday() { return this.usage.day === today() && !this.deleted ? this.usage.rows : 0; }
+
 	async stats(): Promise<VaultStats> {
 		if (this.token === null && !this.deleted) return { bytes: 0, requestsToday: 0, rowsWrittenToday: 0, history: [], lastActivity: null, name: "", deleted: false, devices: [], settings: { snapshots: null, historyBackup: null }, snapshots: [], historyCopies: { copies: 0, bytes: 0 } };
 		const online = new Set(this.ctx.getWebSockets().map((ws) => (ws.deserializeAttachment() as Session).device));
@@ -1019,12 +1049,14 @@ export class Vault extends DurableObject<Env> {
 		return {
 			bytes: this.sql.databaseSize,
 			requestsToday: fresh ? this.usage.requests : 0,
-			rowsWrittenToday: fresh ? this.usage.rows : 0,
+			rowsWrittenToday: this.rowsWrittenToday(),
 			history: [...days.values()].sort((a, b) => a.day - b.day),
 			lastActivity: this.usage.lastActivity,
 			name: this.sql.exec<{ name: string }>("SELECT name FROM vault_name").toArray()[0]?.name ?? "",
 			deleted: this.deleted,
 			settings: this.settings(),
+			migrationNeedsWrites: this.deleted || this.migrated ? undefined : this.migrationNeedsWrites ??
+				this.sql.exec<{value: number}>("SELECT value FROM settings WHERE key='migrationNeedsWrites'").toArray()[0]?.value,
 			migration: this.deleted ? undefined : this.migrated ? "complete" : this.migrationFailureDay === today() ? "failedToday" : this.migrationRequested() ? "requested" : "legacy",
 			// Complete snapshots, newest first; history copies only as totals (the Worker doesn't know which device made one).
 			snapshots: this.sql.exec<{ at: number; size: number }>("SELECT at, size FROM snapshots WHERE received = parts ORDER BY day DESC").toArray(),
@@ -1198,6 +1230,12 @@ export class Owner extends DurableObject<Env> {
 
 	listVaults(): { id: string; created: number; label: string }[] {
 		return this.sql.exec<{ id: string; created: number; label: string }>("SELECT id, created, label FROM vaults ORDER BY created").toArray();
+	}
+
+	async otherVaultWritesToday(caller: string) {
+		const others = this.listVaults().filter(v => v.id !== caller);
+		const used = await Promise.all(others.map(v => this.env.VAULT.get(this.env.VAULT.idFromName(v.id)).rowsWrittenToday()));
+		return used.reduce((total, n) => total + n, 0);
 	}
 
 	/** A vault was deleted from Obsidian: it leaves the dashboard. */

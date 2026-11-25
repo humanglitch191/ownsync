@@ -494,7 +494,7 @@ function migrationCard(v) {
 		catch { error.hidden = false; button.disabled = false; }
 	} }, "Migrate now");
 	return h("section", { class: "card" }, h("h3", {}, "Vault sync migration"),
-		h("p", {}, v.migration === "failedToday" ? "Migration could not complete today. The vault still uses legacy sync." : v.migration === "requested" ? "Waiting for an updated device to complete migration." :
+		h("p", {}, v.migrationNeedsWrites !== undefined ? `Migration needs ${count(v.migrationNeedsWrites)} row writes. At the last check this exceeded the remaining Free plan budget. The vault still uses legacy sync. Cloudflare’s paid plan has no daily row-write limit.` : v.migration === "failedToday" ? "Migration could not complete today. The vault still uses legacy sync." : v.migration === "requested" ? "Waiting for an updated device to complete migration." :
 			"Migration normally waits until every recently active device has updated. Migrating now requires older devices to update before syncing again."),
 		v.migration === "requested" ? null : button, error);
 }

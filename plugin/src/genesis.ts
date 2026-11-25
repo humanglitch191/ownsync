@@ -1,7 +1,7 @@
 // shortcut: A stale compare restarts both passes from zero (index first, then attachment docs).
 // Neither the device's legacy replica nor an unstored live update can contribute to genesis. The Worker compares the whole-vault head at commit.
 import { KIND, docTag, hex, openEnvelope, unpackEntry } from "../../protocol/ownsync";
-import { decodeServer, encodeClient, packGenesis, type ClientFrame } from "../../server/src/wire";
+import { decodeServer, encodeClient, estimateGenesis, packGenesis, type ClientFrame } from "../../server/src/wire";
 import { LegacyProjection } from "./core/table/migration";
 import type { VaultKeys } from "./keys";
 import type { TableSync } from "./tableSync";
@@ -9,8 +9,8 @@ import type { TableSync } from "./tableSync";
 export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, finished: (stale: boolean, error?: unknown) => void) {
 	const ws = new WebSocket(url), projection = new LegacyProjection(), epoch = keys.epoch, vmk = keys.vmk;
 	ws.binaryType = "arraybuffer";
-	let pass: "format" | "index" | "docs" | "stage" | "compare" = "format", base = 0, staged = 0, part = 0, ended = false;
-	let parts: AsyncGenerator<Uint8Array>;
+	let pass: "format" | "index" | "docs" | "estimate" | "stage" | "compare" = "format", base = 0, staged = 0, part = 0, ended = false;
+	let parts: AsyncGenerator<Uint8Array>, writes: number;
 	const tags = new Map<string, string>(), older = new Map<string, string>();
 	const seen = new Set<string>(), oldOnly = new Set<string>();
 	const watch = async (doc: string) => {
@@ -51,6 +51,11 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 		queue = queue.then(async () => {
 			if (ended) return;
 			const f = decodeServer(new Uint8Array(e.data as ArrayBuffer));
+			if (f.t === "migrationBudget") {
+				if (pass !== "estimate") throw new Error("Unexpected migration budget reply");
+				if (!f.allowed) throw new Error(`Migration needs ${writes.toLocaleString()} row writes. This exceeds the Worker’s remaining Free plan budget today. This vault still uses legacy sync. Cloudflare’s paid plan has no daily row-write limit.`);
+				pass = "stage"; parts = packGenesis(stagedRows()); return next();
+			}
 			if (f.t === "migrationFailed") throw new Error("Migration failed: " + f.reason + ". This vault still uses legacy sync.");
 			if (f.t === "migrationWriteFailed") throw new Error("Migration could not complete today. The Worker could not store the migration. This vault still uses legacy sync.");
 			if (f.t === "format") {
@@ -99,7 +104,8 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 			} else if (pass === "docs") {
 				if (base !== f.seq) return finish(true);
 				projection.requireStoredNotes(seen);
-				pass = "stage"; parts = packGenesis(stagedRows()); await next();
+				pass = "estimate"; writes = await estimateGenesis(stagedRows()); staged = 0;
+				send({ t: "migrationEstimate", writes });
 			}
 		}).catch(err => finish(false, err));
 	};

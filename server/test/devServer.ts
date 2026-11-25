@@ -30,6 +30,15 @@ export async function migrateNow(host: string, vault: string) {
 	if (!response.ok) throw new Error("migrate now: " + response.status);
 }
 
+export async function ownerOverview(host: string) {
+	const cookie = await sessions.get(host);
+	if (!cookie) throw new Error("no dashboard session");
+	return (await fetch(host + "/api/overview", { headers: { cookie } })).json() as Promise<{
+		limits: { rowsWrittenPerDay: number }; usage: { rowsWrittenToday: number };
+		vaults: { id: string; migrationNeedsWrites?: number }[];
+	}>;
+}
+
 /** Owner codes for test vaults, one per vault, from the dashboard as the owner gets them. */
 export async function ownerCodes(host: string): Promise<() => Promise<string>> {
 	return () => claim(host);
