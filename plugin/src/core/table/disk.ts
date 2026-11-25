@@ -175,6 +175,14 @@ export async function executeIntent(device: TableDevice, disk: DiskPort, i: Disk
 			s.intent = undefined; // a later user rename already identified the new endpoint
 			return false;
 		}
+		// Another file can claim an endpoint while this intent waits, even if a pending
+		// deletion leaves it empty or its bytes look exactly like a completed write.
+		for (const [id, local] of s.local) {
+			if (id !== op.file && (local.path === op.path || (op.kind === "rename" && local.path === op.from))) {
+				s.intent = undefined;
+				return false;
+			}
+		}
 		let unreadable = false;
 		const read = async (path: string) => {
 			try {

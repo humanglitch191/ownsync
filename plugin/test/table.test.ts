@@ -310,3 +310,52 @@ test("a remote rename waits for a pending deletion to release its disk path (tab
 		assert.equal(d.disk.text("y.bin"), "A");
 	}
 });
+
+test("a restarted download respects a new owner's pending change at its destination", async () => {
+	for (const deleted of [true, false]) {
+		const { a, b, file } = await pair();
+		a.disk.edit("y.bin", "A"); await a.settle(); await b.pull(); await b.plan();
+		assert.equal(await b.dev.change(s => s.intent?.kind), "write");
+		await b.disk.moveIf("x.bin", "y.bin", b.disk.hash("x.bin")!);
+		await b.plan({ kind: "renamed", from: "x.bin", to: "y.bin" });
+		if (deleted) {
+			b.disk.files.delete("y.bin"); await b.plan({ kind: "deleted", path: "y.bin" });
+		}
+		// Both absence and the exact expected bytes would satisfy the saved write.
+		const pending = await b.packet(file);
+		await b.reopen();
+		assert.equal(await b.effect(), false);
+		assert.equal(await b.dev.change(s => s.intent), undefined);
+		assert.deepEqual(await b.packet(file), pending);
+		assert.equal(b.disk.text("y.bin"), deleted ? undefined : "A");
+		assert.deepEqual(await b.dev.change(s => [...s.local.keys()]), [file]);
+		await b.settle();
+		assert.equal(b.disk.text("y.bin"), "A");
+	}
+});
+
+test("a saved rename cannot move another file that now owns its source", async () => {
+	const { a, b } = await pair();
+	a.disk.edit("other.bin", "A"); await a.settle(); await b.settle();
+	await a.disk.moveIf("x.bin", "y.bin", a.disk.hash("x.bin")!);
+	await a.plan({ kind: "renamed", from: "x.bin", to: "y.bin" }); await a.settle();
+	await b.pull(); await b.plan();
+	assert.equal(await b.dev.change(s => s.intent?.kind), "rename");
+	b.disk.files.delete("x.bin");
+	await b.disk.moveIf("other.bin", "x.bin", b.disk.hash("other.bin")!);
+	await b.plan({ kind: "renamed", from: "other.bin", to: "x.bin" });
+	assert.equal(await b.effect(), false);
+	assert.equal(b.disk.text("x.bin"), "A");
+	assert.equal(b.disk.text("y.bin"), undefined);
+});
+
+test("a device rejects duplicate local paths before committing any changes", async () => {
+	const { b, file } = await pair();
+	await assert.rejects(b.dev.change(s => {
+		s.local.set("other", { path: "x.bin", base: {} });
+		s.cursor++;
+	}), /Multiple local attachment IDs at x\.bin/);
+	await b.reopen();
+	assert.deepEqual(await b.dev.change(s => [...s.local.keys()]), [file]);
+	assert.equal(await b.dev.change(s => s.cursor), 1);
+});

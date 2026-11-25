@@ -11,6 +11,13 @@ export interface Local {
 	removed?: boolean; // explicit delete or authoritative startup absence, retained across an in-flight proposal
 	redundant?: { target: string; hash: string };
 }
+export function checkLocalPaths(locals: Iterable<Local>) {
+	const paths = new Set<string>();
+	for (const { path } of locals) {
+		if (paths.has(path)) throw new Error("Multiple local attachment IDs at " + path);
+		paths.add(path);
+	}
+}
 export interface Observation { path: string; size: number; mtime: number; hash?: string }
 export type Request = { req: string; file: string } & (
 	| { t: "del"; base: number }
@@ -282,7 +289,10 @@ export class TableDevice {
 				for (const id of before[kind].keys()) if (!draft[kind].has(id)) deletes.push(`table/${kind}/${id}`);
 			}
 			if (before.cursor !== draft.cursor || before.intent !== draft.intent) puts.set("table/meta", { cursor: draft.cursor, intent: draft.intent });
-			if (puts.size || deletes.length) await this.store.commit(puts, deletes);
+			if (puts.size || deletes.length) {
+				checkLocalPaths(draft.local.values());
+				await this.store.commit(puts, deletes);
+			}
 			this.state = draft;
 			return result;
 		});

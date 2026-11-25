@@ -3,7 +3,7 @@
 import * as Y from "yjs";
 import { hex, tableFileId, unhex } from "../../../../protocol/ownsync";
 import type { Entry, NoteMeta, Ref, Store, Upload } from "../ports";
-import { conflictSuffix, type Local, type Row } from "./device";
+import { checkLocalPaths, conflictSuffix, type Local, type Row } from "./device";
 import { places, type IndexValue } from "../places";
 const suffix = (p: string, s: string) => p.replace(/(\.[^./]*)?$/, (_, ext) => ` (conflict ${s})${ext ?? ""}`);
 
@@ -114,7 +114,7 @@ async function deletedBase(store: Store, id: string, seen: string) {
 
 // Capture these bases together with the handoff marker, before starting either disk planner.
 export async function legacyBases(store: Store, key: Uint8Array) {
-	const puts = new Map<string, unknown>();
+	const locals = new Map<string, Local>();
 	const out = (await store.list<StoredEntry>("out:"))
 		.sort(([a], [b]) => Number(a.slice(4)) - Number(b.slice(4)))
 		.map(([, e]) => e);
@@ -139,9 +139,11 @@ export async function legacyBases(store: Store, key: Uint8Array) {
 					if (h) bytes = { h }; // never substitute a staged hash for its agreement
 				}
 			}
-			puts.set("table/local/" + file, { path, base: { path: changed.has(id) ? changed.get(id) : path, bytes }, removed } satisfies Local);
+			locals.set("table/local/" + file, { path, base: { path: changed.has(id) ? changed.get(id) : path, bytes }, removed });
 		}
 	} finally { index.destroy(); }
+	checkLocalPaths(locals.values());
+	const puts = new Map<string, unknown>(locals);
 	puts.set("table/migrated", true);
 	return puts;
 }

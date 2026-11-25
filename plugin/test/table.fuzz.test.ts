@@ -53,7 +53,10 @@ async function run(seed: number, steps: number) {
 	const w = new WorkerModel(), required = new Set<string>(), log: string[] = [];
 	// Keep accepted deletions independently of the live-file oracle: staged bytes and orphan
 	// chunks cannot satisfy a promise to offer the deleted version for restore.
-	const tombstones = new Map<string, { seq: number; bytes: string; at: number }>();
+	const deletionKey = (file: string, seq: number) => file + "/" + seq;
+	const tombstones = new Map<string, { file: string; seq: number; bytes: string; at: number; cleaned: boolean }>();
+	const rememberDeletion = (file: string, seq: number, bytes: string, at: number) =>
+		tombstones.set(deletionKey(file,seq), { file, seq, bytes, at, cleaned: false });
 	let serial = 0;
 	const submit = (packet: Uint8Array) => {
 		const frame = decodeClient(packet), seq = w.seq;
@@ -64,11 +67,11 @@ async function run(seed: number, steps: number) {
 			assert.ok(data, "accepted a version without its bytes");
 			const bytes = value(data);
 			if (frame.t === "restore") {
-				assert.equal(bytes, tombstones.get(row.file)?.bytes, "restore changed the deleted bytes");
+				assert.equal(bytes, tombstones.get(deletionKey(row.file,frame.base))?.bytes, "restore changed the deleted bytes");
 				coverage.restores++;
 			}
-			if (row.deleted !== null) tombstones.set(row.file, { seq: row.seq, bytes, at: row.deleted });
-			else tombstones.delete(row.file);
+			if ("base" in frame && frame.base !== null) tombstones.delete(deletionKey(row.file,frame.base));
+			if (row.deleted !== null) rememberDeletion(row.file,row.seq,bytes,row.deleted);
 			log.push(`accepted ${frame.t} #${w.seq} ${row.file} ${row.path} ${bytes}`);
 		}
 		return answer;
@@ -116,11 +119,12 @@ async function run(seed: number, steps: number) {
 	const check = async () => {
 		await drain();
 		verify(w,peers.map(d => d.disk),required);
-		for (const [file, tomb] of tombstones) {
-			const row = w.rows.get(file);
+		for (const tomb of tombstones.values()) {
+			const row = w.rows.get(tomb.file);
 			assert.equal(row?.seq, tomb.seq, "lost deleted row");
 			assert.equal(row.deleted, tomb.at);
-			assert.equal(w.content(row.bytes)?.toString("hex"), tomb.bytes, "lost recoverable deleted bytes");
+			const data = w.content(row.bytes);
+			if (!tomb.cleaned || data) assert.equal(data?.toString("hex"), tomb.bytes, "lost recoverable deleted bytes");
 		}
 		for (const p of peers) await p.dev.change(s => {
 			assert.equal(s.cursor,w.seq);
@@ -160,7 +164,7 @@ async function run(seed: number, steps: number) {
 					const deleted = row.dateAtCommit ? w.time : row.deleted;
 					w.genesis({ ...row, deleted });
 					const bytes = w.content(row.bytes);
-					if (deleted !== null && bytes) tombstones.set(row.file, { seq: row.seq, bytes: value(bytes), at: deleted });
+					if (deleted !== null && bytes) rememberDeletion(row.file,row.seq,value(bytes),deleted);
 				}
 			} finally { projection.close(); }
 			for (const d of old) {
@@ -231,9 +235,10 @@ async function run(seed: number, steps: number) {
 					// Release only tombstones explicitly covered by this cleanup range.
 					// An unseen user edit remains required even when an erroneous del is cleaned.
 					coverage.cleanedChunks += w.clean(0,cutoff);
-					for (const [file, tomb] of tombstones) {
-						const row = w.rows.get(file)!;
-						if (row.bytes.s && tomb.at < cutoff && !w.content(row.bytes)) tombstones.delete(file);
+					for (const tomb of tombstones.values()) {
+						const row = w.rows.get(tomb.file)!;
+						// Staging can replenish cleaned chunks. A successful restore must still return the original bytes.
+						if (row.bytes.s && tomb.at < cutoff && !w.content(row.bytes)) tomb.cleaned = true;
 					}
 					for (const row of w.live()) assert.ok(w.content(row.bytes));
 				}
@@ -288,6 +293,10 @@ test("the oracle rejects orphan-only bytes, a divergent disk and byte-identical 
 });
 
 const seed = process.env.FUZZ_SEED;
+const regressions = [2728545, 2747157, 2781512, 2808104, 2833507, 2845892, 2860885];
+test("table fuzz: saved intents and restore after cleaned chunks return", { skip: !!seed || !!process.env.FUZZ_FIRST }, async () => {
+	for (const n of regressions) await run(n,250);
+});
 const count = seed === undefined ? Number(process.env.FUZZ_RUNS ?? 20) : 1;
 const first = Number(seed ?? process.env.FUZZ_FIRST ?? 1), steps = Number(process.env.FUZZ_STEPS ?? 250);
 test(`table fuzz: seeds ${first}–${first+count-1}, ${steps} steps`, async t => {
