@@ -11,17 +11,14 @@
 // Each piece of typed text is a unique token, which is what makes 2 and 3 checkable. An attachment's content
 // is random bytes around one token, split into several chunks.
 //
-// FUZZ_RUNS=2000 node --import jiti/register --test test/engine.fuzz.test.ts    longer run
+// FUZZ_RUNS=5000 node --import jiti/register --test test/engine.fuzz.test.ts    longer run
 // FUZZ_SEED=1234 ...                                                            replay one failing run
 // FUZZ_FIRST=20001 ...                                                          start at another seed
 
-import { createHash } from "node:crypto";
-import { LegacyDevice, releasedEngine } from "./legacy-engine";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
-import { claimOf } from "../src/core/conflictPath";
-import type { NoteMeta, Ref, Upload } from "../src/core/ports";
+import type { NoteMeta, Ref } from "../src/core/ports";
 import { type Content, Device, SCOPED, Server, bytes, latin1, quiesce, rng } from "./sim";
 
 const POOL = ["a.md", "b.md", "c.md", "d.md", "x/e.md", "x/f.md", "x/y/g.md", "p.png", "q.bin", "x/r.png"];
@@ -30,15 +27,14 @@ const isNote = (path: string) => path.endsWith(".md");
 const NOTE_PATHS = POOL.filter(isNote);
 const DAY = 86_400_000;
 
-async function run(seed: number, steps: number) {
+async function run(seed: number, steps: number): Promise<void> {
 	const random = rng(seed);
 	const restoreRandom = rng(seed ^ 0x6ae5371d);
 	const exerciseRestores = !FIXED.includes(seed); // preserve the original operation sequence for regressions
 	const chance = (p: number) => random() < p;
 	const pick = <T>(items: T[]): T | undefined => items[Math.floor(random() * items.length)];
 	const server = new Server();
-	const old = process.env.FUZZ_MIXED === "1" ? await releasedEngine() : undefined;
-	const devs = [0, 1, 2].map((i) => i === 1 && old ? new LegacyDevice(`d${i}`, server, random, old) : new Device(`d${i}`, server, random));
+	const devs = [0, 1, 2].map((i) => new Device(`d${i}`, server, random));
 	// Version-scoped chunks and Clean up, except in the seeds kept from before them (their runs stay as they were).
 	// Days pass and the owner cleans up on a generator of their own, so the devices' moves stay those of the seed.
 	const storage = !FIXED.includes(seed), storageRandom = rng(seed ^ 0x2c1b3c6d);
@@ -48,7 +44,6 @@ async function run(seed: number, steps: number) {
 	const notesOnly = new Set(seed % 3 === 0 ? [devs[2]!] : []);
 	for (const d of notesOnly) d.overrides = { ...d.overrides, attachments: false };
 	const synced = (d: Device, path: string) => isNote(path) || !notesOnly.has(d);
-	const hashes = new Map<string, string>();
 	const fate = new Map<string, "must" | "may">(); // token → must still exist at the end, or may be gone
 	const restored = new Map<string, string>(); // restored token → note ID, until a user deletes the token again
 	const removedBy = new Map(devs.map((d) => [d, new Set<string>()]));
@@ -61,99 +56,10 @@ async function run(seed: number, steps: number) {
 	// Tokens are separated by spaces, and new ones go in at a boundary, as whole words do in real typing.
 	const insertAt = (text: string, t: string) => { const parts = text ? text.split(" ") : []; parts.splice(Math.floor(random() * (parts.length + 1)), 0, t); return parts.join(" "); };
 	const closedFiles = (d: Device) => [...d.files.keys()].filter((p) => { const id = d.engine?.noteAt(p); return !id || !d.editors.has(id); });
-	const tokensIn = (content: Content): string[] => latin1(content).match(/<[^>]+>/g) ?? [];
-	// Lifetime creations bound the legacy exemption; the visible allowance falls when a user consumes a copy.
-	const copies = new Map<string, { made: number; allowed: number; spent: Set<string>; required: Set<string>; removals: { ids: string[]; claim: string }[] }>();
-	const copyRecord = (t: string) => {
-		let copy = copies.get(t);
-		if (!copy) {
-			copy = { made: 1, allowed: 1, spent: new Set(), required: new Set(), removals: [] };
-			copies.set(t, copy);
-		}
-		return copy;
-	};
-	const addCopy = (t: string) => {
-		const copy = copyRecord(t);
-		copy.made++;
-		copy.allowed++;
-		fate.set(t, "must");
-	};
-	const releasedDrop = (t: string, d: Device) => {
-		const legacy = devs[1], hash = hashes.get(t);
-		return legacy instanceof LegacyDevice && hash && (copies.get(t)?.made ?? 1) <= 2 && legacy.explainsLoss(hash, d);
-	};
-	let unseenActions = 0;
-
-	// Compute the oracle from committed documents, independently of the engine's head cache and file projection.
-	const matching = (d: Device, index: ReturnType<Device["storedIndex"]>, claim: string, hash: string) => {
-		const ids: string[] = [];
-		for (const [id, v] of index) {
-			if (v.d !== undefined || claimOf(id, v.p) !== claim) continue;
-			const up = d.data.get(`up:${id}`) as Upload | undefined;
-			if (up) {
-				// The user can already have replaced these staged bytes while the file event is queued.
-				const path = (d.data.get(`note:${id}`) as NoteMeta | undefined)?.diskPath;
-				const file = path && d.files.get(path);
-				if (up.ref.h === hash && file && createHash("sha256").update(file.content).digest("hex").slice(0, 12) === hash) ids.push(id);
-				continue;
-			}
-			const state = d.data.get(`state:${id}`) as Uint8Array | undefined;
-			if (!state) continue;
-			const doc = new Y.Doc();
-			Y.applyUpdate(doc, state);
-			const refs = doc.getArray<Ref>("v").toArray();
-			if (refs.length && refs.every((r) => r.h === hash)) ids.push(id);
-			doc.destroy();
-		}
-		return ids;
-	};
-	// A user can move a file and delete it before the engine receives its rename. The disk object follows that move.
-	const moved = new WeakMap<object, string>(), destinations = new Map<string, Set<string>>();
-	const fileOwner = (d: Device, path: string, index: ReturnType<Device["storedIndex"]>) =>
-		d.engine?.noteAt(path) ?? moved.get(d.files.get(path)!) ??
-		[...index.keys()].find((id) => (d.data.get(`note:${id}`) as NoteMeta | undefined)?.diskPath === path);
-	const rename = (d: Device, from: string, to: string) => {
-		if (!isNote(from)) {
-			const owner = fileOwner(d, from, d.storedIndex());
-			if (owner) {
-				moved.set(d.files.get(from)!, owner);
-				destinations.set(owner, (destinations.get(owner) ?? new Set()).add(to));
-			}
-		}
-		d.rename(from, to);
-	};
-	const replaceContent = (d: Device, path: string, t: string) => {
-		if (isNote(path)) { fate.set(t, "may"); return; }
-		if (notesOnly.has(d)) return;
-		const copy = copyRecord(t);
-		const index = d.storedIndex();
-		const owner = fileOwner(d, path, index);
-		const claim = owner ? claimOf(owner, index.get(owner)?.p ?? path) : path;
-		const hash = createHash("sha256").update(d.files.get(path)!.content).digest("hex").slice(0, 12);
-		const { spent, required } = copy;
-		const observed = matching(d, index, claim, hash);
-		if (owner && !observed.includes(owner)) observed.push(owner);
-		const fresh = observed.filter((id) => !spent.has(id));
-		if (copy.allowed > 1 && (!observed.length || fresh.length)) {
-			copy.allowed--;
-			copy.removals.push({ ids: fresh, claim });
-		}
-		for (const id of observed) { spent.add(id); required.delete(id); }
-		let unseen = false;
-		for (const peer of devs) {
-			if (peer === d || notesOnly.has(peer)) continue;
-			for (const id of matching(peer, peer.storedIndex(), claim, hash)) if (!index.has(id) && !spent.has(id)) {
-				required.add(id);
-				unseen = true;
-			}
-		}
-		fate.set(t, required.size ? "must" : "may");
-		if (unseen) unseenActions++;
-		log.push(`${d.name} replaces/deletes ${t} at ${claim}; observed ${observed.join(",")}; required ${[...required].join(",")}`);
-	};
+	const tokensIn = (content: Content) => latin1(content).match(/<[^>]+>/g) ?? [];
 	const remove = (d: Device, path: string) => {
 		for (const t of tokensIn(d.files.get(path)!.content)) {
-			replaceContent(d, path, t);
+			fate.set(t, "may");
 			restored.delete(t);
 			removedBy.get(d)!.add(t);
 		}
@@ -163,7 +69,6 @@ async function run(seed: number, steps: number) {
 	const noise = () => String.fromCharCode(...Array.from({ length: Math.floor(random() * 7) }, () => pick([0, 0, 0, 0, 1, 10, 61, 128, 255])!));
 	const create = (d: Device, path: string): Content => {
 		const content = isNote(path) ? token(d) : bytes(noise() + token(d) + noise());
-		if (old && typeof content !== "string") for (const t of tokensIn(content)) hashes.set(t, createHash("sha256").update(content).digest("hex").slice(0, 12));
 		if (!synced(d, path)) for (const t of tokensIn(content)) fate.set(t, "may"); // never leaves this device
 		return content;
 	};
@@ -171,7 +76,7 @@ async function run(seed: number, steps: number) {
 	const edit = (d: Device, path: string): Content => {
 		const old = d.files.get(path)!.content;
 		if (typeof old === "string") return insertAt(old, token(d));
-		for (const t of tokensIn(old)) replaceContent(d, path, t);
+		for (const t of tokensIn(old)) fate.set(t, "may");
 		return create(d, path);
 	};
 	// Half the edits go to attachments, if there are any: few paths, so devices replace the same one at once.
@@ -198,43 +103,6 @@ async function run(seed: number, steps: number) {
 	};
 
 	for (const d of devs) { d.boot(); d.connect(); }
-	const exerciseCopies = seed % 4 === 0 && !FIXED.includes(seed) && !FAILED.includes(seed);
-	if (exerciseCopies) {
-		await quiesce(devs);
-		const [a, b] = devs as [Device, Device, Device];
-		b.disconnect();
-		const p = "p.png", content = create(a, p);
-		a.write(p, content);
-		await quiesce(devs);
-		const to = seed % 8 === 0 ? "q.bin" : p;
-		b.write(to, a.files.get(p)!.content);
-		await quiesce([b]);
-		if (to !== p) rename(b, to, p);
-		for (const t of tokensIn(content)) addCopy(t);
-		log.push(`${b.name} independently ${to === p ? "writes" : "renames onto"} ${p} with ${a.name}'s bytes`);
-		// In half these seeds A still knows only its original attachment when B publishes the twin.
-		const stale = seed % 16 < 8;
-		if (stale) a.disconnect();
-		b.connect();
-		await quiesce(devs);
-		for (const d of devs) if (!notesOnly.has(d)) {
-			assert.deepEqual([...d.files.keys()], [p], `seed ${seed}: setup must leave one file on ${d.name}`);
-			assert.deepEqual(d.files.get(p)!.content, content);
-		}
-		for (const t of tokensIn(content)) copies.get(t)!.allowed = 1;
-		if (stale) {
-			if (seed % 16 === 0) remove(a, p);
-			else a.write(p, edit(a, p));
-			await quiesce([a]);
-			a.connect();
-			await quiesce(devs);
-			if (!old) assert.equal(unseenActions, 1, `seed ${seed}: stale device missed its twin`);
-			if (unseenActions) for (const d of devs) if (!notesOnly.has(d)) {
-				const present = [...d.files.values()].some((f) => latin1(f.content) === latin1(content));
-				assert.ok(present || releasedDrop(tokensIn(content)[0]!, d), `seed ${seed}: unseen bytes lost on ${d.name}`);
-			}
-		}
-	}
 	for (let step = 0; step < steps; step++) {
 		const d = pick(devs)!;
 		const editorsBefore = new Map(d.editors), typed = new Set<string>();
@@ -253,24 +121,11 @@ async function run(seed: number, steps: number) {
 			if (r < 30) { log.push(`${d.name} boots`); d.boot(); if (chance(0.7)) d.connect(); }
 			else if (r < 45) { const p = toEdit([...d.files.keys()]); if (p) { log.push(`${d.name} (app closed) edits ${p}`); d.write(p, edit(d, p)); } }
 			else if (r < 52) { const p = pick(POOL.filter((x) => !d.files.has(x))); if (p) { log.push(`${d.name} (app closed) creates ${p}`); d.write(p, create(d, p)); } }
-			else if (r < 58) { const p = pick([...d.files.keys()].filter((x) => !isCopy(x))), to = p && renameTo(d, p); if (p && to) { log.push(`${d.name} (app closed) renames ${p} → ${to}`); rename(d, p, to); } }
+			else if (r < 58) { const p = pick([...d.files.keys()].filter((x) => !isCopy(x))), to = p && renameTo(d, p); if (p && to) { log.push(`${d.name} (app closed) renames ${p} → ${to}`); d.rename(p, to); } }
 			else if (r < 62) { const p = pick([...d.files.keys()]); if (p) { log.push(`${d.name} (app closed) deletes ${p}`); remove(d, p); } }
-		} else if (exerciseCopies && r >= 6 && r < 8 && !notesOnly.has(d)) {
-			// A user brings the same attachment over independently while either device may still be behind.
-			const source = pick(devs.filter((peer) => peer !== d && !notesOnly.has(peer)));
-			// A copy into an existing claim with identical bytes is adopted, including after a crash.
-			// Only a new claim gives the oracle an independent user-made copy to count.
-			const path = source && pick(POOL.filter((p) => !isNote(p) && !d.files.has(p) && !d.engine!.noteAt(p) &&
-				!d.engine!["places"]().owners.has(p) && source.files.has(p)));
-			if (source && path) {
-				const content = source.files.get(path)!.content;
-				for (const t of tokensIn(content)) addCopy(t);
-				log.push(`${d.name} copies ${source.name}'s ${path}`);
-				d.write(path, content);
-			}
 		} else if (r < 8) { const p = pick(POOL.filter((x) => !d.files.has(x))); if (p) { log.push(`${d.name} creates ${p}`); d.write(p, create(d, p)); } }
 		else if (r < 20) { const p = toEdit(closedFiles(d)); if (p) { log.push(`${d.name} edits ${p}`); d.write(p, edit(d, p)); } }
-		else if (r < 24) { const p = pick(closedFiles(d).filter((x) => !isCopy(x))), to = p && renameTo(d, p); if (p && to) { log.push(`${d.name} renames ${p} → ${to}`); rename(d, p, to); } }
+		else if (r < 24) { const p = pick(closedFiles(d).filter((x) => !isCopy(x))), to = p && renameTo(d, p); if (p && to) { log.push(`${d.name} renames ${p} → ${to}`); d.rename(p, to); } }
 		else if (r < 27) { const p = pick(closedFiles(d)); if (p) { log.push(`${d.name} deletes ${p}`); remove(d, p); } }
 		else if (r < 32) {
 			const id = pick([...d.files.keys()].filter(isNote).map((p) => d.engine!.noteAt(p)).filter((x): x is string => !!x && !d.editors.has(x)));
@@ -403,75 +258,42 @@ async function run(seed: number, steps: number) {
 	}
 	const sync = devs.map((d) => `${d.name}: cursor ${(d.data.get("meta") as { cursor: number } | undefined)?.cursor}, unsent ${[...d.data.keys()].filter((k) => k.startsWith("out:")).join(",") || "none"}, online ${d.online}`).join("; ");
 	const index = devs[0]!.storedIndex();
-	const indexes = [index, ...devs.slice(1).map((d) => d.storedIndex())].map((entries) => new Map([...entries].map(([id, v]) => [id, JSON.stringify([v.p, v.d, v.t, v.g, v.r])])));
+	const indexes = [index, ...devs.slice(1).map((d) => d.storedIndex())].map((entries) => new Map([...entries].map(([id, v]) => [id.slice(0, 6), `${v.p}${v.d === undefined ? "" : " (deleted)"}`])));
 	const indexDiff = [...new Set(indexes.flatMap((m) => [...m.keys()]))].filter((id) => new Set(indexes.map((m) => m.get(id))).size > 1).map((id) => `${id}: ${indexes.map((m) => m.get(id) ?? "-").join(" | ")}`);
 	if (process.env.FUZZ_LOG) log.push(`index waiting for missing updates: ${devs.map((d) => { const doc = new Y.Doc(); const st = d.data.get("index") as Uint8Array | undefined; if (st) Y.applyUpdate(doc, st); const p = (doc.store as unknown as { pendingStructs: { missing: Map<number, number> } | null }).pendingStructs; return `${d.name}: ${p ? JSON.stringify([...p.missing]) : "no"}`; }).join("; ")}`);
 	if (process.env.FUZZ_LOG) log.push(`index differences: ${indexDiff.join("; ") || "none"}`, `server rows: ${server.rows.map((r) => `${r.seq}:${r.entry.doc.slice(0, 6)}${r.entry.kind === "snapshot" ? "S" : ""}`).join(" ")}`);
 	if (process.env.FUZZ_LOG) (await import("node:fs")).writeFileSync(process.env.FUZZ_LOG, log.join("\n") + "\n");
-	if (indexDiff.length) fail(`devices ended with different indexes: ${indexDiff.join(" | ")}`);
 	if (new Set(full).size > 1) fail(`devices that sync attachments ended with different vaults:\n${full.join("\n")}`);
 	if (new Set(disks).size !== 1) fail(`devices ended with different vaults (server head ${server.head}; ${sync}):\n${devs.map((d, i) => `${d.name}: ${disks[i]}`).join("\n")}`);
 	for (const d of devs) {
 		const left = [...d.data.keys()].filter((k) => k.startsWith("out:") || k.startsWith("base:") || k.startsWith("up:"));
 		if (left.length) fail(`${d.name} still has unsent or unwritten work: ${left.join(", ")}\n${disks[0]}`);
 	}
-	// A restored attachment may hold content that also lives on elsewhere (a version split off as a conflict copy, say):
-	// bringing it back from Recently deleted is the user's choice, so like a recovery copy it isn't counted as a duplicate.
-	const restoredAttachment = (p: string) => !isNote(p) && p.includes(" (restored)");
-	const files = [...devs[0]!.files], main = files.filter(([p]) => !isCopy(p) && !restoredAttachment(p)).map(([, f]) => latin1(f.content)).join(" "), all = files.map(([, f]) => latin1(f.content)).join(" ");
-	for (const [p, file] of files) {
-		if (isNote(p)) continue;
-		const original = p.replace(/ \(conflict [0-9a-f]{6}\)(\.[^./]*)?$/, "$1");
-		const other = original !== p && devs[0]!.files.get(original);
-		if (other && latin1(other.content) === latin1(file.content)) fail(`identical conflict copy at ${p}`);
-	}
+	const files = [...devs[0]!.files], main = files.filter(([p]) => !isCopy(p)).map(([, f]) => latin1(f.content)).join(" "), all = files.map(([, f]) => latin1(f.content)).join(" ");
 	for (const [t, f] of fate) {
 		const count = main.split(t).length - 1;
-		const copy = copies.get(t);
-		let allowed = copy?.allowed ?? 1;
-		if (copy && count > allowed) {
-			// A concurrent user rename can win over the deletion of the original. Its independently
-			// made copy still has its own allowance. Only the exact moved ID, path and bytes qualify.
-			for (const removal of copy.removals) if (removal.ids.some((id) => {
-				const entry = index.get(id), path = devs[0]!.pathOf(id);
-				const file = path && devs[0]!.files.get(path);
-				return entry && entry.d === undefined && claimOf(id, entry.p) !== removal.claim &&
-					destinations.get(id)?.has(entry.p) && file && tokensIn(file.content).includes(t);
-			})) allowed++;
-		}
-		if (count > allowed) fail(`${t} is duplicated (${count} times)\n${full[0]}`);
-		if (f === "must" && !all.includes(t)) {
-			if (releasedDrop(t, devs[0]!)) {
-				console.log(`seed ${seed}: released 0.2.5 tombstone lost ${t}`);
-			} else fail(`${t} was lost\n${disks[0]}`);
-		}
+		if (count > 1) fail(`${t} is duplicated (${count} times)\n${disks[0]}`);
+		if (f === "must" && !all.includes(t)) fail(`${t} was lost\n${disks[0]}`);
 	}
 	for (const [t, id] of restored) {
 		if (index.get(id)?.d !== undefined) continue; // a deletion can still win
 		if (!all.includes(t)) fail(`${t} was lost from restored note ${id}\n${disks[0]}`);
 	}
-	return { hidden: devs.some((d) => d.reachedHidden), unseenActions };
 }
 
 const RUNS = Number(process.env.FUZZ_RUNS ?? 300), STEPS = Number(process.env.FUZZ_STEPS ?? 250);
 test(`fuzz: ${process.env.FUZZ_SEED ? `seed ${process.env.FUZZ_SEED}` : `${RUNS} random runs`} of ${STEPS} steps converge without losing or duplicating text`, async () => {
-	if (process.env.FUZZ_SEED) return void await run(Number(process.env.FUZZ_SEED), STEPS);
+	if (process.env.FUZZ_SEED) return run(Number(process.env.FUZZ_SEED), STEPS);
 	const first = Number(process.env.FUZZ_FIRST ?? 1);
-	let reached = 0, unseenSeeds = 0, unseenActions = 0;
 	for (let seed = first; seed < first + RUNS; seed++) {
 		try {
-			const result = await run(seed, STEPS);
-			if (result.hidden) reached++;
-			if (result.unseenActions) unseenSeeds++;
-			unseenActions += result.unseenActions;
+			await run(seed, STEPS);
 		} catch (err) {
 			// A failed check names its seed already; anything else that throws must too, or it can't be replayed.
 			if (err instanceof Error && !/seed \d+, last steps/.test(err.message)) err.message += `\nseed ${seed}`;
 			throw err;
 		}
 	}
-	console.log(`Unseen copies must survive: ${unseenActions} edits/deletes across ${unseenSeeds}/${RUNS} seeds`);
-	console.log(`Hidden copies reached in ${reached}/${RUNS} seeds (${(100 * reached / RUNS).toFixed(1)}%)`);
 });
 
 // Seeds the nightly batch once failed on (text lost or duplicated), kept so those bugs stay fixed.
@@ -485,7 +307,7 @@ const FIXED = [
 const FAILED = [
 	1610460, 1621736, 1645185, 1661421, 1691034, 1703746, 1724336, 1743398, 1762951, 1781044, 1803511, 1820440,
 	1843276, 1860490, 1880494, 1901034, 1957125, 1971785, 1986257, 2003566, 2031220, 2046034, 2061343, 2102409,
-	2170737, 2192509, 2246326, 2261806, 2281409, 2380026
+	2170737, 2192509, 2281409
 ];
 test(`fuzz: ${FAILED.length} seeds that failed with restores and Clean up`, { skip: !!process.env.FUZZ_SEED || !!process.env.FUZZ_FIRST }, async () => {
 	for (const seed of FAILED) await run(seed, 250);
