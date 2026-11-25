@@ -42,8 +42,8 @@ const unb64 = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 
 function loadDoc(state?: Uint8Array, clientId?: number) {
 	const doc = new Y.Doc();
-	if (clientId !== undefined) doc.clientID = clientId;
 	if (state) Y.applyUpdate(doc, state);
+	if (clientId !== undefined) doc.clientID = clientId;
 	return doc;
 }
 
@@ -112,6 +112,7 @@ export interface NoteEntry {
 	forkedHash?: string;
 	held?: boolean;
 	change?: NoteStructure;
+	legacy?: NoteStructure; // fallback for a legacy row omitted from genesis
 	inFlight?: NoteRequest;
 	join?: { path: string; hash: string };
 	firstTextPending?: boolean;
@@ -141,6 +142,8 @@ export interface NoteBlocked {
 
 export interface BrakeState {
 	count: number;
+	awaiting?: boolean;
+	reviewIds?: string[];
 	approvedIds?: string[]; // exact note IDs covered by the owner's approval
 	declined?: boolean;
 	declinedIds?: string[]; // incoming deletion note IDs held by decline (stop counting toward new prompts)
@@ -176,7 +179,11 @@ export interface LegacyNoteSeed {
 }
 
 export type NoteInput =
+	| { t: "intentDeferred" }
+	| { t: "forgotten"; req: string }
+	| { t: "recheck" }
 	| { t: "crashRestart" }
+	| { t: "setFirstSync"; firstSync: boolean; noteAuthority?: boolean }
 	| { t: "finishFirstSync" }
 	| { t: "migrateFromLegacy"; seed: LegacyNoteSeed }
 	| {
@@ -192,7 +199,7 @@ export type NoteInput =
 	| { t: "yjsUpdate"; id: string; docState: Uint8Array; isFirstTextAck?: boolean; textQueued?: boolean }
 	| { t: "editorOpen"; id: string }
 	| { t: "editorClose"; id: string }
-	| { t: "row"; row: NoteRow }
+	| { t: "row"; row: NoteRow; catchUp?: boolean }
 	| { t: "userRestore"; id: string; path?: string; deletionSeq?: number }
 	| { t: "answer"; req: string; ok?: number; refused?: { row: NoteRow | null; missing: boolean } }
 	| {
@@ -200,9 +207,10 @@ export type NoteInput =
 		intent: NoteIntent;
 		outcome: "applied" | "landed" | "preconditionFailed" | "unreadable" | "caseClash";
 		after?: DiskObsFile;
+		source?: DiskObsFile;
 	}
-	| { t: "brakeApproved" }
-	| { t: "brakeDeclined" }
+	| { t: "brakeApproved"; ids?: string[] }
+	| { t: "brakeDeclined"; ids?: string[] }
 	| { t: "pathDirty"; path: string; delta: 1 | -1 };
 
 export type NoteAction =
@@ -221,7 +229,9 @@ export interface StepEnv {
 	newId(): string;
 	hash(text: string): string;
 	brake?: { minCount: number; minFraction: number };
-	attachmentPendingDeletes?: number;
+	catchingUp?: boolean;
+	announcedPaths?: ReadonlyMap<string, number>;
+	attachmentDeletes?: {key: string; incoming: boolean}[];
 	attachmentTotalLive?: number;
 }
 
@@ -318,7 +328,7 @@ function setEntry(s: VaultNoteState, next: NoteEntry): void {
 	}
 	if (next.diskPath !== undefined) s.byPath.set(next.diskPath, next.id);
 	const knownDoc = s.filesToDocs.get(next.file);
-	if (knownDoc && knownDoc !== next.id) throw new Error("A note's file and document IDs must stay together");
+	if ((old && old.file !== next.file) || (knownDoc && knownDoc !== next.id)) throw new Error("A note's file and document IDs must stay together");
 	s.filesToDocs.set(next.file, next.id);
 	s.notes.set(next.id, next);
 	s.touched.add(next.id);
@@ -444,7 +454,7 @@ function clearResolvedBlockers(state: VaultNoteState): void {
 	for (const [id, block] of state.blocked) {
 		const n = state.notes.get(id);
 		const authRow = state.notes.get(block.authority)?.row;
-		if (!n || (authRow && authRow.seq !== block.seq)) {
+		if (!n || (authRow && authRow.seq !== block.seq) || (n.diskPath && !block.endpoints.some(([p]) => p === n.diskPath))) {
 			state.blocked.delete(id);
 			continue;
 		}
@@ -476,27 +486,8 @@ function isDirty(state: VaultNoteState, path: string | undefined): boolean {
  * cancels outgoing `del` changes so their notes restore back to disk from stored text,
  * while incoming deletions from peers remain held until `BrakeApproved`.
  */
-function declineBrake(state: VaultNoteState): void {
-	const declinedIds: string[] = [];
-	for (const n of state.notes.values()) {
-		if (n.change?.t === "del" && n.row?.deleted == null && !n.inFlight) {
-			setEntry(state, {
-				...n,
-				change: undefined,
-				missing: undefined,
-				diskPath: undefined,
-				forkedHash: undefined,
-			});
-		} else if (n.row?.deleted != null && n.diskPath) {
-			declinedIds.push(n.id);
-		}
-	}
-	if (declinedIds.length > 0) {
-		state.brakePaused = { count: declinedIds.length, declined: true, declinedIds };
-	} else {
-		state.brakePaused = undefined;
-	}
-	state.fullScan = true;
+function noteDeletionKey(n: NoteEntry, incoming: boolean) {
+	return `note/${incoming ? "remove" : "del"}/${n.id}/${n.row?.seq ?? 0}`;
 }
 
 function settleStartupIntent(s: VaultNoteState, env: StepEnv): void {
@@ -516,7 +507,8 @@ function settleStartupIntent(s: VaultNoteState, env: StepEnv): void {
 					missing: undefined,
 					forkedHash: undefined,
 					held: false,
-					baseState: n.intended ?? s.docs.get(op.id),
+					basePath: n.row?.path === op.path ? op.path : n.basePath,
+						baseState: n.intended ?? s.docs.get(op.id),
 					baseStat: { ...obs.stat, hash: obsHash },
 					intended: undefined,
 					intendedHash: undefined,
@@ -566,30 +558,95 @@ function settleStartupIntent(s: VaultNoteState, env: StepEnv): void {
 	}
 }
 
+function needsRevival(n: NoteEntry, row: NoteRow, doc: Uint8Array, env: StepEnv) {
+	// A second user deletion waits for the outstanding restore's row. Its old
+	// snapshot cannot turn that later decision back into the first restore.
+	return !(n.inFlight?.action === "restore" && n.change?.t === "del") && env.crdt.outsideDeletion(row, doc);
+}
+
+function receiveRow(s: VaultNoteState, row: NoteRow, env: StepEnv) {
+	const docForFile = s.filesToDocs.get(row.file);
+	if (docForFile && docForFile !== row.id) throw new Error("A note's file and document IDs must stay together");
+	const existing = s.notes.get(row.id);
+	if (existing && existing.file !== row.file) throw new Error("A note's file and document IDs must stay together");
+	if (existing?.row && existing.row.seq >= row.seq) return;
+
+	let next: NoteEntry = existing ?? {
+		id: row.id,
+		file: row.file,
+		editor: "closed",
+	};
+	next = { ...next, row, legacy: undefined };
+	if (next.inFlight?.accepted !== undefined && next.inFlight.accepted <= row.seq) {
+		const req = next.inFlight.req;
+		const finishedAction = next.inFlight.action;
+		const acceptedPath = next.inFlight.path;
+		const wasChange = next.inFlight.change;
+		next.inFlight = undefined;
+		if (finishedAction !== "del") next.basePath = acceptedPath;
+		if (next.change && JSON.stringify(next.change) === JSON.stringify(wasChange)
+			&& !(wasChange.t === "del" && finishedAction === "set")) {
+			next.change = undefined;
+		} else if (next.change?.t === "set" && finishedAction === "set") {
+			next.change = { ...next.change, basePath: acceptedPath };
+		}
+	}
+	const block = s.blocked.get(row.id);
+	if (block && block.authority === row.id && block.seq !== row.seq) s.blocked.delete(row.id);
+
+	if (row.deleted != null) {
+		next.conflictOriginPath = undefined;
+		const docState = s.docs.get(row.id);
+		if (next.change?.t === "set" && next.change.legacyRestore && row.vector) {
+			next.change = { t: "restore", path: next.change.path, base: row.seq };
+		} else if (docState && needsRevival(next, row, docState, env)) {
+			if (next.change?.t !== "restore" || next.change.base !== row.seq) {
+				next.change = { t: "restore", path: row.path, base: row.seq };
+			}
+		}
+	}
+	setEntry(s, next);
+}
+
 export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): VaultNoteState {
 	const s = cloneState(prev);
 	s.lastOpenResult = undefined;
 	s.pendingProblems = [];
 
 	switch (input.t) {
+		case "intentDeferred": {
+			const n = s.intent && s.notes.get(s.intent.id);
+			if (n && s.intent?.kind === "write") setEntry(s, { ...n, intended: undefined, intendedHash: undefined });
+			s.intent = undefined;
+			return s;
+		}
+		case "forgotten": s.forget.delete(input.req); return s;
+		case "recheck": s.fullScan = true; return s;
 		case "crashRestart": {
 			s.dirtyPaths.clear();
 			s.observed.clear();
 			s.listingComplete = false;
 			// Keep durable s.intent across restart so the first complete startup listing settles it cleanly.
-			s.brakePaused = s.brakePaused?.declined ? { ...s.brakePaused } : undefined;
+			// Preserve the exact outstanding approvals until inventory can recount both file types.
 			s.emittedNotices.clear();
 			s.fullScan = true;
 			for (const n of s.notes.values()) {
 				const next: NoteEntry = { ...n };
 				if (next.editor === "open") next.editor = "owed-recover";
-				if (!s.firstSync) next.join = undefined;
+
 				if (next.unpublished) {
 					if (next.unpublished.isSnapshot) next.needsSnapshotPublish = true;
 					else next.needsInitialPublish = true;
 				}
 				setEntry(s, next);
 			}
+			return s;
+		}
+
+		case "setFirstSync": {
+			s.firstSync = input.firstSync;
+			if (input.noteAuthority !== undefined) s.noteAuthority = input.noteAuthority;
+			s.fullScan = true;
 			return s;
 		}
 
@@ -624,23 +681,25 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 			return s;
 		}
 
-		case "brakeApproved": {
-			const approvedIds: string[] = [];
-			for (const n of s.notes.values()) {
-				if (n.change?.t === "del" && !n.inFlight) approvedIds.push(n.id);
-				else if (n.row?.deleted != null && n.diskPath && !s.blocked.has(n.id)) {
-					const docState = s.docs.get(n.id);
-					if (!docState || !env.crdt.outsideDeletion(n.row, docState)) approvedIds.push(n.id);
+		case "brakeApproved":
+		case "brakeDeclined": {
+			const brake = s.brakePaused;
+			const ids = input.ids ?? brake?.reviewIds ?? brake?.declinedIds ?? [];
+			const selected = new Set(ids);
+			const held = new Set(brake?.declinedIds), approved = new Set(brake?.approvedIds);
+			if (input.t === "brakeApproved") {
+				for (const key of ids) { approved.add(key); held.delete(key); }
+			} else {
+				for (const key of ids) held.add(key);
+				for (const n of s.notes.values()) {
+					if (n.change?.t === "del" && !n.inFlight && selected.has(noteDeletionKey(n, false))) {
+						setEntry(s, { ...n, change: undefined, missing: undefined, diskPath: undefined, forkedHash: undefined });
+					}
 				}
 			}
-			s.brakePaused = { count: approvedIds.length, approvedIds, declined: false };
+			s.brakePaused = { count: held.size, declined: !!held.size, declinedIds: [...held], approvedIds: [...approved] };
 			s.emittedNotices.clear();
 			s.fullScan = true;
-			return s;
-		}
-
-		case "brakeDeclined": {
-			declineBrake(s);
 			return s;
 		}
 
@@ -678,7 +737,7 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 			if (input.isFirstTextAck && n.firstTextPending) {
 				next = { ...next, firstTextPending: false, needsInitialPublish: false, unpublished: undefined };
 			}
-			if (next.row?.deleted != null && env.crdt.outsideDeletion(next.row, input.docState)) {
+			if (next.row?.deleted != null && needsRevival(next, next.row, input.docState, env)) {
 				if (next.change?.t !== "restore" || next.change.base !== next.row.seq) {
 					next = { ...next, change: { t: "restore", path: next.row.path, base: next.row.seq } };
 				}
@@ -687,52 +746,9 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 			return s;
 		}
 
-		case "row": {
-			const { row } = input;
-			const docForFile = s.filesToDocs.get(row.file);
-			if (docForFile && docForFile !== row.id) throw new Error("A note's file and document IDs must stay together");
-			const existing = s.notes.get(row.id);
-			if (existing && existing.file !== row.file) throw new Error("A note's file and document IDs must stay together");
-			if (existing?.row && existing.row.seq >= row.seq) return s;
-
-			let next: NoteEntry = existing ?? {
-				id: row.id,
-				file: row.file,
-				editor: "closed",
-			};
-			next = { ...next, row };
-			if (next.inFlight?.accepted !== undefined && next.inFlight.accepted <= row.seq) {
-				const req = next.inFlight.req;
-				const finishedAction = next.inFlight.action;
-				const acceptedPath = next.inFlight.path;
-				const wasChange = next.inFlight.change;
-				s.forget.set(req, true);
-				next.inFlight = undefined;
-				if (finishedAction !== "del") next.basePath = acceptedPath;
-				if (next.change && JSON.stringify(next.change) === JSON.stringify(wasChange)
-					&& !(wasChange.t === "del" && finishedAction === "set")) {
-					next.change = undefined;
-				} else if (next.change?.t === "set" && finishedAction === "set") {
-					next.change = { ...next.change, basePath: acceptedPath };
-				}
-			}
-			const block = s.blocked.get(row.id);
-			if (block && block.authority === row.id && block.seq !== row.seq) s.blocked.delete(row.id);
-
-			if (row.deleted != null) {
-				next.conflictOriginPath = undefined;
-				const docState = s.docs.get(row.id);
-				if (next.change?.t === "set" && next.change.legacyRestore && row.vector) {
-					next.change = { t: "restore", path: next.change.path, base: row.seq };
-				} else if (docState && env.crdt.outsideDeletion(row, docState)) {
-					if (next.change?.t !== "restore" || next.change.base !== row.seq) {
-						next.change = { t: "restore", path: row.path, base: row.seq };
-					}
-				}
-			}
-			setEntry(s, next);
+		case "row":
+			receiveRow(s, input.row, env);
 			return s;
-		}
 
 		case "userRestore": {
 			const n = s.notes.get(input.id);
@@ -774,21 +790,8 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				return s;
 			}
 			const refusedRow = input.refused?.row ?? null;
-			if (refusedRow) {
-				const docForFile = s.filesToDocs.get(refusedRow.file);
-				if (docForFile && docForFile !== refusedRow.id) throw new Error("A note's file and document IDs must stay together");
-			}
-			let next: NoteEntry = { ...owner, inFlight: undefined };
-			if (refusedRow && refusedRow.id === owner.id && (!owner.row || owner.row.seq < refusedRow.seq)) {
-				next.row = refusedRow;
-				if (refusedRow.deleted != null) next.conflictOriginPath = undefined;
-			} else if (refusedRow && refusedRow.id !== owner.id) {
-				// Record occupant row so next() sees the taken path and picks a conflict/(restored) suffix.
-				const occupant = s.notes.get(refusedRow.id);
-				if (!occupant || !occupant.row || occupant.row.seq < refusedRow.seq) {
-					setEntry(s, { ...(occupant ?? { id: refusedRow.id, file: refusedRow.file, editor: "closed" }), row: refusedRow });
-				}
-			}
+			if (refusedRow) receiveRow(s, refusedRow, env);
+			const next: NoteEntry = { ...s.notes.get(owner.id)!, inFlight: undefined };
 			if (next.change) {
 				if (next.row?.deleted != null && next.change.t === "del") next.change = undefined;
 				else if (next.change.t === "set" && next.row) {
@@ -815,12 +818,14 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				if (input.outcome === "applied" || input.outcome === "landed") {
 					const writtenHash = input.after?.hash ?? n.intendedHash ?? env.hash(op.text);
 					if (input.after) s.observed.set(op.path, input.after);
+					s.blocked.delete(n.id);
 					const next: NoteEntry = {
 						...n,
 						diskPath: op.path,
 						missing: undefined,
 						forkedHash: undefined,
 						held: false,
+						basePath: n.row?.path === op.path ? op.path : n.basePath,
 						baseState: n.intended ?? s.docs.get(op.id),
 						baseStat: input.after ? { ...input.after.stat, hash: writtenHash } : n.baseStat,
 						intended: undefined,
@@ -831,11 +836,15 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				} else {
 					if (input.after) s.observed.set(op.path, input.after);
 					else if (input.outcome === "preconditionFailed") s.observed.delete(op.path);
-					if (input.outcome === "unreadable" || input.outcome === "caseClash") {
+					if (input.outcome === "unreadable" || input.outcome === "caseClash" || (op.expectedHash !== null && !input.after)) {
 						blockNote(s, op.id, op.id, op.seq, [op.path]);
 						if (input.outcome === "caseClash") s.pendingProblems.push([op.path, "Another note differs only by case on this device"]);
 					}
 					setEntry(s, { ...n, intended: undefined, intendedHash: undefined });
+					if (n.missing && !input.after && input.outcome === "preconditionFailed") {
+						s.blocked.delete(n.id);
+						markMissingNote(s, s.notes.get(n.id)!, n.missing.path, env);
+					}
 					if (
 						input.outcome === "preconditionFailed" &&
 						op.expectedHash === null &&
@@ -879,12 +888,14 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 					}
 					setEntry(s, { ...n, diskPath: op.path, missing: undefined, change, conflictOriginPath });
 				} else {
-					if (input.outcome === "unreadable" || input.outcome === "caseClash") {
-						blockNote(s, op.id, op.id, op.seq, [op.from, op.path]);
-						if (input.outcome === "caseClash") s.pendingProblems.push([op.path, "Another note differs only by case on this device"]);
-					} else {
-						s.touched.add(op.id);
+					if (input.after) s.observed.set(op.path, input.after);
+					else s.observed.delete(op.path);
+					if ("source" in input) {
+						if (input.source) s.observed.set(op.from, input.source);
+						else s.observed.delete(op.from);
 					}
+					if (input.outcome === "caseClash") s.pendingProblems.push([op.path, "Another note differs only by case on this device"]);
+					blockNote(s, op.id, op.id, op.seq, [op.from, op.path]);
 				}
 				return s;
 			}
@@ -906,6 +917,7 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				});
 			} else {
 				if (input.after) s.observed.set(op.path, input.after);
+				else s.observed.delete(op.path);
 				if (input.outcome === "unreadable" || input.outcome === "caseClash") {
 					blockNote(s, op.id, op.id, op.seq, [op.path]);
 				} else {
@@ -927,7 +939,11 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				}
 			} else {
 				for (const [p, f] of input.files) s.observed.set(p, f);
-				if (input.path && !input.files.has(input.path) && input.listingComplete) s.observed.delete(input.path);
+				if (input.path && !input.files.has(input.path) && input.listingComplete) {
+					s.observed.delete(input.path);
+					const id = s.byPath.get(input.path);
+					if (id && input.event === "changed" && !s.intent) blockNote(s, id, id, s.notes.get(id)?.row?.seq ?? 0, [input.path]);
+				}
 				if (input.from && !input.files.has(input.from) && input.listingComplete) s.observed.delete(input.from);
 				if (input.path) {
 					const owner = s.byPath.get(input.path) ?? s.rowsByPath.get(input.path);
@@ -950,9 +966,19 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				const priorId = s.byPath.get(input.to);
 				if (priorId && priorId !== id) {
 					const prior = s.notes.get(priorId);
-					if (prior) markMissingNote(s, prior, input.to, env);
+					const obsTo = s.observed.get(input.to);
+					const obsToHash = obsTo && !obsTo.unreadable && obsTo.text !== undefined
+						? (obsTo.hash ?? env.hash(obsTo.text))
+						: undefined;
+					// Ignore delayed watcher echo of our own move (from already gone, to already matches priorId's stored bytes).
+					const ownMoveEcho = !id && prior && obsTo && obsToHash !== undefined && (
+						obsToHash === prior.baseStat?.hash ||
+						obsTo.text === cachedText(env.crdt, s.docs.get(priorId))
+					);
+					if (prior && !ownMoveEcho) markMissingNote(s, prior, input.to, env);
 				}
 				if (id) {
+					s.blocked.delete(id);
 					const n = s.notes.get(id)!;
 					const resolvedOrigin = n.conflictOriginPath && input.to !== n.conflictOriginPath ? undefined : n.conflictOriginPath;
 					setEntry(s, {
@@ -1013,6 +1039,7 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				// Try join if firstSync candidate matches complete doc text.
 				const rowId = s.rowsByPath.get(path);
 				const rowNote = rowId ? s.notes.get(rowId) : undefined;
+				if (rowNote?.join?.path === path && !rowNote.diskPath) continue;
 				if (s.firstSync && rowNote && !rowNote.diskPath) {
 					const docText = cachedText(env.crdt, s.docs.get(rowNote.id));
 					if (docText === undefined) {
@@ -1054,20 +1081,18 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				});
 			}
 
-			// Clear leftover join markers once firstSync is over.
-			if (!s.firstSync) {
-				for (const n of [...s.notes.values()]) {
-					if (n.join) setEntry(s, { ...n, join: undefined });
-				}
-			}
-
 			// Missing owned files: only on explicit delete event (mayDelete !== false) or complete startup scan.
 			if (s.listingComplete) {
 				const checkDelete = (n: NoteEntry) => {
-					if (!n.diskPath || n.intended || s.intent?.id === n.id || isDirty(s, n.diskPath)) return;
+					if (!n.diskPath || isDirty(s, n.diskPath)) return;
 					if (s.observed.has(n.diskPath)) return;
 					if (input.event === "startup" || (input.event === "deleted" && input.mayDelete !== false && input.path === n.diskPath)) {
-						markMissingNote(s, n, n.diskPath, env);
+						if (s.intent?.id === n.id) {
+							if (s.intent.kind === "write") {
+								const snapshot = captureSnapshot(s, n, env);
+								if (snapshot) setEntry(s, { ...n, missing: { path: n.diskPath, snapshot } });
+							}
+						} else markMissingNote(s, n, n.diskPath, env);
 					}
 				};
 				for (const n of [...s.notes.values()]) checkDelete(n);
@@ -1097,12 +1122,33 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 		let n = s.notes.get(id);
 		if (!n) continue;
 
+		if (n.legacy && !n.row && s.listingComplete) {
+			const doc = s.docs.get(id);
+			const path = n.legacy.path;
+			if (doc && cachedText(env.crdt, doc) !== undefined) {
+				// Catch-up has no row for this stable ID. Its old ack cannot prove the
+				// Worker holds a complete body. Republish the full state before CAS.
+				if (!n.change) actions.push({t: "problem", path, message: "Missing from migration. Re-proposing the local note."});
+				n = { ...n, change: n.change ?? n.legacy, legacy: undefined,
+					firstTextPending: true, needsInitialPublish: true, unpublished: { update: doc } };
+				setEntry(s, n);
+			} else {
+				// No complete local document to edit. Preserve readable disk text
+				// verbatim through the usual conflict-copy rule while the ID waits.
+				const disk = n.diskPath && s.observed.get(n.diskPath);
+				if (n.diskPath && disk && !disk.unreadable && disk.text !== undefined && !isDirty(s,n.diskPath)) {
+					const hash = disk.hash ?? env.hash(disk.text);
+					if (n.forkedHash !== hash) n = handleConflictOrHold(s,n,n.diskPath,disk.text,hash,disk.stat,env,actions);
+				}
+			}
+		}
+
 		if (n.join && !n.diskPath) {
 			const obs = s.observed.get(n.join.path);
 			const docState = s.docs.get(n.id);
 			const docText = cachedText(env.crdt, docState);
 			if (obs && !obs.unreadable && obs.text !== undefined && docText !== undefined) {
-				if (docText === obs.text && !s.byPath.has(n.join.path)) {
+				if (docText === obs.text && n.join.hash === (obs.hash ?? env.hash(obs.text)) && !s.byPath.has(n.join.path)) {
 					n = {
 						...n,
 						diskPath: n.join.path,
@@ -1158,7 +1204,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 			}
 		}
 
-		if (n.editor === "owed-doc" && n.missing) {
+		if (n.editor === "owed-doc" && n.missing && s.intent?.id !== n.id) {
 			const dropChange = n.row?.deleted != null && !n.inFlight;
 			n = {
 				...n,
@@ -1176,7 +1222,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 		const docText = cachedText(env.crdt, docState);
 
 		if (n.row?.deleted != null) {
-			if (docState && env.crdt.outsideDeletion(n.row, docState)) {
+			if (docState && needsRevival(n, n.row, docState, env)) {
 				if (n.change?.t !== "restore" || n.change.base !== n.row.seq) {
 					n = { ...n, change: { t: "restore", path: n.row.path, base: n.row.seq } };
 					setEntry(s, n);
@@ -1250,6 +1296,8 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 						n = {
 							...n,
 							baseState: agreement,
+							change: n.row?.deleted != null && env.crdt.outsideDeletion(n.row, agreement)
+								? { t: "restore", path: n.row.path, base: n.row.seq } : n.change,
 							baseStat: { ...obs.stat, hash: diskHash },
 							unpublished: { update },
 						};
@@ -1263,7 +1311,6 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 			}
 		}
 	}
-	s.touched.clear();
 
 	// Pass 2: Evaluate deletion brake against exact pending deletion IDs.
 	// Known limit: deletions made one by one while the app runs don't trip the brake (catching that would need a time window).
@@ -1273,31 +1320,32 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 
 	for (const n of s.notes.values()) {
 		if (n.row?.deleted == null || n.diskPath !== undefined) totalLiveFiles++;
-		if (n.change?.t === "del" && !n.inFlight) pendingDeleteIds.push(n.id);
+		if (n.change?.t === "del" && !n.inFlight) pendingDeleteIds.push(noteDeletionKey(n, false));
 		if (n.row?.deleted != null && n.diskPath && !s.blocked.has(n.id)) {
 			const docState = s.docs.get(n.id);
-			if (!docState || !env.crdt.outsideDeletion(n.row, docState)) incomingRemoveIds.push(n.id);
+			if (!docState || !env.crdt.outsideDeletion(n.row, docState)) incomingRemoveIds.push(noteDeletionKey(n, true));
 		}
 	}
 
-	const allDeleteIds = [...pendingDeleteIds, ...incomingRemoveIds];
+	const external = env.attachmentDeletes?.map(d => d.key) ?? [];
+	const allDeleteIds = [...pendingDeleteIds, ...incomingRemoveIds, ...external];
 	const approvedSet = new Set(s.brakePaused?.approvedIds ?? []);
 	const declinedSet = new Set(s.brakePaused?.declinedIds ?? []);
 	// Stickily ignore incoming removals that were already declined by the owner.
-	const activeDeclinedIds = incomingRemoveIds.filter(id => declinedSet.has(id));
+	const activeDeclinedIds = [...incomingRemoveIds, ...external].filter(id => declinedSet.has(id));
 	const unapprovedDeleteIds = allDeleteIds.filter(id => !approvedSet.has(id) && !(s.brakePaused?.declined && declinedSet.has(id)));
-	const unapprovedCount = unapprovedDeleteIds.length + (env.attachmentPendingDeletes ?? 0);
+	const unapprovedCount = unapprovedDeleteIds.length;
 	const brakeCfg = env.brake ?? DEFAULT_BRAKE;
 	const exceeds = unapprovedCount > brakeCfg.minCount && unapprovedCount > brakeCfg.minFraction * Math.max(1, totalLiveFiles);
 
 	if (exceeds) {
 		s.brakePaused = {
-			count: unapprovedCount,
+			count: unapprovedCount, awaiting: true, reviewIds: unapprovedDeleteIds,
 			approvedIds: s.brakePaused?.approvedIds?.filter(id => allDeleteIds.includes(id)),
 			declined: s.brakePaused?.declined,
 			declinedIds: activeDeclinedIds.length ? activeDeclinedIds : undefined,
 		};
-		const brakeNoticeKey = `brake:${unapprovedCount}`;
+		const brakeNoticeKey = "brake:" + unapprovedDeleteIds.join(",");
 		if (!s.emittedNotices.has(brakeNoticeKey)) {
 			s.emittedNotices.add(brakeNoticeKey);
 			actions.push({
@@ -1323,10 +1371,11 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 			actions.push({
 				t: "problem",
 				path: "",
-				message: `${activeDeclinedIds.length} deleted files held on this device; approve to remove them`,
+				message: `${activeDeclinedIds.length} deleted files held on this device; use the Review held deletions command to remove them`,
 			});
 		}
 	} else {
+		for (const key of s.emittedNotices) if (key.startsWith("brake:")) s.emittedNotices.delete(key);
 		const remainingApproved = s.brakePaused?.approvedIds?.filter(id => allDeleteIds.includes(id)) ?? [];
 		if (remainingApproved.length > 0) {
 			s.brakePaused = { count: remainingApproved.length, approvedIds: remainingApproved };
@@ -1337,7 +1386,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 
 	// Emit Worker requests (unless paused by brake above).
 	for (const n of [...s.notes.values()]) {
-		if (!n.change || n.inFlight || n.firstTextPending) continue;
+		if (!n.change || n.inFlight || n.firstTextPending || n.legacy) continue;
 		const change = n.change;
 		if (isDirty(s, change.path)) continue;
 		if (change.t === "set" && n.row && (n.row.deleted !== null || n.row.path === change.path || n.row.path !== change.basePath)) {
@@ -1451,8 +1500,8 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 
 	// P1: Remove live disk files for confirmed tombstones (held when brake declined).
 	for (const n of sorted) {
-		if (declinedIncoming.has(n.id)) continue;
-		if (!n.diskPath || n.editor === "open" || s.blocked.has(n.id) || isDirty(s, n.diskPath)) continue;
+		if (declinedIncoming.has(noteDeletionKey(n, true))) continue;
+		if (!n.diskPath || n.held || n.editor === "open" || s.blocked.has(n.id) || isDirty(s, n.diskPath)) continue;
 		if (n.row?.deleted == null) continue;
 		const docState = s.docs.get(n.id);
 		if (docState && env.crdt.outsideDeletion(n.row, docState)) continue;
@@ -1468,7 +1517,7 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 
 	// P2: Move placed files whose desired path moved to a free path (run before vacating occupants).
 	for (const n of sorted) {
-		if (!n.diskPath || n.editor === "open" || s.blocked.has(n.id) || n.row?.deleted != null) continue;
+		if (!n.diskPath || n.held || n.editor === "open" || s.blocked.has(n.id) || n.row?.deleted != null) continue;
 		const want = desiredPath(n);
 		if (!want || want === n.diskPath) continue;
 		if (isDirty(s, n.diskPath) || isDirty(s, want)) continue;
@@ -1500,7 +1549,7 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 		const ownerId = s.byPath.get(want);
 		if (ownerId && ownerId !== n.id) {
 			const owner = s.notes.get(ownerId)!;
-			if (owner.editor === "open" || s.blocked.has(ownerId) || isDirty(s, want)) continue;
+			if (owner.editor === "open" || owner.held || declinedIncoming.has(noteDeletionKey(owner, true)) || s.blocked.has(ownerId) || isDirty(s, want)) continue;
 			if (owner.row?.deleted === null && owner.row.path === want) continue;
 			const obs = s.observed.get(want);
 			if (!obs || obs.unreadable || obs.text === undefined) continue;
@@ -1562,7 +1611,16 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 }
 
 export function step(state: VaultNoteState, input: NoteInput, env: StepEnv): { state: VaultNoteState; actions: NoteAction[] } {
-	return next(apply(state, input, env), env);
+	if (env.announcedPaths) {
+		state = { ...state, dirtyPaths: new Map(env.announcedPaths), fullScan: state.fullScan || [...state.dirtyPaths.keys()].some(p => !env.announcedPaths!.has(p)) };
+	}
+	if (env.catchingUp && input.t === "editorOpen") return { state, actions: [{t: "openResult", id: input.id, allowed: false}] };
+	const applied = apply(state, input, env);
+	if (!applied.noteAuthority || env.catchingUp || input.t === "crashRestart" || input.t === "setFirstSync" ||
+		(input.t === "row" && input.catchUp) || (!applied.listingComplete && env.announcedPaths)) {
+		return { state: applied, actions: [] };
+	}
+	return next(applied, env);
 }
 
 // --- Durable Store Wrapper (parallel to TableDevice in device.ts) ---
@@ -1599,7 +1657,7 @@ export class NoteDevice {
 	static async open(store: Store): Promise<NoteDevice> {
 		const entries = await store.list<NoteEntry>(NOTE_STATE_PREFIX);
 		const meta = await store.get<PersistedNoteMeta>(NOTE_META_KEY);
-		if (!entries.length && !meta) {
+		if (!meta && !entries.length) {
 			if (await store.get("table/note-authority")) {
 				throw new Error("Pre-release table note state detected; reset vault sync data required");
 			}
@@ -1610,6 +1668,8 @@ export class NoteDevice {
 			}
 		}
 		const state = emptyVaultNoteState(meta?.firstSync ?? false);
+		state.listingComplete = false;
+		state.noteAuthority = meta?.noteAuthority ?? false;
 		if (meta) {
 			state.noteAuthority = meta.noteAuthority;
 			state.intent = meta.intent;
@@ -1655,6 +1715,10 @@ export class NoteDevice {
 			}
 			for (const [id, entry] of after.notes) {
 				if (before.notes.get(id) !== entry) puts.set(NOTE_STATE_PREFIX + id, entry);
+				// Catch-up can defer publication while a disk event creates a new note.
+				// Its private body and the obligation to publish must survive the same crash.
+				const doc = after.docs.get(id);
+				if (entry.unpublished && doc && doc !== before.docs.get(id)) puts.set("state:" + id, doc);
 			}
 			for (const id of before.notes.keys()) {
 				if (!after.notes.has(id)) deletes.push(NOTE_STATE_PREFIX + id);

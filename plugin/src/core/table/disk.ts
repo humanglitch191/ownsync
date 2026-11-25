@@ -1,7 +1,7 @@
 // A plan is committed before executing any filesystem intent. The injected adapter owns the
 // private plugin-folder temp file and the conditional mutations at the visible endpoints.
 import type { Disk, DiskFile, Ref } from "../ports";
-import { reconcile, reserved, type Blocked, type Inputs, type Observation, type State, type TableDevice } from "./device";
+import { proposeLegacy, reconcile, reserved, type Blocked, type Inputs, type Observation, type State, type TableDevice } from "./device";
 
 export type Event = { kind: "startup" | "settle" } | { kind: "changed" | "deleted"; path: string }
 	| { kind: "renamed"; from: string; to: string };
@@ -12,8 +12,10 @@ export interface DiskInputs extends Inputs {
 	hash(bytes: Uint8Array): Promise<string>;
 	readStage(ref: Ref): Promise<Uint8Array | undefined>;
 	fetch(ref: Ref): Promise<Uint8Array>;
+	legacyVersion?(path: string, ref: Ref): Promise<Ref | undefined>;
 }
 export interface DiskPort extends Pick<Disk, "stat" | "list" | "readBinary"> {
+	allowed?(path: string): boolean;
 	writeTemp(bytes: Uint8Array): Promise<void>;
 	discardTemp(): Promise<void>;
 	// Recheck immediately at mutation, including destination absence. A failed precondition preserves user bytes.
@@ -121,14 +123,14 @@ async function parkCycle(s: State, view: Map<string, Observation>, inputs: DiskI
 	}
 }
 
-export async function planDisk(device: TableDevice, disk: DiskPort, inputs: DiskInputs, event: Event, failedDownloads?: Set<string>) {
+export async function planDisk(device: TableDevice, disk: DiskPort, inputs: DiskInputs, event: Event, failedDownloads?: Set<string>, recoverIntent = true) {
 	if (!inputs.attachments) {
 		await device.change(s => { s.intent = undefined; });
 		return;
 	}
 	if (event.kind === "startup") {
 		await device.change(async () => disk.discardTemp());
-		await executeIntent(device, disk, inputs, failedDownloads);
+		if (recoverIntent) await executeIntent(device, disk, inputs, failedDownloads);
 	}
 	const seen = new Set<string>();
 	let before: number;
@@ -150,9 +152,10 @@ async function planPass(device: TableDevice, disk: DiskPort, inputs: DiskInputs,
 		}
 		// Ingest local changes before creating remote files. Process authoritative missing events even
 		// when another file needs disk work; an event can contain the only evidence of a user rename.
-		const ids = [...new Set([...s.local.keys(), ...s.latest.keys()])];
+		const ids = [...new Set([...s.local.keys(), ...s.latest.keys(), ...s.legacy.keys()])];
 		for (const id of ids) {
-			const local = s.local.get(id), path = local?.path ?? s.latest.get(id)?.path;
+			const legacy = s.legacy.get(id);
+			const local = s.local.get(id), path = local?.path ?? s.latest.get(id)?.path ?? legacy?.path;
 			if (!path || !included(inputs, path) || defer.has(id) || s.blocked.has(id) || failedDownloads?.has(id)) continue;
 			const row = s.latest.get(id);
 			if (row && (!included(inputs, row.path) || row.bytes.n > inputs.maxFileSize)) continue;
@@ -160,6 +163,16 @@ async function planPass(device: TableDevice, disk: DiskPort, inputs: DiskInputs,
 				|| (event.kind === "renamed" && under(path, event.from) && !included(inputs, event.to + path.slice(event.from.length)));
 			if (deleted && local && !view.has(path) && !local.removed && s.intent?.file !== id)
 				s.local.set(id, { ...local, removed: true });
+			if (legacy && !row && (!local || !view.has(local.path))) {
+				if (!reserved(s, id) && (!local || local.removed || deleted) && legacy.bytes.n <= inputs.maxFileSize) {
+					const removed = legacy.removed || (!!local && local.base.bytes?.h === legacy.bytes.h);
+					if (removed && !legacy.removed) s.legacy.set(id, { ...legacy, removed });
+					const bytes = await inputs.legacyVersion?.(path, legacy.bytes);
+					if (bytes) await proposeLegacy(s, id, bytes, removed, inputs);
+					else failedDownloads?.add(id);
+				}
+				continue;
+			}
 			await reconcile(s, id, view, deleted, inputs);
 		}
 		if (!s.intent) await parkCycle(s, view, inputs);

@@ -20,16 +20,6 @@ export async function claim(host: string, key = SETUP_KEY): Promise<string> {
 	return code.split("#")[1]!;
 }
 
-/** The signed-in owner asks a capable device to migrate this vault. */
-export async function migrateNow(host: string, vault: string) {
-	const cookie = await sessions.get(host);
-	if (!cookie) throw new Error("no dashboard session");
-	const response = await fetch(host + "/api/vaults/" + vault + "/migrate", {
-		method: "POST", headers: { origin: host, cookie, "content-type": "application/json" }, body: "{}",
-	});
-	if (!response.ok) throw new Error("migrate now: " + response.status);
-}
-
 export async function ownerOverview(host: string) {
 	const cookie = await sessions.get(host);
 	if (!cookie) throw new Error("no dashboard session");

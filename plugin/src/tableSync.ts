@@ -3,21 +3,21 @@
 import { KIND, chunkName, hex, nameKey, openEnvelope, parseHeader, randomBytes, scopedChunkName, sealEnvelope, tablePathKey, unhex, versionTag } from "../../protocol/ownsync";
 import { decodeClient, encodeClient, MAX_CHUNK, MAX_MARK, type AttachmentRow, type ClientFrame, type ServerFrame } from "../../server/src/wire";
 import * as Y from "yjs";
-import { NoteRows, type NoteRow } from "./core/table/notes";
+import type { NoteRow } from "./core/table/notes";
 import type { VaultKeys } from "./keys";
-import type { NoteMeta, Ref, Store } from "./core/ports";
+import type { Ref, Store } from "./core/ports";
 import { TableDevice, catchUp, conflictSuffix, packRequest, restore, type Answer, type RecordData, type Row } from "./core/table/device";
 import { executeIntent, planDisk, type DiskInputs, type DiskPort, type Event } from "./core/table/disk";
 import type { Engine } from "./core/engine";
-import type { NoteRequest, NoteStructure } from "./core/table/noteDisk";
-import { conflictName } from "./core/places";
+import { NoteSession } from "./core/table/noteSession";
+import type { NoteRequest } from "./core/table/notePlanner";
 import type { GenesisRow } from "./core/table/migration";
 
 type Ask = (packet: Uint8Array, matches: (f: ServerFrame) => boolean) => Promise<ServerFrame>;
 const id = () => hex(randomBytes(16));
 const validHash = (h: unknown) => typeof h === "string" && /^[a-f0-9]{64}$/.test(h);
 export class TableSync {
-	readonly notes: NoteRows;
+	readonly notes: NoteSession;
 	private device?: TableDevice;
 	private ask?: Ask;
 	private synced = false;
@@ -27,21 +27,35 @@ export class TableSync {
 	private inputs: DiskInputs;
 	private key?: Promise<Uint8Array>;
 	constructor(private store: Store, private keys: VaultKeys, private disk: DiskPort, allowed: (p: string) => boolean,
-		attachments: boolean, maxFileSize: number, private problem: (what: string, err: unknown) => void, private noteChanged?: (id: string) => void) {
-		this.notes = new NoteRows(store);
+		attachments: boolean, maxFileSize: number, private problem: (what: string, err: unknown) => void) {
+		this.notes = new NoteSession(store);
+		this.notes.beforeInventory = () => this.planAttachments({kind:"settle"});
 		this.inputs = {
-			id, attachments, maxFileSize, allowed, hash: b => this.hash(b), suffix: (h, n) => this.suffix(h, n),
+			id, attachments, maxFileSize, allowed,
+			holdRemove: (file, seq) => !!this.notes.state?.brakePaused?.declinedIds?.includes(`remove/${file}/${seq}`),
+			hash: b => this.hash(b), suffix: (h, n) => this.suffix(h, n),
 			readStage: r => store.get("table/blob/" + r.u), fetch: r => this.fetch(r), stage: async o => {
 				const bytes = await disk.readBinary(o.path);
-				const ref: Ref = { h: await this.hash(bytes), n: bytes.length, u: id(), s: 1, c: [] };
-				if (ref.h !== o.hash || ref.n !== o.size) throw new Error("Attachment changed during staging");
-				for (let at = 0; at < ref.n; at += MAX_CHUNK)
-					ref.c.push(await this.chunk(ref, ref.c.length, bytes.subarray(at, at + MAX_CHUNK)));
-				if (ref.c.length > MAX_MARK) throw new Error("Attachment exceeds scoped version limit");
-				await store.commit(new Map<string, unknown>([["table/blob/" + ref.u, bytes], ["table/stage/" + ref.u, true]]), []);
-				return ref;
+				if (!o.hash || bytes.length !== o.size) throw new Error("Attachment changed during staging");
+				return this.stageBytes(bytes, o.hash);
+			}, legacyVersion: async (path, ref) => {
+				if (!this.synced) return;
+				try {
+					// Existing scoped chunks can be referenced by an ordinary set. An
+					// unscoped version must be verified and uploaded as a new version.
+					return ref.s ? ref : await this.stageBytes(await this.fetch(ref), ref.h);
+				} catch (err) { this.problem("recovering " + path, err); }
 			}, pack: r => packRequest(r, { pathkey: p => this.pathkey(p), version: r => this.version(r), seal: (f, d) => this.seal(f, d) })
 		};
+	}
+	private async stageBytes(bytes: Uint8Array, expected: string) {
+		const ref: Ref = { h: await this.hash(bytes), n: bytes.length, u: id(), s: 1, c: [] };
+		if (ref.h !== expected) throw new Error("Attachment changed during staging");
+		for (let at = 0; at < ref.n; at += MAX_CHUNK)
+			ref.c.push(await this.chunk(ref, ref.c.length, bytes.subarray(at, at + MAX_CHUNK)));
+		if (ref.c.length > MAX_MARK) throw new Error("Attachment exceeds scoped version limit");
+		await this.store.commit(new Map<string, unknown>([["table/blob/" + ref.u, bytes], ["table/stage/" + ref.u, true]]), []);
+		return ref;
 	}
 	private first() { const k = this.keys.keyFor(0); if (!k) throw new Error("Missing original vault key"); return k; }
 	nameKey() { return this.key ??= nameKey(this.first(), this.keys.vaultId); }
@@ -143,11 +157,11 @@ export class TableSync {
 	}
 	async connect(ask: Ask, engine?: Engine) {
 		this.engine = engine; this.textCaughtUp = false; this.noteActive = false;
-		this.ask = ask; this.synced = false;
+		this.ask = ask; this.synced = false; this.notes.env.catchingUp = !!engine;
 		await this.open();
 		return this.device!.change(s => s.cursor);
 	}
-	disconnect() { this.ask = undefined; this.synced = false; }
+	disconnect() { this.ask = undefined; this.synced = false; this.notes.env.catchingUp = false; }
 	row(frame: AttachmentRow) {
 		const session = this.ask;
 		return this.run(async () => {
@@ -155,10 +169,9 @@ export class TableSync {
 			try {
 				if (frame.version === null) {
 					const note = await this.openNote(frame);
-					await this.notes.receive(note);
+					await this.notes.input({t:"row", row:note, catchUp:!!this.engine && !this.synced});
 					await this.device!.change(s => catchUp(s, { cursor: frame.seq }));
-					this.noteChanged?.(note.id);
-					if (this.noteActive && await this.store.get("table/note-request/" + note.id)) this.noteChanges([note.id]);
+					if (this.noteActive) this.schedule();
 					return;
 				}
 				const row = await this.openRow(frame);
@@ -177,91 +190,44 @@ export class TableSync {
 			await this.device!.change(s => catchUp(s, { cursor }));
 			if (!this.initialized) await this.store.commit(new Map([["table/initialized", true]]), []);
 			this.initialized = true; this.synced = true;
-			await this.activateNotes();
+			await this.startNotesWhenReady();
 			this.schedule();
 		});
 	}
 	private engine?: Engine;
 	private textCaughtUp = false;
 	private noteActive = false;
-	private dirtyNotes = new Set<string>();
+
 	notesCaughtUp() {
 		const session = this.ask;
 		return this.run(async () => {
 			if (!session || session !== this.ask) return;
-			this.textCaughtUp = true; await this.activateNotes();
+			this.textCaughtUp = true; await this.startNotesWhenReady();
 		});
 	}
-	private async activateNotes() {
+	private async startNotesWhenReady() {
 		if (!this.engine || !this.textCaughtUp || !this.synced || this.noteActive) return;
-		await this.engine.startTableNoteFiles();
+		this.notes.env.catchingUp = false;
+		if (this.engine.tableNotesReady) await this.planAttachments({kind: "settle"});
+		await this.engine.initializeNoteFiles();
+		await this.notes.input({t:"recheck"});
 		if (!this.engine.tableNotesReady) throw new Error("Note handoff did not complete");
 		this.noteActive = true;
-		for (const prefix of ["table/note-request/", "table/note-change/"])
-			for (const [k] of await this.store.list(prefix)) this.dirtyNotes.add(k.slice(prefix.length));
 		this.schedule();
 	}
-	noteChanges(ids: string[]) {
-		for (const id of ids) this.dirtyNotes.add(id);
-		if (this.noteActive && this.synced) this.schedule();
-	}
-	private async forgetNote(req: string) {
-		await this.request({ t: "forget", req: unhex(req) }, a => a.t === "forgotten" && hex(a.req) === req);
-		await this.store.commit(new Map(), ["table/note-forget/" + req]);
-	}
-	private async sendNote(doc: string) {
-		const engine = this.engine!, key = "table/note-request/" + doc;
-		let proposal = await this.store.get<NoteRequest>(key);
-		const row = this.notes.get(doc);
-		if (!row && (await this.store.get<NoteMeta>("note:" + doc))?.firstText !== undefined) return;
-		if (!proposal) {
-			const change = await this.store.get<NoteStructure>("table/note-change/" + doc);
-			if (!change) return;
-			if ((change.t === "set" && row && (row.deleted !== null || row.path === change.path || row.path !== change.basePath)) ||
-				(change.t === "restore" && (!row || row.deleted === null || row.seq !== change.base)) ||
-				(change.t === "del" && row && row.deleted !== null)) {
-				await engine.finishNoteChange(doc, change);
-				return;
-			}
-			// A note created and then deleted offline still needs its identity and text
-			// in Recently deleted. Confirm the create before submitting its deletion.
-			const action = row ? change.t : "set";
-			let path = action === "del" ? row!.path : change.path;
-			for (let n = 1; action !== "del" && this.notes.at(path) && this.notes.at(path)!.id !== doc; n++)
-				path = action === "restore" ? change.path.replace(/\.md$/, n === 1 ? " (restored).md" : ` (restored ${n}).md`) : conflictName(path, doc);
-			const identity = "table/note-file/" + doc;
-			const file = row?.file ?? await this.store.get<string>(identity) ?? id();
-			proposal = { req: id(), file, path, action, base: row?.seq ?? null, change };
-			await this.store.commit(new Map<string, unknown>([[key, proposal], [identity, file]]), []);
-		}
-		const p = proposal, { action, path, req, file, base, change } = p;
-		if (p.accepted === undefined) {
-			const deletion = action === "del" && change.t === "del";
-			const sealed = await this.wireNote({ kind: "note", id: doc, file, path, seq: 0, deleted: null,
-				...(deletion ? { vector: change.vector, snapshot: change.snapshot } : {}) });
-			const common = { file: sealed.file, req: unhex(req), record: sealed.record, pathkey: sealed.pathkey, expectedChunks: null };
-			const frame: ClientFrame = action === "set" ? { ...common, t: action, base, version: null } : { ...common, t: action, base: base! };
-			const answer = await this.request(frame, f => (f.t === "ok" || f.t === "refused") && hex(f.req) === req);
-			if (answer.t === "refused") {
-				if (answer.missing) throw new Error("Worker could not store the note change");
-				if (!answer.row) throw new Error("Worker refused a note request without a row");
-				const latest = await this.openNote(answer.row);
-				await this.notes.receive(latest);
-				await engine.finishNoteChange(doc, change, p, true);
-				this.noteChanged?.(latest.id);
-				this.noteChanges([doc]);
-				return;
-			}
-			if (answer.t !== "ok") throw new Error("Unexpected note answer");
-			p.accepted = answer.seq;
-			await this.store.commit(new Map([[key, p]]), []);
-		}
-		// The stream supplies the deletion time and any later concurrent change.
-		if ((this.notes.get(doc)?.seq ?? 0) < p.accepted) return;
-		await engine.finishNoteChange(doc, change, p);
-		if (await this.store.get(key)) return; // failed local commit; keep the replay answer
-		await this.forgetNote(req);
-		this.noteChanges([doc]);
+	noteWork() { if (this.synced && this.noteActive) this.schedule(); }
+	private async transmitNote(doc: string, p: NoteRequest) {
+		const {action, file, base, path, req, change} = p;
+		const deletion = action === "del" && change.t === "del";
+		const sealed = await this.wireNote({ kind: "note", id: doc, file, path, seq: 0, deleted: null,
+			...(deletion ? { vector: change.vector, snapshot: change.snapshot } : {}) });
+		const common = { file: sealed.file, req: unhex(req), record: sealed.record, pathkey: sealed.pathkey, expectedChunks: null };
+		const frame: ClientFrame = action === "set" ? { ...common, t: action, base, version: null } : { ...common, t: action, base: base! };
+		const answer = await this.request(frame, f => (f.t === "ok" || f.t === "refused") && hex(f.req) === req);
+		if (answer.t === "ok") await this.notes.input({t: "answer", req, ok: answer.seq});
+		else if (answer.t === "refused" && answer.row && !answer.missing)
+			await this.notes.input({t: "answer", req, refused: {row: await this.openNote(answer.row), missing: false}});
+		else throw new Error("Worker could not store the note change");
 	}
 	// Scoped to one drain. A missing chunk must not starve other downloads or spin the socket.
 	private failedDownloads = new Set<string>();
@@ -323,21 +289,61 @@ export class TableSync {
 		}, r => this.upload(r));
 		return { gone, missing };
 	}
-	private async drive(event: Event) {
+	private async planAttachments(event: Event) {
+		await this.open();
+		if (!this.inputs.attachments) return;
 		const d = this.device!;
+		if (this.startup) {
+			await planDisk(d,this.disk,this.inputs,{kind:"startup"},this.failedDownloads,false);
+			this.startup = false;
+		}
+		await planDisk(d, this.disk, this.inputs, event, this.failedDownloads);
+		const counts = await d.change(s => {
+			const deletes: {key: string; incoming: boolean}[] = [];
+			const live = new Set(s.local.keys());
+			for (const [file,row] of s.latest) {
+				const local = s.local.get(file);
+				if (row.deleted === null) live.add(file);
+				if (!local || s.blocked.has(file) || s.pending.has(file)) continue;
+				const hash = s.observed.get(local.path)?.hash;
+				if (!hash) continue;
+				const target = local.redundant && s.latest.get(local.redundant.target);
+				if (target?.deleted === null && target.bytes.h === hash && local.redundant?.hash === hash)
+					deletes.push({key: `remove/${file}/${target.seq}`, incoming: true});
+				else if (row.deleted !== null && local.base.bytes?.h === hash)
+					deletes.push({key: `remove/${file}/${row.seq}`, incoming: true});
+			}
+			for (const [file,p] of s.pending) if (p.request.t === "del" && p.acceptedDelete === undefined)
+				deletes.push({key: `del/${file}/${p.request.req}`, incoming:false});
+			return {attachmentTotalLive:live.size, attachmentDeletes:deletes};
+		});
+		Object.assign(this.notes.env, counts);
+	}
+	private async drive(event: Event) {
+		const d = this.device!, before = d.revision;
 		if (this.keys.state.pending?.tokenHash) return;
+		await this.planAttachments(event);
+		if (this.engine && !this.noteActive) return;
+		if (this.noteActive) await this.notes.input({t:"recheck"});
+		const brake = this.notes.state?.brakePaused;
+		if (brake?.awaiting) return;
+		const held = new Set(brake?.declinedIds);
+		await d.change(s => {
+			if (s.intent?.kind === "remove" && held.has(`remove/${s.intent.file}/${s.intent.seq}`)) s.intent = undefined;
+			for (const [file,p] of s.pending) if (p.request.t === "del" && p.acceptedDelete === undefined && held.has(`del/${file}/${p.request.req}`)) {
+				s.pending.delete(file); s.local.delete(file); // The confirmed row will be materialized again.
+			}
+		});
 		if (this.noteActive && this.synced) {
-			for (const [key] of await this.store.list("table/note-forget/")) await this.forgetNote(key.slice("table/note-forget/".length));
-			for (const doc of [...this.dirtyNotes]) {
-				this.dirtyNotes.delete(doc);
-				try { await this.sendNote(doc); } catch (e) { this.problem("sending a note change", e); }
+			for (const req of this.notes.state!.forget.keys()) {
+				await this.request({ t: "forget", req: unhex(req) }, f => f.t === "forgotten" && hex(f.req) === req);
+				await this.notes.input({ t: "forgotten", req });
+			}
+			for (const n of this.notes.state!.notes.values()) {
+				if (n.inFlight && n.inFlight.accepted === undefined) await this.transmitNote(n.id, n.inFlight);
 			}
 		}
 		if (!this.inputs.attachments) return;
-		const before = d.revision;
-		if (!this.startup && await this.store.get("table/fs")) await this.disk.discardTemp();
-		if (this.startup) { await planDisk(d, this.disk, this.inputs, { kind: "startup" }, this.failedDownloads); this.startup = false; }
-		await planDisk(d, this.disk, this.inputs, event, this.failedDownloads);
 		if (!this.synced || !this.ask) return;
 		await d.sendForgets(p => this.forget(p));
 		// An accepted delete waits for its ordered row. Let incoming rows run between passes.
@@ -348,7 +354,7 @@ export class TableSync {
 			try { if ((await this.send(file)).missing) this.failedSends.add(file); }
 			catch (e) { this.failedSends.add(file); this.problem("sending an attachment", e); }
 		}
-		if (await d.change(s => !!s.intent)) await executeIntent(d, this.disk, this.inputs, this.failedDownloads);
+		if (await d.change(s => s.intent && !(s.intent.kind === "remove" && held.has(`remove/${s.intent.file}/${s.intent.seq}`)))) await executeIntent(d, this.disk, this.inputs, this.failedDownloads);
 		await this.collectStages();
 		if (await d.needsAnotherPass(before, this.passes, [this.failedDownloads, this.failedSends])) this.schedule(false);
 		else this.passes.clear();

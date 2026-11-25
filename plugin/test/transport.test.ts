@@ -13,7 +13,7 @@ import { hex, unhex, sha256, unpackPairing } from "../../protocol/ownsync";
 import { TableDisk } from "../src/tableDisk";
 import { TableSync } from "../src/tableSync";
 import { attachmentFs } from "./table-fs";
-import { migrateNow, ownerCodes, startDev, stats } from "../../server/test/devServer";
+import { ownerCodes, startDev, stats } from "../../server/test/devServer";
 import { Device, Server, memoryPorts, rng } from "./sim";
 
 const dev = await startDev();
@@ -39,14 +39,14 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	const { fs,store } = attachmentFs(d.files,d.data);
 	const allowed = (p: string) => !p.startsWith(".") && !p.endsWith(".md");
 	const adapter: TableDisk = new TableDisk(fs,store,".private/table",allowed,b => table.hash(b),(h,n) => table.suffix(h,n));
-	const table = new TableSync(store,keys,adapter,allowed,overrides.attachments !== false,20*2**20,onProblem, id => { void d.engine!.tableNoteChanged(id); });
+	const table = new TableSync(store,keys,adapter,allowed,overrides.attachments !== false,20*2**20,onProblem);
 	if (capable) {
 		d.overrides.tableNotes = table.notes;
 		d.overrides.tableHistory = table;
 		d.overrides.hash = async text => hex(await sha256(new TextEncoder().encode(text)));
 		d.overrides.noteDisk = new TableDisk(fs,store,".private/notes",p => !p.startsWith(".") && p.endsWith(".md"),
 			async b => hex(await sha256(b)),(h,n) => table.suffix(h,n),"table/note-fs");
-		d.overrides.onNoteChanges = ids => table.noteChanges(ids);
+		d.overrides.onNoteWork = () => table.noteWork();
 	}
 	d.boot();
 	const link = new Transport(host, keys, d.engine!, {
@@ -327,20 +327,16 @@ test("a live legacy vault migrates through the transport, then an updated peer d
 	const vault = "migration", opts = {reports:()=>true,scoped:()=>true};
 	const old = await device("old",vault,key,opts);
 	await old.link.connect(); await until([old.d],() => old.link.status === "synced");
-	const a = await device("capable",vault,key,opts,undefined,undefined,true);
-	await a.link.connect(); await until([old.d,a.d],() => a.link.status === "synced");
 	const content = (s: string) => new TextEncoder().encode(s);
 	const val = (d: Device,p: string) => new TextDecoder().decode(d.files.get(p)?.content as Uint8Array | undefined);
 	old.d.write("legacy.png",content("before genesis"));
 	old.d.write("kept.md", "existing note"); old.d.write("removed.md", "legacy deleted text");
-	await until([old.d,a.d], () => disk(a.d)["removed.md"] === "legacy deleted text");
+	await until([old.d], () => !!old.d.engine!.noteAt("removed.md") && old.d.data.size > 0);
 	const kept = old.d.engine!.noteAt("kept.md")!, removed = old.d.engine!.noteAt("removed.md")!;
 	old.d.remove("removed.md");
-	await until([old.d,a.d], () => !a.d.files.has("removed.md"));
-	await until([old.d,a.d],() => val(a.d,"legacy.png") === "before genesis");
-	assert.equal(a.d.engine!.tableActive,false);
-	old.link.disconnect();
-	await migrateNow(host,hex(a.keys.vaultId));
+	await until([old.d], () => !old.d.engine!.noteAt("removed.md") && ![...old.d.data.keys()].some(k => k.startsWith("out:") || k.startsWith("up:")));
+	const a = await device("capable",vault,key,opts,undefined,undefined,true);
+	await a.link.connect(); await until([old.d,a.d],() => a.link.status === "synced");
 	await until([a.d],() => a.d.data.has("table/initialized"));
 	assert.equal(a.d.engine!.tableActive,true);
 	await until([a.d], () => a.d.engine!.tableNotesReady);
@@ -368,7 +364,7 @@ test("a live legacy vault migrates through the transport, then an updated peer d
 	assert.deepEqual([...a.problems,...b.problems,...a.d.problems,...b.d.problems],[]);
 });
 
-test("the device reports a failed migration and its legacy connection keeps syncing", async () => {
+test("the device reports a failed migration and waits without running legacy sync", async () => {
 	const dir = join(dev.persistDir, "v3/do/ownsync-Vault"), before = new Set(readdirSync(dir));
 	const old = await device("legacy", "write-limit");
 	await old.link.connect(); await until([old.d], () => old.link.status === "synced");
@@ -378,12 +374,12 @@ test("the device reports a failed migration and its legacy connection keeps sync
 	try {
 		db.exec("CREATE TRIGGER refuse_format BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
 		const a = await device("capable","write-limit",key,{},undefined,undefined,true);
-		await a.link.connect(); await until([a.d], () => a.link.status === "synced");
-		await migrateNow(host, hex(a.keys.vaultId));
+		await a.link.connect();
 		await until([a.d], () => a.problems.some(p => p.includes("Migration could not complete today")));
 		assert.equal(a.d.engine!.tableActive, false);
 		old.d.write("still-legacy.md", "after a refused migration");
-		await until([old.d,a.d], () => a.d.files.get("still-legacy.md")?.content === "after a refused migration");
+		await until([old.d], () => !!old.d.engine!.noteAt("still-legacy.md"));
+		assert.equal(a.d.files.has("still-legacy.md"),false);
 	} finally { db.close(); }
 });
 

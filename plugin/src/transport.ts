@@ -4,7 +4,6 @@
 // before it says hello with the epoch's token. Editors' presence (cursors) travels as live frames, but
 // never reaches the engine.
 
-import { IncompleteIndex, MissingNoteText } from "./core/table/migration";
 import { importGenesis } from "./genesis";
 import type { TableSync } from "./tableSync";
 import type { Engine } from "./core/engine";
@@ -75,7 +74,6 @@ export class Transport {
 	private engineConnected = false;
 	private textCaughtUp = false;
 	private switched = false;
-	private waitingForDoc?: string;
 	private stopGenesis?: () => void;
 	private waiting?: { matches: (f: ServerFrame) => boolean; resolve: (f: ServerFrame) => void; reject: (err: Error) => void };
 	constructor(private readonly host: string, private readonly keys: VaultKeys, private readonly engine: Engine, private readonly opts: TransportOptions = {}) {}
@@ -87,7 +85,7 @@ export class Transport {
 		ws.binaryType = "arraybuffer";
 		this.ws = ws;
 		this.authed = false; this.negotiated = false; this.engineConnected = false; this.switched = false;
-		this.batch = []; this.waitingForDoc = undefined; this.textCaughtUp = false;
+		this.batch = []; this.textCaughtUp = false;
 		this.held = []; // the engine sends what it still needs again on the new connection
 		this.offered = -1;
 		this.reported = -1;
@@ -114,6 +112,7 @@ export class Transport {
 
 	/** Relay this device's presence in a note to the others. At most one batch per PRESENCE_MS; only the newest per note goes. */
 	presence(note: string, update: Uint8Array): void {
+		if (this.opts.attachments && !this.switched) return;
 		this.presenceOut.set(note, update);
 		this.presenceTimer ??= window.setTimeout(() => {
 			this.presenceTimer = null;
@@ -275,22 +274,9 @@ export class Transport {
 					if (ws !== this.ws) return;
 					ws.send(encodeClient({t:"since",after}));
 				} else if (!f.table && this.engine.tableActive) throw new Error("Worker no longer holds the migrated attachment table");
-				await this.connectNotes(ws);
+				if (f.table) await this.connectNotes(ws);
+				else this.beginGenesis(ws, sync);
 			} catch (e) { ws.close(); throw e; }
-			return;
-		}
-		if (sync && f.t === "migrationEligible") {
-			if (f.ready && !this.switched && !this.stopGenesis && !this.keys.state.pending?.tokenHash)
-				this.stopGenesis = importGenesis(vaultUrl(this.host,this.keys.vaultId),this.keys,sync,(stale,err) => {
-					this.stopGenesis = undefined;
-					if (err instanceof IncompleteIndex && ws === this.ws && !this.switched) {
-						this.waitingForDoc = "index";
-						void this.engine.repairIndex(err.partial);
-					}
-					if (err instanceof MissingNoteText && ws === this.ws && !this.switched) this.waitingForDoc = err.doc;
-					if (err) this.opts.onProblem?.("migrating the vault",err);
-					if (stale && !this.switched && ws === this.ws) ws.send(encodeClient({t:"migrationCheck"}));
-				});
 			return;
 		}
 		if (sync && this.switched) {
@@ -303,6 +289,7 @@ export class Transport {
 		}
 		if (f.t === "record") return void this.batch.push(f);
 		if (f.t === "records") return this.records(ws);
+		if (sync && !this.switched) return;
 		if (f.t === "stored" || f.t === "missing") return this.engine.receive({ t: f.t, name: hex(f.name) });
 		if (f.t === "marked") return this.engine.receive({ t: "marked", id: f.id, tags: f.tags.map(hex) });
 		if (f.t === "chunk") {
@@ -317,10 +304,8 @@ export class Transport {
 			// Who this is goes before anything the engine sends once caught up: the Worker files its list of current versions under it.
 			if (f.t === "synced") {
 				this.report(true);
-				if (this.negotiated && !this.switched) ws.send(encodeClient({t:"migrationCheck"}));
 			}
 			await this.engine.receive(f);
-			if (f.t === "ack") this.retryMigration(ws);
 			if (f.t === "synced") {
 				this.textCaughtUp = true;
 				if (sync && this.switched) void sync.notesCaughtUp().then(() => this.finishCatchUp(ws)).catch(() => ws.close());
@@ -339,7 +324,6 @@ export class Transport {
 		if (kind !== KIND.update && kind !== KIND.snapshot) throw new Error(`unexpected envelope kind ${kind}`);
 		const entry: Entry = { doc: docId, kind: kind === KIND.snapshot ? "snapshot" : "update", data: update };
 		await this.engine.receive(f.t === "entry" ? { t: "entry", seq: f.seq, entry } : { t: "live", entry });
-		if (f.t === "entry" && entry.doc === this.waitingForDoc) this.retryMigration(ws);
 	}
 
 	// The text subscription and table catch-up finish independently. Rotation must
@@ -353,9 +337,13 @@ export class Transport {
 		if (this.keys.state.resnapshot) await this.resnapshot();
 	}
 
-	private retryMigration(ws: WebSocket) {
-		if (!this.waitingForDoc || this.switched) return;
-		this.waitingForDoc = undefined; ws.send(encodeClient({ t: "migrationCheck" }));
+	private beginGenesis(ws: WebSocket, sync: TableSync) {
+		if (this.stopGenesis || this.switched || this.ws !== ws) return;
+		this.stopGenesis = importGenesis(vaultUrl(this.host,this.keys.vaultId),this.keys,sync,(stale,err) => {
+			this.stopGenesis = undefined;
+			if (err) this.opts.onProblem?.("migrating the vault",err);
+			if (stale) this.beginGenesis(ws, sync);
+		}, message => this.opts.onProblem?.("migration gap", new Error(message)));
 	}
 
 	private async records(ws: WebSocket): Promise<void> {
@@ -388,6 +376,7 @@ export class Transport {
 			ws.send(encodeClient(this.opts.owner ? { t: "hello", token, owner: unhex(this.opts.owner) } : { t: "hello", token }));
 			this.set("catching up");
 			if (this.negotiated) ws.send(encodeClient({t:"table"}));
+			else if (this.opts.attachments) this.opts.onProblem?.("migration",new Error("Update your Worker to start vault migration"));
 			else await this.connectNotes(ws);
 		}
 		this.offer();

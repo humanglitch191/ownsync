@@ -6,10 +6,11 @@ import { LegacyProjection } from "./core/table/migration";
 import type { VaultKeys } from "./keys";
 import type { TableSync } from "./tableSync";
 
-export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, finished: (stale: boolean, error?: unknown) => void) {
+export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, finished: (stale: boolean, error?: unknown) => void, reportGap?: (message: string) => void) {
 	const ws = new WebSocket(url), projection = new LegacyProjection(), epoch = keys.epoch, vmk = keys.vmk;
 	ws.binaryType = "arraybuffer";
 	let pass: "format" | "index" | "docs" | "estimate" | "stage" | "compare" = "format", base = 0, staged = 0, part = 0, ended = false;
+	let indexUnavailable = false;
 	let parts: AsyncGenerator<Uint8Array>, writes: number;
 	const tags = new Map<string, string>(), older = new Map<string, string>();
 	const seen = new Set<string>(), oldOnly = new Set<string>();
@@ -53,11 +54,11 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 			const f = decodeServer(new Uint8Array(e.data as ArrayBuffer));
 			if (f.t === "migrationBudget") {
 				if (pass !== "estimate") throw new Error("Unexpected migration budget reply");
-				if (!f.allowed) throw new Error(`Migration needs ${writes.toLocaleString()} row writes. This exceeds the Worker’s remaining Free plan budget today. This vault still uses legacy sync. Cloudflare’s paid plan has no daily row-write limit.`);
+				if (!f.allowed) throw new Error(`Migration needs ${writes.toLocaleString()} row writes. This exceeds the Worker’s remaining Free plan budget today. This device is waiting for migration. Cloudflare’s paid plan has no daily row-write limit.`);
 				pass = "stage"; parts = packGenesis(stagedRows()); return next();
 			}
-			if (f.t === "migrationFailed") throw new Error("Migration failed: " + f.reason + ". This vault still uses legacy sync.");
-			if (f.t === "migrationWriteFailed") throw new Error("Migration could not complete today. The Worker could not store the migration. This vault still uses legacy sync.");
+			if (f.t === "migrationFailed") throw new Error("Migration failed: " + f.reason + ". This device is waiting for migration.");
+			if (f.t === "migrationWriteFailed") throw new Error("Migration could not complete today. The Worker could not store the migration. This device is waiting for migration.");
 			if (f.t === "format") {
 				if (f.table) return finish();
 				if (pass === "stage") {
@@ -68,7 +69,7 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 			}
 			if (pass === "compare") {
 				if (f.t === "more" || (f.t === "synced" && f.seq !== base)) return finish(true);
-				if (f.t === "synced") return finish(false, new Error("Worker refused genesis at the same head; check eligibility and stored chunks"));
+				if (f.t === "synced") return finish(false, new Error("Worker refused genesis at the same head; check stored chunks"));
 				return;
 			}
 			if (pass === "stage") {
@@ -90,20 +91,19 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 				const entry = { doc, data: update, kind: kind === KIND.snapshot ? "snapshot" as const : "update" as const };
 				seen.add(doc);
 				if (pass === "index") projection.applyIndex(entry);
-				else projection.applyAttachment(entry);
+				else projection.applyDocument(entry);
 			}
 			if (f.t === "more") return send({ t: "subscribe", after: f.seq });
 			if (f.t !== "synced") return;
-			// Never decrypt an old-epoch edit after removal. If the only stored copy still
-			// uses the old tag, wait for a survivor's ordinary re-encrypted snapshot.
-			for (const id of oldOnly) if (!seen.has(id)) throw new Error("Waiting for legacy snapshots after key rotation");
 			if (pass === "index") {
+				indexUnavailable = oldOnly.has("index") && !seen.has("index");
 				base = f.seq; tags.clear(); older.clear(); seen.clear(); oldOnly.clear();
 				for (const id of projection.notes.keys()) await watch(id);
 				pass = "docs"; send({ t: "subscribe", after: 0 });
 			} else if (pass === "docs") {
 				if (base !== f.seq) return finish(true);
-				projection.requireStoredNotes(seen);
+				const gaps = projection.gaps(indexUnavailable);
+				if (gaps.length) reportGap?.("Missing legacy updates for " + gaps.join(", ") + ". Devices holding these files will propose their changes after migration.");
 				pass = "estimate"; writes = await estimateGenesis(stagedRows()); staged = 0;
 				send({ t: "migrationEstimate", writes });
 			}

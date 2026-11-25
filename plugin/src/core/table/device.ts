@@ -32,6 +32,7 @@ export interface Pending {
 	agreeBytes?: boolean;
 	repair?: boolean;
 	acceptedDelete?: number;
+	retireLegacy?: boolean; // tombstone recreated via set, then del with exactly the accepted seq
 }
 export type Intent = { file: string; path: string; seq: number; authority?: string } & (
 	| { kind: "write"; before: string | null; data: RecordData }
@@ -45,6 +46,7 @@ export interface Blocked {
 	endpoints: [string, Observation | null][];
 }
 export interface State {
+	legacy: Map<string, { path: string; bytes: Ref; removed: boolean }>;
 	observed: Map<string, Observation>;
 	blocked: Map<string, Blocked>;
 	latest: Map<string, Row>;
@@ -56,6 +58,7 @@ export interface State {
 	intent?: Intent;
 }
 export interface Inputs {
+	holdRemove?(file: string, seq: number): boolean;
 	id(): string;
 	stage(observation: Observation): Promise<Ref>; // durable immutable bytes, also used to repair missing chunks
 	suffix(hash: string, counter: number): Promise<string>;
@@ -91,6 +94,7 @@ function occupant(s: State, path: string, except: string) {
 
 function remember(s: State, row: Row) {
 	if ((s.latest.get(row.file)?.seq ?? 0) < row.seq) s.latest.set(row.file, row);
+	s.legacy.delete(row.file);
 }
 
 // Called only for ordered since/live frames. A refusal may already have supplied a newer row.
@@ -107,6 +111,20 @@ export function catchUp(s: State, frame: Row | { cursor: number }) {
 async function propose(s: State, source: string, request: Request, inputs: Inputs, fields: Omit<Pending, "request" | "packet"> = {}) {
 	if (s.pending.has(source)) throw new Error("Proposal already pending");
 	s.pending.set(source, { ...fields, request, packet: await inputs.pack(request) });
+}
+
+// When the original bytes exist only in chunks, there is no disk observation
+// from which to propose the omitted file. Use the same create CAS and suffixes.
+export async function proposeLegacy(s: State, file: string, bytes: Ref, removed: boolean, inputs: Inputs) {
+	const original = s.legacy.get(file)!.path;
+	let path = original;
+	for (let n = 0; ; n++) {
+		const holder = occupant(s, path, file);
+		if (!holder || (!removed && holder.bytes.h === bytes.h)) break;
+		path = withSuffix(original, `conflict ${await inputs.suffix(bytes.h, n)}`);
+	}
+	await propose(s, file, { t: "set", req: inputs.id(), file, base: null,
+		data: { path, bytes, mtime: null } }, inputs, { retireLegacy: removed, agreeBytes: true });
 }
 
 export function reserved(s: State, file: string) {
@@ -151,14 +169,15 @@ export async function answer(s: State, a: Answer, inputs: Inputs): Promise<"gone
 		if (a.missing && r.t === "restore") return "gone";
 		if (a.missing && r.t === "set") {
 			await propose(s, source, { ...r, req: inputs.id() }, inputs, {
-				sourcePath: p.sourcePath, agreePath: p.agreePath, agreeBytes: p.agreeBytes, repair: true,
+				sourcePath: p.sourcePath, agreePath: p.agreePath, agreeBytes: p.agreeBytes, retireLegacy: p.retireLegacy, repair: true,
 			});
 		} else if (r.t === "restore" && a.row && a.row.file !== source) {
 			const original = s.latest.get(source);
 			if (original?.seq === r.base) await restore(s, original, inputs);
 		} else if (r.t === "set" && r.base === null && a.row?.file !== r.file && a.row?.deleted === null
 			&& a.row.path === r.data.path && a.row.bytes.h === r.data.bytes.h && s.latest.get(a.row.file)?.seq === a.row.seq) {
-			handover(s, source, a.row, p.sourcePath!);
+			if (p.retireLegacy === false || p.sourcePath) s.legacy.delete(source);
+			if (p.sourcePath) handover(s, source, a.row, p.sourcePath);
 		}
 		return;
 	}
@@ -170,6 +189,8 @@ export async function answer(s: State, a: Answer, inputs: Inputs): Promise<"gone
 	}
 	const accepted: Row = { ...r.data, file: r.file, deleted: null, seq: a.ok };
 	remember(s, accepted);
+	if (p.retireLegacy && s.latest.get(source)?.seq === a.ok)
+		await propose(s, source, { t: "del", req: inputs.id(), file: source, base: a.ok }, inputs);
 	if (r.t === "restore") return;
 	if (source !== r.file) { handover(s, source, accepted, p.sourcePath!); return; }
 	const local = s.local.get(source);
@@ -188,7 +209,9 @@ function field(mine: string, theirs: string, base?: string) {
 
 export async function reconcile(s: State, file: string, view: ReadonlyMap<string, Observation>, missingIsDelete: boolean, inputs: Inputs): Promise<void> {
 	if (s.intent?.file === file || reserved(s, file)) return;
-	const schedule = (op: Intent) => { if (!s.intent) s.intent = op; };
+	const schedule = (op: Intent) => {
+		if (!s.intent && !(op.kind === "remove" && inputs.holdRemove?.(op.file, op.seq))) s.intent = op;
+	};
 	const row = s.latest.get(file);
 	let local = s.local.get(file);
 	if (!local) {
@@ -265,7 +288,7 @@ export async function reconcile(s: State, file: string, view: ReadonlyMap<string
 	} else if (hash !== row.bytes.h) schedule({ seq: row.seq, kind: "write", file, path: disk.path, before: hash, data: record(row) });
 }
 
-const maps = ["latest", "local", "pending", "forget", "parked", "observed", "blocked"] as const;
+const maps = ["latest", "legacy", "local", "pending", "forget", "parked", "observed", "blocked"] as const;
 type Meta = Pick<State, "cursor" | "intent">;
 export class TableDevice {
 	private queue: Promise<unknown> = Promise.resolve();
@@ -278,12 +301,12 @@ export class TableDevice {
 			const prefix = "table/" + kind + "/";
 			return new Map((await store.list<T>(prefix)).map(([k,v]) => [k.slice(prefix.length), v]));
 		};
-		return new TableDevice(store, { cursor: 0, ...meta, latest: await load<Row>("latest"), local: await load<Local>("local"), pending: await load<Pending>("pending"), forget: await load<true>("forget"), parked: await load<Ref>("parked"), observed: await load<Observation>("observed"), blocked: await load<Blocked>("blocked") });
+		return new TableDevice(store, { cursor: 0, ...meta, latest: await load<Row>("latest"), legacy: await load("legacy"), local: await load<Local>("local"), pending: await load<Pending>("pending"), forget: await load<true>("forget"), parked: await load<Ref>("parked"), observed: await load<Observation>("observed"), blocked: await load<Blocked>("blocked") });
 	}
 	// Publish the new in-memory state only after the atomic write succeeds.
 	change<T>(fn: (draft: State) => T | Promise<T>): Promise<T> {
 		const work = this.queue.then(async () => {
-			const before = this.state, draft = { ...before, latest: new Map(before.latest), local: new Map(before.local), pending: new Map(before.pending), forget: new Map(before.forget), parked: new Map(before.parked), observed: new Map(before.observed), blocked: new Map(before.blocked) };
+			const before = this.state, draft = { ...before, latest: new Map(before.latest), legacy: new Map(before.legacy), local: new Map(before.local), pending: new Map(before.pending), forget: new Map(before.forget), parked: new Map(before.parked), observed: new Map(before.observed), blocked: new Map(before.blocked) };
 			const result = await fn(draft);
 			const puts = new Map<string, unknown>(), deletes: string[] = [];
 			for (const kind of maps) {

@@ -92,8 +92,8 @@ export async function runNoteSeed(seed: number, steps: number) {
 		const d = p.d;
 		d.afterCommit = puts => {
 			for (const [k, v] of puts) {
-				if (!k.startsWith("note:")) continue;
-				const id = k.slice(5), parent = (v as {copyOf?: string}).copyOf;
+				if (!k.startsWith("table/note-state/")) continue;
+				const id = k.slice("table/note-state/".length), parent = (v as {copyOf?: string}).copyOf;
 				if (parent && !copied.has(id)) copied.set(id, { parent, markers: markers(d.storedText(id)) });
 			}
 		};
@@ -130,9 +130,8 @@ export async function runNoteSeed(seed: number, steps: number) {
 			(what,e) => {
 				if (e instanceof Error && (e.message === "injected lost answer" || (!d.online && e.message === "Offline"))) return;
 				if (d.alive) d.problems.push(what + ": " + e);
-			},
-			id => { void d.engine?.tableNoteChanged(id); });
-		Object.assign(d.overrides, { noteDisk: disk, tableNotes: sync.notes, tableHistory: sync, onNoteChanges: (ids: string[]) => sync.noteChanges(ids) });
+			});
+		Object.assign(d.overrides, { noteDisk: disk, tableNotes: sync.notes, tableHistory: sync, onNoteWork: () => sync.noteWork() });
 	}
 	function add(d = device()) {
 		const p = { d, cursor: 0, lose: false } as Peer;
@@ -158,7 +157,11 @@ export async function runNoteSeed(seed: number, steps: number) {
 	}
 	async function deliver(p: Peer) {
 		const end = worker.entries.length;
-		while (p.d.online && p.cursor < end) await p.sync.row(worker.entries[p.cursor++]!);
+		while (p.d.online && p.cursor < end) {
+			try { await p.sync.row(worker.entries[p.cursor]!); }
+			catch (e) { if (e instanceof Crashed && !p.d.alive) return; throw e; }
+			p.cursor++;
+		}
 	}
 	async function drain() {
 		for (let pass = 0; ; pass++) {
@@ -235,7 +238,15 @@ export async function runNoteSeed(seed: number, steps: number) {
 				assert.deepEqual(new Map([...sync.notes.ids()].map(id => [id,sync.notes.get(id)])),rows,d.name + " row divergence");
 				const actual = new Map(paths(p).map(path => [path,d.files.get(path)!.content]));
 				for (const path of new Set([...actual.keys(), ...expected.keys()])) {
-					if (actual.get(path) !== expected.get(path)) problem("disk divergence",d.name + " " + path);
+					if (actual.get(path) !== expected.get(path)) {
+						problem("disk divergence",d.name + " " + path);
+						if (process.env.FUZZ_LOG) {
+							const state = sync.notes.state!;
+							log.push(JSON.stringify({ device: d.name, path, actual: actual.get(path), expected: expected.get(path),
+								intent: state.intent, notes: [...state.notes.values()].filter(n => n.diskPath === path || n.row?.path === path)
+									.map(n => ({id:n.id, at:n.diskPath, row:n.row, change:n.change, flight:n.inFlight, editor:n.editor, held:n.held, blocked:state.blocked.get(n.id)})) }));
+						}
+					}
 				}
 				const deleted = await d.engine!.deletedNotes();
 				for (const [id,r] of rows) {
@@ -245,7 +256,9 @@ export async function runNoteSeed(seed: number, steps: number) {
 						assert.equal(await d.engine!.deletedText(id),docs.get(id)!.getText("t").toString());
 					}
 				}
-				if ([...d.data.keys()].some(k => /^table\/note-(change|request|move|remove|write)\//.test(k))) problem("unsettled device",d.name);
+				const state = sync.notes.state!;
+				if (state.intent || state.forget.size || [...state.notes.values()].some(n => n.change || n.inFlight || n.unpublished))
+					problem("unsettled device",d.name);
 			}
 			assert.ok(!problems.size,[...problems.values()].join("; "));
 		} finally { for (const doc of docs.values()) doc.destroy(); }
@@ -253,18 +266,18 @@ export async function runNoteSeed(seed: number, steps: number) {
 	try {
 		const a = add(), b = add(), mixed = seed % 4 === 0;
 		if (mixed) {
-			for (const p of peers) { p.d.boot(); p.d.connect(); }
+			for (const p of peers) { delete p.d.overrides.tableNotes; p.d.boot(); p.d.connect(); }
 			await quiesce(peers.map(p => p.d));
 			for (let i=0; i<3; i++) { await write(pick(peers),"draft.md"); await quiesce(peers.map(p => p.d)); }
 			a.d.write("legacy.bin", Uint8Array.of(1,2,3)); await quiesce(peers.map(p => p.d));
 			const projection = new LegacyProjection(), key = await a.sync.nameKey();
 			try {
 				for (const {entry} of server.rows) projection.applyIndex(entry);
-				for (const {entry} of server.rows) projection.applyAttachment(entry);
+				for (const {entry} of server.rows) projection.applyDocument(entry);
 				for await (const r of projection.rows(key)) worker.store(await a.sync.wireRow(r));
 				for await (const {row} of projection.noteRows(key,worker.entries.length)) worker.store(await a.sync.wireNote(row));
 			} finally { projection.close(); }
-			for (const p of peers) disconnect(p);
+			for (const p of peers) { disconnect(p); p.d.crash(); }
 			noteCoverage.migrated++;
 		}
 		await wire(a); await wire(b);

@@ -487,16 +487,9 @@ function when(t) {
 }
 
 function migrationCard(v) {
-	const error = h("p", { class: "error cerr", hidden: true }, FAILED);
-	const button = h("button", { class: "btn primary", onclick: async () => {
-		button.disabled = true;
-		try { await api(`/api/vaults/${v.id}/migrate`, {}); await dashboard("storage"); }
-		catch { error.hidden = false; button.disabled = false; }
-	} }, "Migrate now");
 	return h("section", { class: "card" }, h("h3", {}, "Vault sync migration"),
-		h("p", {}, v.migrationNeedsWrites !== undefined ? `Migration needs ${count(v.migrationNeedsWrites)} row writes. At the last check this exceeded the remaining Free plan budget. The vault still uses legacy sync. Cloudflare’s paid plan has no daily row-write limit.` : v.migration === "failedToday" ? "Migration could not complete today. The vault still uses legacy sync." : v.migration === "requested" ? "Waiting for an updated device to complete migration." :
-			"Migration normally waits until every recently active device has updated. Migrating now requires older devices to update before syncing again."),
-		v.migration === "requested" ? null : button, error);
+		h("p", {}, v.migrationNeedsWrites !== undefined ? `Migration needs ${count(v.migrationNeedsWrites)} row writes. At the last check this exceeded the remaining Free plan budget. Updated devices wait for migration. Cloudflare’s paid plan has no daily row-write limit.` : v.migration === "failedToday" ? "Migration could not complete today. Updated devices wait for migration." :
+			"The first updated device will migrate this vault. Older devices will need to update before syncing again."));
 }
 
 function storagePage(v, buckets) {
@@ -537,7 +530,7 @@ function storagePage(v, buckets) {
 		h("p", { class: "lede" }, h("b", {}, size(v.bytes)), " on your Worker.",
 			removable.length ? [" ", h("b", {}, size(sum(removable, bytes))), ` of it is attachment history from ${listed(removable.map((r) => r.label).reverse())} that you can remove.`] : null),
 		sizeBar(v, buckets),
-		...(v.migration === "failedToday" || v.migration === "legacy" || v.migration === "requested" ? [migrationCard(v)] : []),
+		...(v.migration === "failedToday" || v.migration === "legacy" ? [migrationCard(v)] : []),
 		h("div", { class: "cols" },
 			h("section", { class: "card" },
 				h("div", { class: "ch col" }, h("div", {}, h("h3", {}, "Clean up"), h("p", {}, "Old versions of attachments and attachments you deleted, by period. Notes and current attachments are never touched.")),

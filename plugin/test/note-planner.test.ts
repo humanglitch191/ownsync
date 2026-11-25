@@ -568,3 +568,28 @@ test("brakeApproved persists across multiple deletions until pending count reach
 	s = runStep(s, { t: "answer", req: (reqs[0] as Extract<NoteAction, { t: "workerReq" }>).request.req, ok: 2 }, env).state;
 	assert.equal(s.brakePaused, undefined, "once pending deletes reach 0, approval clears");
 });
+
+test("the deletion prompt counts both file types and a stale answer covers only the deletions shown", () => {
+	const env = makeEnv(), id = "01".repeat(16), file = "02".repeat(16);
+	const row: NoteRow = {id, file, kind: "note", path:"keep.md", seq:1, deleted:null};
+	let s = runStep(emptyVaultNoteState(), {t:"row", row}, env).state;
+	const body = env.crdt.create("keep", 1);
+	s = runStep(s, {t:"yjsUpdate", id, docState:body},env).state;
+	s = runStep(s, {t:"intentDone", intent:s.intent!, outcome:"applied", after:obsFile(row.path,"keep")},env).state;
+	env.attachmentDeletes = Array.from({length:20}, (_,i) => ({key:`remove/file${i}/1`, incoming:true}));
+	env.attachmentTotalLive = 20;
+	let r = runStep(s, {t:"diskObs", event:"startup", listingComplete:true, files:new Map()}, env);
+	assert.equal(r.state.brakePaused?.count, 21);
+	assert.equal(r.actions.some(a => a.t === "diskIntent" || a.t === "workerReq"),false);
+	const shown = r.state.brakePaused!.reviewIds!;
+	r = runStep(r.state, {t:"brakeDeclined", ids:shown},env);
+	assert.equal(r.state.brakePaused?.declinedIds?.length,20);
+	assert.equal(r.state.notes.get(id)?.change,undefined);
+	assert.equal(r.state.intent?.kind,"write");
+	// Reusing a file ID for a later deletion is a different decision.
+	const later = env.attachmentDeletes.map(d => ({...d,key: d.key.replace(/1$/, "2")}));
+	env.attachmentDeletes = [...later, {key:"remove/extra/2",incoming:true}];
+	r = runStep(r.state, {t:"brakeApproved", ids:shown},env);
+	assert.equal(r.state.brakePaused?.awaiting,true);
+	assert.deepEqual(r.state.brakePaused?.reviewIds,env.attachmentDeletes.map(d => d.key));
+});

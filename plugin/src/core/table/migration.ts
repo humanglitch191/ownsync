@@ -5,7 +5,7 @@ import { hex, tableFileId, unhex } from "../../../../protocol/ownsync";
 import type { Entry, NoteMeta, Ref, Store, Upload } from "../ports";
 import { checkLocalPaths, conflictSuffix, type Local, type Row } from "./device";
 import type { NoteRow } from "./notes";
-import type { NoteStructure } from "./noteDisk";
+import type { NoteEntry, NoteStructure } from "./notePlanner";
 import { places, type IndexValue } from "../places";
 const suffix = (p: string, s: string) => p.replace(/(\.[^./]*)?$/, (_, ext) => ` (conflict ${s})${ext ?? ""}`);
 
@@ -16,36 +16,100 @@ function migratedId(key: Uint8Array, id: string) {
 
 export type GenesisRow = Row & { dateAtCommit?: true };
 
-export class IncompleteIndex extends Error { constructor(readonly partial: Uint8Array) { super("Waiting for the missing stored index update or a complete snapshot"); } }
+// Keep only clock coverage for note bodies. A complete stream covers every clock
+// up to each referenced insertion or deletion, including cross-writer origins.
+class NoteCoverage {
+	private ranges = new Map<number, [number, number][]>();
+	private needs = new Map<number, number>();
 
-export class MissingNoteText extends Error {
-	constructor(readonly doc: string) { super("Waiting for the first stored text of note " + doc); }
+	add(update: Uint8Array) {
+		const { structs, ds } = Y.decodeUpdate(update);
+		const need = (client: number, end: number) => this.needs.set(client, Math.max(this.needs.get(client) ?? 0, end));
+		for (const item of structs) {
+			if (item instanceof Y.Skip) continue;
+			const {client, clock} = item.id, end = clock + item.length;
+			let ranges = this.ranges.get(client);
+			if (!ranges) this.ranges.set(client, ranges = []);
+			const last = ranges[ranges.length - 1];
+			if (last && clock >= last[0] && clock <= last[1]) last[1] = Math.max(last[1], end);
+			else ranges.push([clock, end]);
+			need(client, end);
+			if (item instanceof Y.Item) for (const ref of [item.origin, item.rightOrigin, item.parent])
+				if (ref instanceof Y.ID) need(ref.client, ref.clock + 1);
+		}
+		for (const [client, spans] of ds.clients) for (const {clock, len} of spans) need(client, clock + len);
+	}
+
+	complete() {
+		for (const [client, end] of this.needs) {
+			let covered = 0;
+			for (const [a, b] of (this.ranges.get(client) ?? []).sort(([a], [b]) => a-b)) {
+				if (a > covered) return false;
+				covered = Math.max(covered, b);
+			}
+			if (covered < end) return false;
+		}
+		return true;
+	}
 }
 
 export class LegacyProjection {
 	readonly index = new Y.Doc();
 	readonly notes = this.index.getMap<IndexValue>("notes");
 	private docs = new Map<string, Y.Doc>();
+	private text = new Map<string, NoteCoverage>();
+	private omitted = new Set<string>();
 	applyIndex(entry: Entry) { if (entry.doc === "index") Y.applyUpdate(this.index, entry.data); }
-	applyAttachment(entry: Entry) {
+	applyDocument(entry: Entry) {
 		const path = this.notes.get(entry.doc)?.p;
-		if (!path || path.endsWith(".md")) return;
+		if (!path) return;
+		if (path.endsWith(".md")) {
+			let coverage = this.text.get(entry.doc);
+			if (!coverage) this.text.set(entry.doc, coverage = new NoteCoverage());
+			coverage.add(entry.data);
+			return;
+		}
 		let d = this.docs.get(entry.doc);
 		if (!d) this.docs.set(entry.doc, d = new Y.Doc());
 		Y.applyUpdate(d, entry.data);
 	}
-	requireStoredNotes(stored: ReadonlySet<string>) {
-		for (const [id, value] of this.notes)
-			if (value.p.endsWith(".md") && !stored.has(id)) throw new MissingNoteText(id);
+
+	// Inspect pending index items only after both passes have reached the same head.
+	// A missing predecessor can hide the note ID or its path entirely.
+	gaps(indexUnavailable = false) {
+		this.omitted.clear();
+		const paths = new Set<string>();
+		const pending = this.index.store.pendingStructs;
+		if (pending) for (const item of Y.decodeUpdateV2(pending.update).structs) {
+			if (!(item instanceof Y.Item)) continue;
+			// Decoded root parents are their Yjs names until integration.
+			const parentName: unknown = item.parent;
+			let id = parentName === "notes" ? item.parentSub : null;
+			for (const origin of [item.origin, item.rightOrigin]) {
+				if (id || !origin || origin.clock >= Y.getState(this.index.store, origin.client)) continue;
+				const parent = Y.getItem(this.index.store, origin);
+				if (parent instanceof Y.Item && parent.parent === this.notes) id = parent.parentSub;
+			}
+			if (id) this.omitted.add(id);
+			for (const value of item.content.getContent()) if (typeof value?.p === "string") paths.add(value.p);
+		}
+		for (const [id, note] of this.notes) {
+			const doc = this.docs.get(id);
+			if (note.p.endsWith(".md") ? !this.text.get(id)?.complete() :
+				doc?.store.pendingStructs || doc?.store.pendingDs || (!doc && note.d === undefined)) this.omitted.add(id);
+			if (this.omitted.has(id)) paths.add(note.p);
+		}
+		if (pending || this.index.store.pendingDs || indexUnavailable) paths.add("legacy index (some file names may be unavailable)");
+		return [...paths].sort();
 	}
 	// Text remains in its existing Yjs stream. In particular the deletion vector
 	// is the one the deleter saw, not the current vector of the text document.
 	async *noteRows(key: Uint8Array, after: number) {
-		if (this.index.store.pendingStructs || this.index.store.pendingDs) throw new IncompleteIndex(Y.encodeStateAsUpdate(this.index));
 		const { paths } = places(this.notes);
 		for (const id of [...this.notes.keys()].sort()) {
+			if (this.omitted.has(id)) continue;
 			const v = this.notes.get(id)!;
-			if (!v.p.endsWith(".md")) continue;
+			if (!v.p.endsWith(".md") || !this.text.get(id)?.complete()) continue;
 			if (v.d !== undefined) Y.decodeStateVector(Uint8Array.from(atob(v.d), c => c.charCodeAt(0)));
 			const row: NoteRow = { kind: "note", id, file: await migratedId(key, id), path: paths.get(id) ?? v.p,
 				seq: ++after, deleted: v.t ?? null, ...(v.d === undefined ? {} : { vector: v.d }) };
@@ -53,15 +117,11 @@ export class LegacyProjection {
 		}
 	}
 	async *rows(key: Uint8Array): AsyncGenerator<GenesisRow> {
-		// A live-only dependency may not yet be stored. Committing a partial Yjs document would
-		// discard the update waiting for it; a later snapshot can complete this projection.
-		if (this.index.store.pendingStructs || this.index.store.pendingDs) throw new IncompleteIndex(Y.encodeStateAsUpdate(this.index));
-		for (const doc of this.docs.values())
-			if (doc.store.pendingStructs || doc.store.pendingDs) throw new Error("Incomplete stored document");
 		const { paths } = places(this.notes), occupied = new Set(paths.values());
 		const emitted = new Set<string>();
 		let seq = 0;
 		for (const id of [...this.notes.keys()].sort()) {
+			if (this.omitted.has(id)) continue;
 			const v = this.notes.get(id)!;
 			if (v.p.endsWith(".md")) continue;
 			const versions = this.docs.get(id)?.getArray<Ref>("v").toArray() ?? [];
@@ -112,6 +172,7 @@ function unsentPaths(index: Y.Doc, out: StoredEntry[]) {
 		const from = new Map(e.renameSources);
 		for (const struct of Y.decodeUpdate(e.data).structs) {
 			if (!(struct instanceof Y.Item)) continue;
+			if (struct.id.clock >= Y.getState(index.store, struct.id.client)) continue;
 			const item = Y.getItem(index.store, struct.id);
 			if (item instanceof Y.Item && item.parent === notes && item.parentSub !== null) {
 				const key = item.parentSub;
@@ -144,8 +205,6 @@ export async function legacyBases(store: Store, key: Uint8Array) {
 	const locals = new Map<string, Local>();
 	const puts = new Map<string, unknown>();
 	const queued = (await store.list<StoredEntry>("out:")).sort(([a], [b]) => Number(a.slice(4)) - Number(b.slice(4)));
-	const firstText = new Map<string, number>();
-	for (const [key, e] of queued) if (!firstText.has(e.doc)) firstText.set(e.doc,Number(key.slice(4)));
 	const out = queued.map(([,e]) => e);
 	const pending = new Set(out.map(e => e.doc));
 	const restores = new Set(out.filter(e => e.kind === "snapshot").map(e => e.doc));
@@ -155,25 +214,48 @@ export async function legacyBases(store: Store, key: Uint8Array) {
 		if (data) Y.applyUpdate(index, data);
 		const notes = index.getMap<IndexValue>("notes"), changed = unsentPaths(index, out);
 		const paths = places(notes).paths;
-		for (const [id, from] of changed) {
-			const v = notes.get(id);
-			if (!v?.p.endsWith(".md")) continue;
-			const change: NoteStructure = v.d === undefined ? { t: "set", path: paths.get(id) ?? v.p, basePath: from, ...(restores.has(id) ? { legacyRestore: true } as const : {}) }
-				: { t: "del", path: v.p, vector: v.d };
-			puts.set("table/note-change/" + id, change);
+		// A tombstone or a never-downloaded file can survive solely as a local
+		// version reference. Keep those references until table catch-up proves
+		// which IDs made it into genesis, including legacy split versions.
+		const projection = new LegacyProjection();
+		try {
+			if (data) projection.applyIndex({ doc: "index", data, kind: "snapshot" });
+			for (const [id, value] of notes) if (!value.p.endsWith(".md")) {
+				const body = await store.get<Uint8Array>("state:" + id);
+				if (body) projection.applyDocument({ doc: id, data: body, kind: "snapshot" });
+			}
+			for await (const r of projection.rows(key))
+				puts.set("table/legacy/" + r.file, { path: r.path, bytes: r.bytes, removed: r.dateAtCommit || r.deleted !== null });
+		} finally { projection.close(); }
+		for (const id of notes.keys()) {
+			const entry = notes.get(id)!;
+			if (!entry.p.endsWith(".md")) continue;
+			const m = await store.get<NoteMeta>("note:" + id);
+			const base = await store.get<Uint8Array>("base:" + id);
+			// A backup may hold the missing prefix only in its last agreement.
+			// Keep the union in the same handoff commit as the planner seed.
+			if (base) {
+				const current = await store.get<Uint8Array>("state:" + id);
+				const merged = current ? Y.mergeUpdates([current,base]) : base;
+				if (!current || merged.length !== current.length || merged.some((b,i) => b !== current[i]))
+					puts.set("state:" + id, merged);
+			}
+			const basePath = changed.has(id) ? changed.get(id) : m?.diskPath;
+			const change: NoteStructure | undefined = !changed.has(id) ? undefined : entry.d === undefined
+				? { t: "set", path: paths.get(id) ?? entry.p, basePath, ...(restores.has(id) ? { legacyRestore: true } as const : {}) }
+				: { t: "del", path: entry.p, vector: entry.d };
+			const seed: NoteEntry = { id, file: await migratedId(key, id), diskPath: m?.diskPath, basePath,
+				editor: m?.open ? "owed-recover" : m?.owed === "doc" ? "owed-doc" : m?.owed === "recover" ? "owed-recover" : "closed",
+				baseState: m?.baseHash === undefined ? undefined : base ?? await store.get<Uint8Array>("state:" + id),
+				intended: m?.writing ? base : undefined, copyOf: m?.copyOf,
+				legacy: entry.d === undefined ? { t: "set", path: paths.get(id) ?? entry.p } : { t: "del", path: entry.p, vector: entry.d },
+				firstTextPending: pending.has(id), change };
+			puts.set("table/note-state/" + id, seed);
 		}
 		for (const [k, m] of await store.list<NoteMeta>("note:")) {
 			const id = k.slice(5), entry = notes.get(id);
 			const removed = !m.diskPath && changed.has(id) && entry?.d !== undefined;
 			const path = m.diskPath ?? (removed ? entry?.p : undefined);
-			if (entry?.p.endsWith(".md")) {
-				puts.set(k, { ...m, tableNote: true, firstText: firstText.get(id), basePath: changed.has(id) ? changed.get(id) : path });
-				if (m.writing && !m.baseHash) {
-					const intended = await store.get("base:" + id);
-					if (intended) puts.set("table/note-write/" + id, intended);
-				}
-				continue;
-			}
 			if (!path || path.endsWith(".md")) continue;
 			const file = await migratedId(key, id);
 			let bytes: Local["base"]["bytes"];

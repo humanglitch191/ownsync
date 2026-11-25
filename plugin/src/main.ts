@@ -144,6 +144,8 @@ export default class OwnsyncPlugin extends Plugin {
 		this.addCommand({ id: "pair-device", name: "Add a device", checkCallback: (checking) => this.hasKey() && (checking || void showPairingCode(this), true) });
 		this.addCommand({ id: "open-dashboard", name: "Open dashboard", checkCallback: (checking) => this.hasKey() && (checking || openDashboard(this), true) });
 		// Phones have no status bar, so the status is also a command.
+		this.addCommand({ id: "review-held-deletions", name: "Review held deletions",
+			checkCallback: checking => this.session?.engine.reviewHeldDeletions(checking) ?? false });
 		this.addCommand({ id: "show-status", name: "Show sync status", callback: () => say(this.describe(), 10000) });
 		// Phones suspend the app and drop its connection without telling it: reconnect when it comes back.
 		const wake = () => { if (activeDocument.visibilityState === "visible" && this.status === "offline") void this.session?.transport.connect().catch(() => {}); };
@@ -339,7 +341,7 @@ export default class OwnsyncPlugin extends Plugin {
 		const scratch = (this.manifest.dir ?? vault.configDir+"/plugins/"+this.manifest.id)+"/attachments/"+vaultId;
 		const tableDisk: TableDisk = new TableDisk(vault.adapter,store,scratch,allowed,
 			b => table.hash(b),(h,n) => table.suffix(h,n));
-		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem, id => { void engine.tableNoteChanged(id); });
+		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem);
 		const noteDisk = new TableDisk(vault.adapter, store, scratch + "/notes", p => visible(p) && p.endsWith(".md"),
 			b => sha256(b).then(hex), (h, n) => table.suffix(h, n), "table/note-fs");
 		const engine = new Engine(store, disk, {
@@ -347,7 +349,17 @@ export default class OwnsyncPlugin extends Plugin {
 			tableHistory: table,
 			onLegacyNotePlacements: this.bindHistory,
 			tableNotes: table.notes,
-			onNoteChanges: ids => table.noteChanges(ids),
+			onNoteWork: () => table.noteWork(),
+			onBrake: (count, decide) => {
+				const modal = new Modal(this.app);
+				modal.titleEl.setText(`This would delete ${count} files. Continue?`);
+				const buttons = modal.contentEl.createDiv({cls: "modal-button-container"});
+				let approve = false;
+				buttons.createEl("button", {text: "Keep files"}).onclick = () => modal.close();
+				buttons.createEl("button", {text: "Continue", cls: "mod-warning"}).onclick = () => { approve = true; modal.close(); };
+				modal.onClose = () => decide(approve);
+				modal.open();
+			},
 			onNoteReady: () => refresh(),
 			hash: async (text) => hex(await sha256(new TextEncoder().encode(text))),
 			chunkName: (data, scope): Promise<string> => transport.chunkName(data, scope),
@@ -402,23 +414,10 @@ export default class OwnsyncPlugin extends Plugin {
 		const snapshots = createSnapshots({
 			...backupConnection,
 			mobile: Platform.isMobile,
-			ready: () => connected() && (!engine.tableActive || table.caughtUp) && !keys.state.removed && !keys.state.fork,
+			ready: () => connected() && table.caughtUp && !keys.state.removed && !keys.state.fork,
 			vmkFor: keys.keyFor,
-			async *listNotes(maxBytes) {
-				if (engine.tableActive) { yield* engine.tableSnapshotNotes(); return; }
-				let bytes = 0;
-				for (const file of vault.getMarkdownFiles()) {
-					if (!disk.synced(file)) continue;
-					const { path } = file;
-					const id = engine.noteAt(path);
-					if (!id) continue;
-					bytes += file.stat.size;
-					if (bytes > maxBytes) throw new RangeError("snapshot notes exceed the size limit");
-					yield { id, path, text: await vault.cachedRead(file) };
-				}
-			},
-			// Table snapshots can include the confirmed attachment references without downloading their bytes.
-			listAttachments: () => engine.tableActive ? table.snapshotAttachments() : !this.attachments || vault.getFiles().some((file) => disk.synced(file) && !file.path.endsWith(".md")) ? undefined : [],
+			listNotes: () => engine.tableSnapshotNotes(),
+			listAttachments: () => table.snapshotAttachments(),
 			snapshotLedger: () => engine.snapshotLedger(),
 			recordSnapshot: (id, entry) => engine.recordSnapshot(id, entry),
 			forgetSnapshots: (ids) => engine.forgetSnapshots(ids),

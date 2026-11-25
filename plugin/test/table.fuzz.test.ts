@@ -159,7 +159,7 @@ async function run(seed: number, steps: number) {
 			const projection = new LegacyProjection();
 			try {
 				for (const r of legacy.rows) projection.applyIndex(r.entry);
-				for (const r of legacy.rows) projection.applyAttachment(r.entry);
+				for (const r of legacy.rows) projection.applyDocument(r.entry);
 				for (const [c,b] of legacy.chunks) w.put(c,b,legacy.versionChunks.get(c));
 				for await (const row of projection.rows(nameKey)) {
 					const deleted = row.dateAtCommit ? w.time : row.deleted;

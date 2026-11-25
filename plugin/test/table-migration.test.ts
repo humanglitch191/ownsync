@@ -24,7 +24,7 @@ test("stored genesis preserves legacy names, collapses equal versions and retain
 	const projection = new LegacyProjection();
 	projection.applyIndex(entry("index", Y.encodeStateAsUpdate(index)));
 	const docs = [versionDoc(ref(6), ref(6), ref(7)), versionDoc(ref(8)), versionDoc(ref(9), ref(10))];
-	for (const [i, d] of docs.entries()) projection.applyAttachment(entry(id(i + 1), Y.encodeStateAsUpdate(d)));
+	for (const [i, d] of docs.entries()) projection.applyDocument(entry(id(i + 1), Y.encodeStateAsUpdate(d)));
 	const rows: Row[] = [];
 	for await (const row of projection.rows(key)) rows.push(row);
 	assert.equal(rows.length, 5);
@@ -72,8 +72,8 @@ test("genesis dates undated tombstones at commit and preserves a replaced split 
 		const parent = versionDoc(ref(4), ref(5)), child = versionDoc(ref(6));
 		if (splitChild) notes.set(id(5), { p: "child.bin" });
 		projection.applyIndex(entry("index", Y.encodeStateAsUpdate(index)));
-		projection.applyAttachment(entry(id(1), Y.encodeStateAsUpdate(parent)));
-		if (splitChild) projection.applyAttachment(entry(id(5), Y.encodeStateAsUpdate(child)));
+		projection.applyDocument(entry(id(1), Y.encodeStateAsUpdate(parent)));
+		if (splitChild) projection.applyDocument(entry(id(5), Y.encodeStateAsUpdate(child)));
 		const rows = [];
 		for await (const row of projection.rows(key)) rows.push(row);
 		if (splitChild) {
@@ -173,7 +173,7 @@ test("genesis rejects a version without its identity, even when the bytes repeat
 	const doc = versionDoc(ref(2), invalid as Ref);
 	try {
 		projection.applyIndex(entry("index", Y.encodeStateAsUpdate(index)));
-		projection.applyAttachment(entry(id(1), Y.encodeStateAsUpdate(doc)));
+		projection.applyDocument(entry(id(1), Y.encodeStateAsUpdate(doc)));
 		await assert.rejects(async () => { for await (const _ of projection.rows(key)) { /* drain */ } },
 			/Missing or invalid legacy version identity at broken.bin/);
 	} finally { index.destroy(); doc.destroy(); projection.close(); }
@@ -213,14 +213,46 @@ test("a failed download retries with unchanged disk and row, including after res
 	}
 });
 
-test("genesis waits for a stored text entry even when the legacy index already contains the note", () => {
-	const projection = new LegacyProjection();
+test("partial genesis names gaps, installs complete notes and leaves the original stream available for repair", async () => {
+	const projection = new LegacyProjection(), index = new Y.Doc(), lost = new Y.Doc(), body = new Y.Doc();
+	const paths = async (p: LegacyProjection) => {
+		const names: string[] = [];
+		for await (const {row} of p.noteRows(key,0)) names.push(row.path);
+		return names;
+	};
 	try {
-		projection.notes.set(id(1), { p: "empty.md" });
-		projection.notes.set(id(2), { p: "photo.png" });
-		assert.throws(() => projection.requireStoredNotes(new Set([id(2)])), /first stored text/);
-		projection.requireStoredNotes(new Set([id(1)]));
-	} finally { projection.close(); }
+		const notes = index.getMap("notes");
+		notes.set(id(1), {p:"healthy.md"});
+		notes.set(id(2), {p:"partial.md"});
+		notes.set(id(3), {p:"absent.md"});
+		projection.applyIndex(entry("index",Y.encodeStateAsUpdate(index)));
+		const prefix = new Y.Doc();
+		try {
+			prefix.getText("t").insert(0,"stored");
+			projection.applyDocument(entry(id(1),Y.encodeStateAsUpdate(prefix)));
+		} finally { prefix.destroy(); }
+		// The stored index entry and the stored body each need an earlier missing clock.
+		lost.getMap("notes").set(id(4), {p:"earlier.md"});
+		const indexBase = Y.encodeStateVector(lost);
+		lost.getMap("notes").set(id(5), {p:"later.md"});
+		projection.applyIndex(entry("index",Y.encodeStateAsUpdate(lost,indexBase)));
+		body.getText("t").insert(0,"keep");
+		const base = Y.encodeStateVector(body);
+		body.getText("t").insert(4," both");
+		projection.applyDocument(entry(id(2),Y.encodeStateAsUpdate(body,base)));
+		const messages = projection.gaps();
+		assert.ok(messages.includes("later.md") && messages.includes("partial.md") && messages.includes("absent.md"));
+		assert.deepEqual(await paths(projection),["healthy.md"]);
+		// The decoder checks the union at the captured head, independent of entry order.
+		const repaired = new LegacyProjection();
+		try {
+			repaired.applyIndex(entry("index",Y.encodeStateAsUpdate(index)));
+			repaired.applyDocument(entry(id(2),Y.encodeStateAsUpdate(body,base)));
+			repaired.applyDocument(entry(id(2),Y.encodeStateAsUpdate(body)));
+			assert.ok(!repaired.gaps().includes("partial.md"));
+			assert.deepEqual(await paths(repaired),["partial.md"]);
+		} finally { repaired.close(); }
+	} finally { projection.close(); index.destroy(); lost.destroy(); body.destroy(); }
 });
 
 test("the device reports an over-budget estimate and sends no staged parts or commit", async t => {
@@ -250,6 +282,50 @@ test("the device reports an over-budget estimate and sends no staged parts or co
 	const keys = { epoch:0, vmk:key, vmks:[key], vaultId:key.slice(0,16), state:{}, token:async () => key };
 	const result = await new Promise<unknown>(resolve => importGenesis("ws://localhost",keys as never,
 		{ nameKey:async () => key } as never, (_,err) => resolve(err)));
-	assert.match(String(result),/needs 2 row writes.*remaining Free plan budget today.*legacy sync.*paid plan has no daily row-write limit/);
+	assert.match(String(result),/needs 2 row writes.*remaining Free plan budget today.*waiting for migration.*paid plan has no daily row-write limit/);
 	assert.deepEqual(sent,["hello","table","subscribe","subscribe","migrationEstimate"]);
+});
+
+test("a holder re-proposes an omitted attachment tombstone from unscoped chunks without a disk file", async () => {
+	const { TableSync } = await import("../src/tableSync");
+	const { Files, Memory } = await import("./table-sim");
+	const { KIND, sealEnvelope, openEnvelope } = await import("../../protocol/ownsync");
+	const { decodeClient } = await import("../../server/src/wire");
+	const vaultId = key.slice(0,16), deviceId = vaultId;
+	const keys = { vmk:key, vaultId, epoch:0, me:{id:deviceId}, keyFor:() => key, state:{} };
+	const store = new Memory(), disk = new Files(), problems: unknown[] = [];
+	const table = new TableSync(store, keys as never, disk, () => true, true, 1024, (_,e) => problems.push(e));
+	const bytes = new TextEncoder().encode("deleted content"), h = await table.hash(bytes);
+	const chunk = await sealEnvelope({ vmk:key, vaultId, epoch:0, deviceId, docId:unhex(h), kind:KIND.chunk, plaintext:bytes });
+	const index = new Y.Doc(), doc = versionDoc({ h, n:bytes.length, u:id(2), c:[h] });
+	index.getMap("notes").set(id(1),{p:"removed.bin",d:"AA=="});
+	store.values.set("index", Y.encodeStateAsUpdate(index));
+	store.values.set("state:"+id(1), Y.encodeStateAsUpdate(doc));
+	index.destroy(); doc.destroy();
+	await store.commit(await legacyBases(store, key),[]);
+	const sent: string[] = [];
+	await table.connect(async packet => {
+		const f = decodeClient(packet); sent.push(f.t);
+		switch (f.t) {
+			case "get": assert.equal(hex(f.name),h); return {t:"chunk",name:f.name,envelope:chunk};
+			case "vput": {
+				const {plaintext} = await openEnvelope(f.envelope,vaultId,f.name,() => key);
+				assert.deepEqual(plaintext,bytes);
+				return {t:"stored",name:f.name};
+			}
+			case "set":
+				assert.equal(f.base,null); assert.equal(f.expectedChunks,1);
+				return {t:"ok",req:f.req,seq:1};
+			case "del":
+				assert.equal(f.base,1);
+				return {t:"ok",req:f.req,seq:2};
+			case "forget": return {t:"forgotten",req:f.req};
+			default: assert.fail("unexpected "+f.t);
+		}
+	});
+	await table.ready(0); await table.idle();
+	assert.deepEqual(problems,[]);
+	assert.deepEqual(sent,["get","vput","set","forget","del","forget"]);
+	assert.equal(disk.files.size,0);
+	assert.equal((await store.list("table/legacy/")).length,0);
 });

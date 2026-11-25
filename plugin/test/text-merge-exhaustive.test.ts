@@ -260,3 +260,19 @@ test("exhaustive check: concurrent edits preserve inserted runs intact and keep 
 	);
 	console.log(`PASS: checked ${totalCases} cases across ${bases.length} base texts`);
 });
+
+test("closed-file edits against an unchanged table base round-trip through the Yjs update", () => {
+	for (const base of generateBaseTexts()) {
+		const state = makeBase(base);
+		for (const {text} of generateEdits(base, state, 2, "x")) {
+			const local = new Y.Doc(), receiver = new Y.Doc();
+			try {
+				Y.applyUpdate(local, state);
+				Y.applyUpdate(receiver, state);
+				applyText(local.getText("t"), text);
+				Y.applyUpdate(receiver, Y.encodeStateAsUpdate(local, Y.encodeStateVector(receiver)));
+				assert.equal(receiver.getText("t").toString(), text);
+			} finally { local.destroy(); receiver.destroy(); }
+		}
+	}
+});

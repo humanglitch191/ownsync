@@ -22,6 +22,8 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    # The legacy engine no longer ships as the sync path. Keep its fuzz results informational.
+    continue-on-error: ${{ matrix.suite == 'engine' }}
     strategy:
       fail-fast: false
       matrix:

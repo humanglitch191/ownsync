@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { Memory } from "./table-sim";
 import {
+	NoteDevice,
 	checkNoteInvariants,
 	emptyVaultNoteState,
 	hasUnresolvedConflict,
@@ -736,6 +738,7 @@ function quiesceWorld(w: World, maxTicks = 200): void {
 
 interface ExpectedResult {
 	liveTexts: Map<string, string>; // path -> expected exact text
+	mergedRuns?: {path: string; base: string; left: string; right: string};
 	exactConflictCount: number;
 	exactConflictTexts: Set<string>;
 	anyOrderTexts?: Set<string>;
@@ -754,7 +757,7 @@ function verifyWorld(w: World, expected?: ExpectedResult): void {
 	const live0 = [...d0.disk.files.entries()].filter(([, f]) => !f.unreadable).map(([p, f]) => [p, f.text]).sort();
 	const live1 = [...d1.disk.files.entries()].filter(([, f]) => !f.unreadable).map(([p, f]) => [p, f.text]).sort();
 	if (!d0.state.brakePaused?.declined && !d1.state.brakePaused?.declined && !hasAnyHeld(d0) && !hasAnyHeld(d1)) {
-		assert.deepEqual(live0, live1, `Devices diverged:\nD0: ${JSON.stringify(live0)}\nD1: ${JSON.stringify(live1)}`);
+		assert.deepEqual(live0, live1, `Devices diverged:\nD0: ${JSON.stringify(live0)}\nD1: ${JSON.stringify(live1)}\n${canonicalKey(w)}`);
 	}
 
 	// 3. Base-advancement check: when settled and disk == docText, baseState MUST match docState!
@@ -784,6 +787,11 @@ function verifyWorld(w: World, expected?: ExpectedResult): void {
 		for (const [p, t] of expected.liveTexts) {
 			assert.equal(actualMap.get(p), t, `Expected exact text at ${p}`);
 		}
+		if (expected.mergedRuns) {
+			const {path, base, left, right} = expected.mergedRuns;
+			const actual = actualMap.get(path);
+			assert.ok(actual === base + left + right || actual === base + right + left, `lost or duplicated run in ${actual}`);
+		}
 		const conflictById = new Map<string, NoteEntry>();
 		for (const d of w.devices) {
 			for (const n of d.state.notes.values()) {
@@ -802,7 +810,7 @@ function verifyWorld(w: World, expected?: ExpectedResult): void {
 		} else {
 			assert.equal(
 				actualMap.size,
-				expected.liveTexts.size + expected.exactConflictCount,
+				expected.liveTexts.size + Number(!!expected.mergedRuns) + expected.exactConflictCount,
 				`Unexpected extra live files: got ${JSON.stringify(live0)}, expected ${JSON.stringify([...expected.liveTexts])}`,
 			);
 		}
@@ -1113,7 +1121,7 @@ test("exhaustive checker: 2x2 async interleavings, crash points, exact-set oracl
 	}));
 
 	// 3. Concurrent remote edit + closed-file edit -> exact 1 conflict copy with copyOf holding disk text verbatim
-	record(() => exploreAllInterleavings("concurrent-closed-edit-vs-remote", () => {
+	for (const remoteFirst of [true, false]) record(() => exploreAllInterleavings("concurrent-closed-edit-remote-first-" + remoteFirst, () => {
 		const { w, idA } = seedTwoSyncedNotes();
 		// D0 edits in open editor and publishes to Worker; D1 edits closed disk file before seeing D0's update
 		assert.ok(userOpenEditor(w, 0, idA));
@@ -1122,14 +1130,15 @@ test("exhaustive checker: 2x2 async interleavings, crash points, exact-set oracl
 		userCloseEditor(w, 0, idA);
 		runAsyncStep(w, { t: "deliverDiskEvent", dev: 0 });
 		runAsyncStep(w, { t: "deliverTextAck", dev: 0 });
-		// D1 gets D0's remote Yjs update BEFORE D1's closed-file edit event arrives (so D1's doc != baseState!)
-		runAsyncStep(w, { t: "deliverTextEntry", dev: 1 });
 		userOutsideEdit(w, 1, "a.md", "alpha local");
+		for (const t of remoteFirst ? ["deliverTextEntry", "deliverDiskEvent"] as const : ["deliverDiskEvent", "deliverTextEntry"] as const)
+			runAsyncStep(w, { t, dev: 1 });
 		return w;
 	}, {
-		liveTexts: new Map([["a.md", "alpha remote"], ["b.md", "beta"]]),
-		exactConflictCount: 1,
-		exactConflictTexts: new Set(["alpha local"]),
+		liveTexts: remoteFirst ? new Map([["a.md", "alpha remote"], ["b.md", "beta"]]) : new Map([["b.md", "beta"]]),
+		mergedRuns: remoteFirst ? undefined : {path: "a.md", base: "alpha", left: " remote", right: " local"},
+		exactConflictCount: remoteFirst ? 1 : 0,
+		exactConflictTexts: new Set(remoteFirst ? ["alpha local"] : []),
 	}, 22, true, 4000));
 
 	// 4. Bug: Edits behind a pending request (rename in flight + live typing + disk edit)
@@ -1456,4 +1465,59 @@ test("exhaustive checker: 2x2 async interleavings, crash points, exact-set oracl
 	const elapsedMs = Date.now() - startTime;
 	console.log(`# Exhaustive model checker: ${totalStates} states explored (${totalTerminals} terminal interleavings) in ${elapsedMs}ms`);
 	assert.deepEqual(failures, [], `Model checker found ${failures.length} counterexamples:\n${failures.join("\n\n")}`);
+});
+
+test("crashes on either side of the publish commit recover the note body and exactly one outbox entry together", async () => {
+	for (const failBefore of [true, false]) {
+		const store = new Memory(), env = makeEnv(makeFreshWorld().devices[0], makeFreshWorld());
+		let device = await NoteDevice.open(store);
+		const scan: NoteInput = { t: "diskObs", event: "startup", listingComplete: true, files: new Map([
+			["outside.md", { stat: { path: "outside.md", mtime: 1, size: 5 }, text: "typed", hash: sha("typed") }],
+		]) };
+		const publish = (puts: Map<string, unknown>, doc: string, data: Uint8Array) => {
+			assert.equal(puts.has("out:1") || store.values.has("out:1"), false);
+			puts.set("out:1", {doc, data});
+			puts.set("meta", {nextOut: 2});
+		};
+		await device.dispatch({t: "setFirstSync", firstSync: true, noteAuthority: true}, env);
+		store.fail = failBefore;
+		if (failBefore) await assert.rejects(device.dispatch(scan, env, publish), /crash at commit/);
+		else await device.dispatch(scan, env, publish);
+		assert.equal((await store.list("out:")).length, failBefore ? 0 : 1);
+		assert.equal((await store.list("table/note-state/")).length, failBefore ? 0 : 1);
+		store.fail = false;
+		device = await NoteDevice.open(store);
+		await device.dispatch({t: "crashRestart"}, env);
+		await device.dispatch(scan, env, publish);
+		const id = device.snapshot().byPath.get("outside.md")!;
+		const entry = await store.get<{doc: string; data: Uint8Array}>("out:1");
+		assert.equal(entry?.doc, id);
+		assert.equal(env.crdt.completeText(entry?.data), "typed");
+		assert.equal(env.crdt.completeText(device.snapshot().docs.get(id)), "typed");
+		assert.equal(device.snapshot().notes.get(id)?.unpublished, undefined);
+		assert.deepEqual(await store.get("meta"), {nextOut: 2});
+	}
+});
+
+test("a crash while a row page defers publication preserves the observed disk text", async () => {
+	const store = new Memory(), world = makeFreshWorld(), env = makeEnv(world.devices[0], world);
+	let device = await NoteDevice.open(store);
+	await device.dispatch({t:"setFirstSync",firstSync:false,noteAuthority:true}, env);
+	env.catchingUp = true;
+	const files = new Map([["a.md", {stat:{path:"a.md",mtime:1,size:4},text:"mine",hash:sha("mine")}]]);
+	await device.dispatch({t:"diskObs",event:"changed",path:"a.md",files,listingComplete:true}, env);
+	const id = device.snapshot().byPath.get("a.md")!;
+	assert.ok(device.snapshot().notes.get(id)?.unpublished);
+	device = await NoteDevice.open(store);
+	env.catchingUp = false;
+	await device.dispatch({t:"crashRestart"},env);
+	let count = 0;
+	await device.dispatch({t:"diskObs",event:"startup",listingComplete:true,files}, env, (puts, doc, data) => {
+		count++;
+		assert.equal(doc,id);
+		puts.set("out:1",data);
+	});
+	assert.equal(count,1);
+	assert.equal(env.crdt.completeText(await store.get("out:1")), "mine");
+	assert.equal(device.snapshot().notes.get(id)?.unpublished, undefined);
 });

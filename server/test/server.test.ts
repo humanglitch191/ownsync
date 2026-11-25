@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SNAPSHOT_BUDGET, snapshotsToPrune } from "../src/snapshots.ts";
 import { CLOSE, GENESIS_PART_BYTES, estimateGenesis, genesisWrites, packGenesis, unpackGenesis, type ClientFrame, type ServerFrame, decodeClient, decodeServer, encodeClient, encodeServer } from "../src/wire.ts";
-import { type Stats, claim, ownerOverview, migrateNow, startDev, stats } from "./devServer.ts";
+import { type Stats, claim, ownerOverview, startDev, stats } from "./devServer.ts";
 
 const dev = await startDev();
 after(() => dev.stop());
@@ -987,7 +987,6 @@ test("packed genesis pays only for parts, the format flag and required note inde
 					yield { t: "stageRow" as const, expectedChunks: null, row };
 				}
 			};
-			await migrateNow(host,v);
 			const writes = async () => (await stats(host,v)).rowsWrittenToday;
 			const estimate = await estimateGenesis(rows()); await budget(a,estimate);
 			const before = await writes();
@@ -1036,7 +1035,6 @@ test("a failed genesis write leaves legacy sync active and exposes no partial ta
 	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
 	const a = await tablePeer(v, tok, false);
 	try {
-		await migrateNow(`http://localhost:${PORT}`, v);
 		const frames = [1, 2].map(seq => ({ t: "stageRow" as const, expectedChunks: null, row: {
 			file: doc(seq), version: null, pathkey: name(seq), seq, deleted: null, record: bytes("sealed")
 		} }));
@@ -1071,7 +1069,6 @@ test("a returning connection reclaims abandoned genesis parts and preserves a li
 	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
 	const a = await tablePeer(v,tok,false), b = await tablePeer(v,tok,false);
 	try {
-		await migrateNow(`http://localhost:${PORT}`,v);
 		const frame = { t: "stagePart" as const, part: 1, data: Uint8Array.of(0) };
 		for (const peer of [a,b]) { await budget(peer,genesisWrites(1,0,1)); peer.send(frame); assert.equal((await peer.next()).t,"stagedPart"); }
 		db.exec("CREATE TRIGGER no_delete BEFORE DELETE ON genesis_parts BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
@@ -1101,13 +1098,6 @@ test("genesis checks the legacy head and complete row count, switches once and c
 			a.send(await onePart({ t: "stageRow", expectedChunks: null, row }));
 			assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
 		};
-		a.send({ t: "migrationCheck" });
-		assert.deepEqual(await a.next(), { t: "migrationEligible", ready: false });
-		await stage();
-		a.send({ t: "genesis", base: 0, rows: 1 });
-		assert.deepEqual(await a.next(), { t: "format", table: false });
-		await migrateNow(`http://localhost:${PORT}`, v);
-		assert.deepEqual(await a.next(), { t: "migrationEligible", ready: true });
 		await stage();
 		const base = await legacy.publish(doc(8), "a note changed");
 		a.send({ t: "genesis", base: 0, rows: 1 });
@@ -1140,7 +1130,6 @@ test("notes share path CAS and keep text across deletion, replay and restore", a
 	const deleted = { ...note, file: doc(2), record: bytes("sealed prior deletion vector"), seq: 2, deleted: 123 };
 	try {
 		const head = await legacy.publish(doc(22), "original Yjs state");
-		await migrateNow(`http://localhost:${PORT}`, v);
 		await budget(a,genesisWrites(1,1,2));
 		for (const row of [note, deleted])
 			assert.deepEqual(await send(await onePart({ t: "stageRow", expectedChunks: null, row })), { t: "stagedPart", seq: row.seq });
@@ -1188,31 +1177,23 @@ test("notes share path CAS and keep text across deletion, replay and restore", a
 	} finally { db.close(); a.ws.close(); legacy.ws.close(); }
 });
 
-test("genesis waits for a recently disconnected legacy device to upgrade or age out", async () => {
-	for (const upgrade of [true, false]) {
-		const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
-		const a = await tablePeer(v, tok, false);
-		const id = doc(1).slice(0,4);
-		try {
-			legacy.send({ t: "status", id, version: "0.2.5", conflicts: 0 });
-			await legacy.catchUp(0); legacy.ws.close(); await legacy.closed;
-			const eligible = async () => { a.send({ t: "migrationCheck" }); return a.next(); };
-			assert.deepEqual(await eligible(), { t: "migrationEligible", ready: false });
-			if (upgrade) a.send({ t: "status", id, version: "updated", conflicts: 0 });
-			else db.exec("UPDATE devices SET last_online = 0");
-			assert.deepEqual(await eligible(), { t: "migrationEligible", ready: true });
-			await budget(a,genesisWrites(0,0,0));
-			a.send({ t: "genesis", base: 0, rows: 0 });
-			assert.deepEqual(await a.next(), { t: "format", table: true });
-		} finally { a.ws.close(); legacy.ws.close(); db.close(); }
-	}
+test("a recently seen legacy client does not block genesis", async () => {
+	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+	const a = await tablePeer(v, tok, false);
+	try {
+		legacy.send({t:"status", id:doc(1).slice(0,4), version:"0.2.5", conflicts:0});
+		await legacy.catchUp(0);
+		await budget(a, genesisWrites(0,0,0));
+		a.send({t:"genesis", base:0, rows:0});
+		assert.deepEqual(await a.next(), {t:"format", table:true});
+		assert.equal(await legacy.closed, CLOSE.updateNeeded);
+	} finally { a.ws.close(); legacy.ws.close(); db.close(); }
 });
 
 test("table CAS includes renames, replays exact answers and distinguishes restoring from reviving", async () => {
 	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
 	const a = await tablePeer(v, tok, false);
 	try {
-		await migrateNow(`http://localhost:${PORT}`, v);
 		await budget(a,genesisWrites(0,0,0));
 		a.send({ t: "genesis", base: 0, rows: 0 });
 		assert.deepEqual(await a.next(), { t: "format", table: true });
@@ -1319,7 +1300,6 @@ test("genesis checks scoped live versions, preserves cleaned tombstones, and gra
 			expectedChunks:1,dateAtCommit:true })), {t:"stagedPart",seq:4});
 	};
 	try {
-		await migrateNow(`http://localhost:${PORT}`, v);
 		old.send({ t: "put", name: name(10), envelope: bytes("old-style bytes") });
 		assert.equal((await old.next()).t, "stored");
 		old.send({ t: "vput", tag: scoped.version, name: name(11), envelope: bytes("a") });
@@ -1355,7 +1335,6 @@ test("table paging resumes after the last row even when the reader changes a row
 	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
 	const peer = await tablePeer(v, tok, false);
 	try {
-		await migrateNow(`http://localhost:${PORT}`, v);
 		await budget(peer,genesisWrites(0,0,0));
 		peer.send({ t: "genesis", base: 0, rows: 0 }); await peer.next();
 		const ins = db.prepare("INSERT INTO attachments(file, version, pathkey, record, seq) VALUES (?, ?, ?, ?, ?)");
