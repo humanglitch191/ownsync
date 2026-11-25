@@ -98,7 +98,11 @@ test("only a current owner code creates a vault, each code once; then devices of
 });
 
 test("every frame survives encoding and decoding", () => {
+	const row = { file: doc(1), version: name(2), pathkey: name(3), record: bytes("sealed"), deleted: 0, seq: 2 ** 32 + 1 };
 	const client: ClientFrame[] = [
+		{ t: "table" }, { t: "since", after: row.seq }, { t: "stageRow", row, expectedChunks: null }, { t: "genesis", base: row.seq, rows: 1 },
+		{ t: "set", req: doc(1), file: row.file, base: null, version: row.version, expectedChunks: 1, pathkey: row.pathkey, record: row.record },
+		{ t: "del", req: doc(2), file: row.file, base: row.seq }, { t: "restore", req: doc(3), file: row.file, base: row.seq, expectedChunks: 0, pathkey: row.pathkey, record: row.record },
 		{ t: "hello", token: token() }, { t: "hello", token: token(), owner: token() }, { t: "subscribe", after: 2 ** 40 + 7 }, { t: "publish", id: 4_000_000_000, doc: doc(3), envelope: bytes("x") },
 		{ t: "snapshot", doc: doc(4), base: 99, envelope: bytes("yy") }, { t: "live", doc: doc(5), envelope: bytes("z") },
 		{ t: "fetch", from: 3 }, { t: "append", number: 2, recovery: bytes("r"), blob: bytes("rec") },
@@ -108,6 +112,8 @@ test("every frame survives encoding and decoding", () => {
 	];
 	for (const f of client) assert.deepEqual(decodeClient(encodeClient(f)), f);
 	const server: ServerFrame[] = [
+		{ t: "format", table: true }, { t: "row", row }, { t: "stagedRow", seq: 1 }, { t: "tableMore", seq: row.seq }, { t: "tableSynced", seq: row.seq },
+		{ t: "ok", req: doc(1), seq: row.seq }, { t: "refused", req: doc(2), row, missing: false }, { t: "refused", req: doc(3), row: null, missing: true },
 		{ t: "entry", seq: 2 ** 40 + 1, doc: doc(1), snapshot: true, envelope: bytes("e") }, { t: "more", seq: 5 }, { t: "synced", seq: 6 },
 		{ t: "ack", id: 7, seq: 8 }, { t: "live", doc: doc(2), envelope: bytes("l") },
 		{ t: "record", number: 4, blob: bytes("rec") }, { t: "records", recovery: bytes("sealed") },
@@ -933,4 +939,202 @@ test("a request for a vault that doesn't exist leaves no storage behind", async 
 		db.close();
 		assert.deepEqual(tables, []);
 	}
+});
+
+async function tablePeer(v: string, tok: Uint8Array, migrated: boolean) {
+	const peer = await connect(v, tok);
+	peer.send({ t: "table" });
+	assert.deepEqual(await peer.next(), { t: "format", table: migrated });
+	return peer;
+}
+
+test("genesis checks the legacy head and complete row count, switches once and closes old devices", async () => {
+	const v = vault(), tok = token();
+	const legacy = await connect(v, tok), a = await tablePeer(v, tok, false), b = await tablePeer(v, tok, false);
+	const row = { file: doc(1), version: name(2), pathkey: name(3), record: bytes("sealed"), deleted: null, seq: 1 };
+	try {
+		const stage = async () => {
+			a.send({ t: "stageRow", expectedChunks: null, row });
+			assert.deepEqual(await a.next(), { t: "stagedRow", seq: 1 });
+		};
+		await stage();
+		const base = await legacy.publish(doc(8), "a note changed");
+		a.send({ t: "genesis", base: 0, rows: 1 });
+		assert.deepEqual(await a.next(), { t: "format", table: false });
+		a.send({ t: "genesis", base, rows: 1 });
+		assert.deepEqual(await a.next(), { t: "format", table: false });
+		await stage();
+		a.send({ t: "genesis", base, rows: 1 });
+		assert.deepEqual(await a.next(), { t: "format", table: true });
+		assert.deepEqual(await b.next(), { t: "format", table: true });
+		assert.equal(await legacy.closed, CLOSE.updateNeeded);
+		b.send({ t: "genesis", base, rows: 0 }); // the loser's import can't replace the winner's
+		assert.deepEqual(await b.next(), { t: "format", table: true });
+		b.send({ t: "since", after: 0 });
+		assert.deepEqual(await b.next(), { t: "row", row });
+		assert.deepEqual(await b.next(), { t: "tableSynced", seq: 1 });
+		assert.deepEqual((await a.catchUp(0)).got, ["1:8:u:a note changed"]);
+		const old = await connect(v, tok);
+		old.send({ t: "subscribe", after: 0 });
+		assert.equal(await old.closed, CLOSE.updateNeeded);
+	} finally { legacy.ws.close(); a.ws.close(); b.ws.close(); }
+});
+
+test("table CAS includes renames, replays exact answers and distinguishes restoring from reviving", async () => {
+	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+	const a = await tablePeer(v, tok, false);
+	try {
+		a.send({ t: "genesis", base: 0, rows: 0 });
+		assert.deepEqual(await a.next(), { t: "format", table: true });
+		assert.equal(await legacy.closed, CLOSE.updateNeeded);
+		for (const n of [10, 11, 12]) {
+			a.send({ t: "vput", tag: name(n), name: name(n + 10), envelope: bytes("chunk") });
+			assert.deepEqual(await a.next(), { t: "stored", name: name(n + 10) });
+		}
+		const change = async (f: ClientFrame) => { a.send(f); return a.next(); };
+		const set = { t: "set", expectedChunks: 1, req: doc(1), file: doc(3), base: null, version: name(10), pathkey: name(4), record: bytes("original") } as const;
+		const ok = (req: number, seq: number) => ({ t: "ok", req: doc(req), seq });
+		assert.deepEqual(await change(set), ok(1, 1));
+		const rename = { ...set, req: doc(2), base: 1, pathkey: name(5), record: bytes("renamed") };
+		assert.deepEqual(await change(rename), ok(2, 2));
+		const stale = { ...set, req: doc(3), base: 1, version: name(11), record: bytes("edit before rename") };
+		const row = { file: set.file, version: set.version, pathkey: rename.pathkey, record: rename.record, deleted: null, seq: 2 };
+		const refusal = { t: "refused", req: stale.req, missing: false, row };
+		assert.deepEqual(await change(stale), refusal);
+		assert.deepEqual(await change({ ...set, file: doc(8), pathkey: rename.pathkey, req: doc(4) }), { ...refusal, req: doc(4) });
+		const del = { t: "del", req: doc(5), file: set.file, base: 2 } as const;
+		assert.deepEqual(await change(del), ok(5, 3));
+		const restore = { t: "restore", expectedChunks: 1, req: doc(6), file: set.file, base: 3, pathkey: rename.pathkey, record: rename.record } as const;
+		assert.deepEqual(await change(restore), ok(6, 4));
+		assert.deepEqual(await change(del), ok(5, 3));
+		assert.deepEqual(await change(stale), refusal);
+		assert.deepEqual(await change(set), ok(1, 1));
+		assert.deepEqual(await change({ ...del, req: doc(7) }), { ...refusal, req: doc(7), row: { ...row, seq: 4 } });
+		const vb = db.prepare("SELECT retired_at FROM versions WHERE tag = ?");
+		assert.equal(vb.get(set.version)!.retired_at, null);
+		assert.deepEqual(await change({ ...del, req: doc(8), base: 4 }), ok(8, 5));
+		const retired = vb.get(set.version)!.retired_at;
+		assert.equal(typeof retired, "number");
+		assert.deepEqual(await change({ ...set, version: name(11), req: doc(9), base: 5 }), ok(9, 6));
+		assert.equal(vb.get(set.version)!.retired_at, retired);
+		assert.equal(vb.get(name(11))!.retired_at, null);
+		const returning = await tablePeer(v, tok, true);
+		try {
+			returning.send(restore);
+			assert.deepEqual(await returning.next(), ok(6, 4)); // lost answer, after a different version revived the file
+		} finally { returning.ws.close(); }
+		const year = new Date().getUTCFullYear() - 1, at = Date.UTC(year, 0, 2);
+		db.prepare("UPDATE versions SET retired_at = ? WHERE tag = ?").run(at, set.version);
+		db.prepare("UPDATE chunks SET uploaded_at = ?").run(at);
+		assert.deepEqual(await cleanupSizes(v), [{ at, old: 5, deleted: 5 }]);
+		assert.deepEqual(await cleanupPost(v, { ranges: [[at, at + 1]], zone: "UTC", months: 1 }), { removed: 2, more: false });
+		assert.equal(db.prepare("SELECT count(*) AS n FROM chunks WHERE name = ?").get(name(21))!.n, 1);
+		const missing = { ...set, version: name(12), base: 6, req: doc(10) };
+		const noChunk = await change(missing);
+		assert.equal(noChunk.t === "refused" && noChunk.missing, true);
+		a.send({ t: "vput", tag: name(12), name: name(22), envelope: bytes("chunk") });
+		await a.next();
+		assert.deepEqual(await change(missing), noChunk);
+		assert.deepEqual(await change({ ...missing, req: doc(11) }), ok(11, 7));
+		assert.deepEqual(await change({ ...del, req: doc(12), base: 7 }), ok(12, 8));
+		db.prepare("UPDATE versions SET retired_at = ? WHERE tag = ?").run(at, name(12));
+		assert.deepEqual(await cleanupPost(v, { ranges: [[at, at + 1]], zone: "UTC", months: 1 }), { removed: 1, more: false });
+		const gone = await change({ ...restore, req: doc(13), base: 8 });
+		assert.equal(gone.t === "refused" && gone.missing && gone.row?.seq, 8);
+		assert.equal(vb.get(name(12))!.retired_at, at);
+	} finally { db.close(); legacy.ws.close(); a.ws.close(); }
+});
+
+test("scoped declarations distinguish partial uploads, complete uploads and empty files", async () => {
+	const peer = await tablePeer(vault(), token(), false);
+	const send = async (f: ClientFrame) => { peer.send(f); return peer.next(); };
+	const set = { t: "set", req: doc(1), file: doc(2), base: null, version: name(3), pathkey: name(4), expectedChunks: 2, record: bytes("sealed") } as const;
+	try {
+		await send({ t: "genesis", base: 0, rows: 0 });
+		assert.deepEqual(await send({ t: "vput", tag: set.version, name: name(1), envelope: bytes("a") }), { t: "stored", name: name(1) });
+		const refused = { t: "refused", req: set.req, row: null, missing: true };
+		assert.deepEqual(await send(set), refused);
+		assert.deepEqual(await send({ t: "vput", tag: set.version, name: name(2), envelope: bytes("b") }), { t: "stored", name: name(2) });
+		assert.deepEqual(await send(set), refused);
+		assert.deepEqual(await send({ ...set, req: doc(2) }), { t: "ok", req: doc(2), seq: 1 });
+		assert.deepEqual(await send({ t: "vput", tag: set.version, name: name(3), envelope: bytes("extra") }), { t: "missing", name: name(3) });
+		assert.deepEqual(await send({ ...set, req: doc(3), base: 1, version: name(5), expectedChunks: 0 }), { t: "ok", req: doc(3), seq: 2 });
+		const unscoped = await send({ ...set, req: doc(4), base: 2, expectedChunks: null, version: name(6) });
+		assert.equal(unscoped.t, "refused");
+	} finally { peer.ws.close(); }
+});
+
+test("genesis checks scoped live versions, preserves cleaned tombstones, and grants the legacy exception only to imported versions", async () => {
+	const { v, tok, a: old, db } = await snapshotVaultWithDb();
+	const peer = await tablePeer(v, tok, false);
+	const send = async (f: ClientFrame) => { peer.send(f); return peer.next(); };
+	const scoped = { file: doc(1), version: name(2), pathkey: name(3), record: bytes("scoped"), seq: 1, deleted: null };
+	const legacy = { ...scoped, file: doc(4), version: name(5), pathkey: name(6), record: bytes("legacy"), seq: 2 };
+	const past = Date.UTC(new Date().getUTCFullYear() - 1, 0, 1);
+	const tombstone = { ...scoped, file: doc(7), version: name(8), pathkey: name(9), seq: 3, deleted: past };
+	const stage = async () => {
+		for (const [row, expectedChunks] of [[scoped, 2], [legacy, null], [tombstone, 1]] as const) {
+			assert.deepEqual(await send({ t: "stageRow", row, expectedChunks }), { t: "stagedRow", seq: row.seq });
+		}
+	};
+	try {
+		old.send({ t: "put", name: name(10), envelope: bytes("old-style bytes") });
+		assert.equal((await old.next()).t, "stored");
+		old.send({ t: "vput", tag: scoped.version, name: name(11), envelope: bytes("a") });
+		assert.equal((await old.next()).t, "stored");
+		await stage();
+		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 3 }), { t: "format", table: false });
+		old.send({ t: "vput", tag: scoped.version, name: name(12), envelope: bytes("b") });
+		assert.equal((await old.next()).t, "stored");
+		await stage();
+		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 3 }), { t: "format", table: true });
+		assert.equal(await old.closed, CLOSE.updateNeeded);
+
+		const restore = { t: "restore", req: doc(13), base: tombstone.seq, file: tombstone.file, pathkey: tombstone.pathkey, record: tombstone.record } as const;
+		for (const [req, expectedChunks] of [[13, 0], [14, 1], [15, null]] as const) {
+			assert.deepEqual(await send({ ...restore, req: doc(req), expectedChunks }), { t: "refused", missing: true, req: doc(req), row: tombstone });
+		}
+		assert.deepEqual(await send({ t: "set", req: doc(16), file: legacy.file, version: legacy.version, pathkey: name(14), record: legacy.record, base: 2, expectedChunks: null }), { t: "ok", req: doc(16), seq: 4 });
+		assert.deepEqual(await send({ t: "del", req: doc(17), file: legacy.file, base: 4 }), { t: "ok", req: doc(17), seq: 5 });
+		db.prepare("UPDATE chunks SET uploaded_at = ?").run(past);
+		db.prepare("UPDATE versions SET retired_at = ? WHERE tag = ?").run(past, legacy.version);
+		assert.deepEqual(await cleanupPost(v, { ranges: [[past, past + 1]], zone: "UTC", months: 1 }), { removed: 0, more: false });
+		assert.deepEqual(await send({ t: "get", name: name(10) }), { t: "chunk", name: name(10), envelope: bytes("old-style bytes") });
+		assert.deepEqual(await send({ ...restore, req: doc(18), file: legacy.file, base: 5, expectedChunks: null, pathkey: legacy.pathkey, record: legacy.record }), { t: "ok", req: doc(18), seq: 6 });
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM version_chunks WHERE tag = ?").get(legacy.version)!.n, 0);
+	} finally { db.close(); old.ws.close(); peer.ws.close(); }
+});
+
+test("table paging resumes after the last row even when the reader changes a row between pages", async () => {
+	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+	const peer = await tablePeer(v, tok, false);
+	try {
+		peer.send({ t: "genesis", base: 0, rows: 0 }); await peer.next();
+		const ins = db.prepare("INSERT INTO attachments(file, version, pathkey, record, seq) VALUES (?, ?, ?, ?, ?)");
+		const count = 402;
+		for (let i = 1; i <= count; i++) {
+			const pathkey = name(0);
+			new DataView(pathkey.buffer).setUint32(0, i);
+			ins.run(bytes(String(i)), name(1), pathkey, bytes("sealed"), i);
+		}
+		peer.send({ t: "since", after: 0 });
+		let last = 0;
+		for (;;) {
+			const f = await peer.next();
+			if (f.t === "tableMore") { assert.equal(f.seq, last); break; }
+			assert.equal(f.t, "row"); if (f.t === "row") assert.equal(f.row.seq, ++last);
+		}
+		peer.send({ t: "del", req: doc(2), file: bytes("1"), base: 1 });
+		assert.deepEqual(await peer.next(), { t: "ok", req: doc(2), seq: count + 1 });
+		peer.send({ t: "since", after: last });
+		for (let i = last + 1; i <= count + 1; i++) {
+			const f = await peer.next();
+			assert.equal(f.t === "row" && f.row.seq, i);
+		}
+		assert.deepEqual(await peer.next(), { t: "tableSynced", seq: count + 1 });
+		peer.send({ t: "del", req: doc(3), file: bytes("2"), base: 2 });
+		assert.deepEqual(await peer.next(), { t: "ok", req: doc(3), seq: count + 2 });
+		const live = await peer.next();
+		assert.equal(live.t === "row" && live.row.seq, count + 2);
+	} finally { db.close(); legacy.ws.close(); peer.ws.close(); }
 });

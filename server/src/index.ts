@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { Dashboard, VERSION, type VaultRpc, type VaultSettings, type VaultStats } from "./dashboard";
 import { SNAPSHOT_BUDGET, SNAPSHOT_DAYS, snapshotsToPrune } from "./snapshots";
-import { CHUNK_OVERHEAD, CLOSE, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_ENVELOPE, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer } from "./wire";
+import { CHUNK_OVERHEAD, CLOSE, type AttachmentAnswer, type AttachmentMutation, type AttachmentRow, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer, validClientSize } from "./wire";
 
 interface Env {
 	VAULT: DurableObjectNamespace<Vault>;
@@ -22,9 +22,16 @@ const MIN_SETUP_KEY = 12;
 
 // token: hex hash of the token this socket said hello with; null before hello. device: the short ID its status gave.
 // listFrom: when this socket's full list of current versions began (DESIGN.md section 10), until its last frame.
-type Session = { token: string | null; live: boolean; device?: string; listFrom?: number };
+type Session = { token: string | null; live: boolean; device?: string; listFrom?: number; table?: string; subscribed?: boolean; tableLive?: boolean };
 const toHex = (b: ArrayBuffer | Uint8Array) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
+type StoredAttachment = { file: ArrayBuffer; version: ArrayBuffer; pathkey: ArrayBuffer; record: ArrayBuffer; deleted: number | null; seq: number };
+const attachmentRow = (r: StoredAttachment): AttachmentRow => ({
+	file: new Uint8Array(r.file), version: new Uint8Array(r.version), pathkey: new Uint8Array(r.pathkey), record: new Uint8Array(r.record), deleted: r.deleted, seq: r.seq,
+});
 type Row = { seq: number; doc: ArrayBuffer; snapshot: number; envelope: ArrayBuffer };
+
+// NULL in versions means upload started, count unknown. Only genesis may install this legacy marker.
+const LEGACY_CHUNKS = -1;
 
 // One catch-up page. Small enough to stay well inside a Worker's time and memory for one event.
 const PAGE_ROWS = 400;
@@ -88,6 +95,7 @@ export class Vault extends DurableObject<Env> {
 	private token: string | null; // hex hash of the vault's current auth token; null until the first hello
 	private name: string | null = null; // this vault's ID (32 hex), from the first request's URL
 	private deleted: boolean;
+	private migrated = false;
 	// Today's counters for the dashboard's free-plan meter, kept in memory and written at most once a minute.
 	private usage: { day: number; requests: number; rows: number; lastActivity: number | null };
 	private flushedAt = 0;
@@ -98,7 +106,10 @@ export class Vault extends DurableObject<Env> {
 		// No tables until a vault is created (or an older Worker made them): a request for a random ID must not
 		// leave storage behind, or anyone could make objects that never go away.
 		const exists = this.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'auth'").toArray().length > 0;
-		if (exists) this.schema();
+		if (exists) {
+			this.schema();
+			this.migrated = !!this.sql.exec("SELECT 1 FROM settings WHERE key = 'attachmentTable'").toArray().length;
+		}
 		this.head = exists ? this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM entries").one().seq : 0;
 		const auth = exists ? this.sql.exec<{ token_hash: ArrayBuffer }>("SELECT token_hash FROM auth").toArray()[0] : undefined;
 		this.token = auth ? toHex(auth.token_hash) : null;
@@ -136,9 +147,18 @@ export class Vault extends DurableObject<Env> {
 			CREATE INDEX IF NOT EXISTS versions_retired ON versions (retired_at);
 			CREATE TABLE IF NOT EXISTS version_chunks (name BLOB PRIMARY KEY, tag BLOB NOT NULL);
 			CREATE INDEX IF NOT EXISTS version_chunks_tag ON version_chunks (tag);
+			CREATE TABLE IF NOT EXISTS attachments (file BLOB PRIMARY KEY, version BLOB NOT NULL, pathkey BLOB NOT NULL, record BLOB NOT NULL, deleted INTEGER, seq INTEGER NOT NULL UNIQUE);
+			CREATE UNIQUE INDEX IF NOT EXISTS attachments_path ON attachments(pathkey) WHERE deleted IS NULL;
+			CREATE INDEX IF NOT EXISTS attachments_version ON attachments(version) WHERE deleted IS NULL;
+			CREATE TABLE IF NOT EXISTS attachment_answers (req BLOB PRIMARY KEY, answer BLOB NOT NULL);
+			CREATE TABLE IF NOT EXISTS attachment_stage (session TEXT NOT NULL, ordinal INTEGER NOT NULL, expected_chunks INTEGER NOT NULL, file BLOB NOT NULL, version BLOB NOT NULL, pathkey BLOB NOT NULL, record BLOB NOT NULL, deleted INTEGER, PRIMARY KEY(session, ordinal), UNIQUE(session, file));
+			CREATE UNIQUE INDEX IF NOT EXISTS attachment_stage_path ON attachment_stage(session, pathkey) WHERE deleted IS NULL;
 			CREATE TABLE IF NOT EXISTS lists (device TEXT PRIMARY KEY, at INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 		`);
+		// Existing chunks have no known upload time. Leave it NULL so an orphan cannot be dated by guesswork.
+		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(chunks)").toArray().some(c => c.name === "uploaded_at")) this.sql.exec("ALTER TABLE chunks ADD COLUMN uploaded_at INTEGER");
+		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(versions)").toArray().some(c => c.name === "expected_chunks")) this.sql.exec("ALTER TABLE versions ADD COLUMN expected_chunks INTEGER");
 		// Added in 0.1.2: a device's name, as Obsidian has it. Vaults made earlier get the column now.
 		if (!this.sql.exec<{ name: string }>("PRAGMA table_info(devices)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");
 		// Added in 0.2.0: when the usage counters were last written, so a wake from hibernation doesn't write them again.
@@ -403,7 +423,7 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	async webSocketMessage(ws: WebSocket, msg: ArrayBuffer | string): Promise<void> {
-		if (typeof msg === "string" || msg.byteLength < 1 || msg.byteLength > MAX_ENVELOPE + 64) return ws.close(CLOSE.badMessage, "bad frame");
+		if (typeof msg === "string" || !validClientSize(new Uint8Array(msg))) return ws.close(CLOSE.badMessage, "bad frame");
 		const session = ws.deserializeAttachment() as Session;
 		this.count(1 / 20); // Cloudflare bills incoming WebSocket messages at 20 to one request
 		// Not asked for an owner code: the vault must not be created again.
@@ -424,11 +444,33 @@ export class Vault extends DurableObject<Env> {
 				this.expireSnapshots(Date.now());
 				return ws.serializeAttachment({ ...session, token: this.token });
 			}
+			if (f.t === "table") {
+				if (!session.table && (session.subscribed || session.live)) return ws.close(CLOSE.badMessage, "negotiate before subscribe");
+				if (!session.table) ws.serializeAttachment({ ...session, table: crypto.randomUUID() });
+				return ws.send(encodeServer({ t: "format", table: this.migrated }));
+			}
+			if (this.migrated && !session.table) return ws.close(CLOSE.updateNeeded, "update needed");
+			if (f.t === "stageRow" || f.t === "genesis") {
+				if (!session.table) return ws.close(CLOSE.badMessage, "table handshake required");
+				if (f.t === "genesis") return this.genesis(ws, session.table, f.base, f.rows);
+				if (this.migrated || !f.row.seq) return ws.close(CLOSE.badMessage, "invalid genesis row");
+				const r = f.row;
+				this.write("INSERT INTO attachment_stage(session, ordinal, expected_chunks, file, version, pathkey, record, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", session.table, r.seq, f.expectedChunks ?? LEGACY_CHUNKS, r.file, r.version, r.pathkey, r.record, r.deleted);
+				return ws.send(encodeServer({ t: "stagedRow", seq: r.seq }));
+			}
+			if (f.t === "since" || f.t === "set" || f.t === "del" || f.t === "restore") {
+				if (!session.table || !this.migrated) return ws.close(CLOSE.badMessage, "attachment table required");
+				if (f.t === "since") return this.since(ws, session, f.after);
+				return this.changeAttachment(ws, f);
+			}
 			if (f.t === "subscribe") return this.subscribe(ws, session, f.after);
 			if (f.t === "hello") return this.expireSnapshots(Date.now());
 			if (f.t === "append" || f.t === "rotate") return this.append(ws, f);
 			if (f.t === "status") return this.status(ws, session, f);
-			if (f.t === "mark") return this.mark(ws, session, f);
+			if (f.t === "mark") {
+				if (this.migrated) return ws.close(CLOSE.badMessage, "attachment table owns retirements");
+				return this.mark(ws, session, f);
+			}
 			if (f.t === "get") {
 				const row = this.sql.exec<{ envelope: ArrayBuffer }>("SELECT envelope FROM chunks WHERE name = ?", f.name).toArray()[0];
 				return ws.send(encodeServer(row ? { t: "chunk", name: f.name, envelope: new Uint8Array(row.envelope) } : { t: "missing", name: f.name }));
@@ -439,7 +481,7 @@ export class Vault extends DurableObject<Env> {
 				if (f.envelope.length > MAX_CHUNK + CHUNK_OVERHEAD) return ws.close(CLOSE.badMessage, "chunk too large");
 				// The name is a keyed hash of the content, so the same name is the same chunk: stored once.
 				try {
-					this.write("INSERT OR IGNORE INTO chunks (name, envelope) VALUES (?, ?)", f.name, f.envelope);
+					this.write("INSERT OR IGNORE INTO chunks (name, envelope, uploaded_at) VALUES (?, ?, ?)", f.name, f.envelope, Date.now());
 				} catch {
 					return ws.send(encodeServer({ t: "missing", name: f.name })); // storage full: the device retries later
 				}
@@ -465,10 +507,131 @@ export class Vault extends DurableObject<Env> {
 		}
 	}
 
+	// Staging belongs to a connection. Only a complete import at the legacy whole-vault head changes the format.
+	private genesis(ws: WebSocket, session: string, base: number, rows: number): void {
+		if (!this.migrated && base === this.head) {
+			const staged = this.sql.exec<{ n: number; last: number }>("SELECT COUNT(*) AS n, COALESCE(MAX(ordinal), 0) AS last FROM attachment_stage WHERE session = ?", session).one();
+			if (staged.n === rows && staged.last === rows && this.genesisVersionsAvailable(session)) {
+				this.ctx.storage.transactionSync(() => {
+					this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) SELECT file, version, pathkey, record, deleted, ordinal FROM attachment_stage WHERE session = ?", session);
+					this.write(`INSERT INTO versions(tag, expected_chunks, retired_at, deleted)
+						SELECT version, MIN(expected_chunks), CASE WHEN COUNT(*) = COUNT(deleted) THEN MAX(deleted) END, COUNT(*) = COUNT(deleted)
+						FROM attachment_stage WHERE session = ? GROUP BY version
+						ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, deleted = excluded.deleted,
+						retired_at = CASE WHEN excluded.deleted THEN COALESCE(versions.retired_at, excluded.retired_at) END`, session);
+					this.write("INSERT INTO settings(key, value) VALUES ('attachmentTable', 1)");
+					this.write("DELETE FROM attachment_stage");
+				});
+				this.migrated = true;
+				for (const peer of this.ctx.getWebSockets()) {
+					if (peer === ws) continue;
+					const s = peer.deserializeAttachment() as Session;
+					if (s.token !== this.token) continue;
+					if (!s.table) peer.close(CLOSE.updateNeeded, "update needed");
+					else peer.send(encodeServer({ t: "format", table: true }));
+				}
+			}
+		}
+		if (!this.migrated) this.write("DELETE FROM attachment_stage WHERE session = ?", session);
+		ws.send(encodeServer({ t: "format", table: this.migrated }));
+	}
+
+	// A deleted scoped version can already have been cleaned. Import its declaration and tombstone;
+	// restore will still need all its chunks. An imported legacy version has no scoped chunk owners.
+	private genesisVersionsAvailable(session: string): boolean {
+		const bad = this.sql.exec(`WITH staged AS (
+				SELECT version, MIN(expected_chunks) AS expected, MAX(expected_chunks) AS largest, COUNT(*) > COUNT(deleted) AS live
+				FROM attachment_stage WHERE session = ? GROUP BY version
+			) SELECT 1 FROM staged s LEFT JOIN version_chunks vc ON vc.tag = s.version LEFT JOIN chunks c ON c.name = vc.name
+			GROUP BY s.version HAVING expected != largest OR
+				(expected = ? AND COUNT(vc.name) != 0) OR
+				(expected >= 0 AND (COUNT(vc.name) > expected OR (live AND COUNT(c.name) != expected))) LIMIT 1`, session, LEGACY_CHUNKS);
+		return bad.toArray().length === 0;
+	}
+
+	private hasAttachmentChunks(version: Uint8Array, expected: number | null, sameVersion: boolean): boolean {
+		const saved = this.sql.exec<{ expected_chunks: number | null }>("SELECT expected_chunks FROM versions WHERE tag = ?", version).toArray()[0]?.expected_chunks;
+		if (expected === null) return sameVersion && saved === LEGACY_CHUNKS;
+		if (saved != null && saved !== expected) return false;
+		const counts = this.sql.exec<{ owned: number; stored: number }>(`SELECT COUNT(*) AS owned, COUNT(c.name) AS stored
+			FROM version_chunks vc LEFT JOIN chunks c ON c.name = vc.name WHERE vc.tag = ?`, version).one();
+		return counts.owned === expected && counts.stored === expected;
+	}
+
+	// Answers include the sealed row as it was at the time of a refusal. A later edit cannot change a retry's answer.
+	private changeAttachment(ws: WebSocket, f: AttachmentMutation): void {
+		const replay = this.sql.exec<{ answer: ArrayBuffer }>("SELECT answer FROM attachment_answers WHERE req = ?", f.req).toArray()[0];
+		if (replay) return ws.send(replay.answer);
+		let changed: AttachmentRow | undefined;
+		const answer = this.ctx.storage.transactionSync(() => {
+			const current = this.sql.exec<StoredAttachment>("SELECT * FROM attachments WHERE file = ?", f.file).toArray()[0];
+			const refused = (r = current, missing = false): AttachmentAnswer => ({ t: "refused", req: f.req, row: r ? attachmentRow(r) : null, missing });
+			const apply = (): AttachmentAnswer => {
+				if (f.t !== "del") {
+					const occupant = this.sql.exec<StoredAttachment>("SELECT * FROM attachments WHERE pathkey = ? AND deleted IS NULL AND file != ?", f.pathkey, f.file).toArray()[0];
+					if (occupant) return refused(occupant);
+				}
+				if ((current?.seq ?? null) !== f.base) return refused();
+				if (f.t === "del" && (!current || current.deleted !== null)) return refused();
+				if (f.t === "restore" && (!current || current.deleted === null)) return refused();
+				const version = f.t === "set" ? f.version : new Uint8Array(current!.version);
+				const sameVersion = !!current && toHex(version) === toHex(current.version);
+				if (f.t === "set" && current?.deleted != null && sameVersion) return refused();
+				if (f.t !== "del" && !this.hasAttachmentChunks(version, f.expectedChunks, sameVersion)) return refused(current, true);
+				const now = Date.now();
+				const seq = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM attachments").one().seq;
+				changed = { seq, file: f.file, version, pathkey: f.t === "del" ? new Uint8Array(current!.pathkey) : f.pathkey,
+					record: f.t === "del" ? new Uint8Array(current!.record) : f.record, deleted: f.t === "del" ? now : null };
+				this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(file) DO UPDATE SET version=excluded.version, pathkey=excluded.pathkey, record=excluded.record, deleted=excluded.deleted, seq=excluded.seq",
+					changed.file, changed.version, changed.pathkey, changed.record, changed.deleted, seq);
+				if (current && current.deleted === null && (f.t === "del" || !sameVersion)) {
+					this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = versions.tag AND deleted IS NULL)", now, Number(f.t === "del"), current.version);
+				}
+				if (f.t !== "del") this.write(`INSERT INTO versions(tag, expected_chunks) VALUES (?, ?)
+					ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, retired_at = NULL, deleted = 0
+					WHERE versions.expected_chunks IS NULL OR versions.retired_at IS NOT NULL`, version, f.expectedChunks ?? LEGACY_CHUNKS);
+				return { t: "ok", req: f.req, seq };
+			};
+			const bytes = encodeServer(apply());
+			this.write("INSERT INTO attachment_answers(req, answer) VALUES (?, ?)", f.req, bytes);
+			return bytes;
+		});
+		ws.send(answer);
+		if (changed) {
+			this.usage.lastActivity = Date.now();
+			// Even the author consumes this row through since/live. Its answer resolves only the proposal.
+			const frame = encodeServer({ t: "row", row: changed });
+			for (const peer of this.ctx.getWebSockets()) {
+				const s = peer.deserializeAttachment() as Session;
+				if (s.tableLive && s.token === this.token) peer.send(frame);
+			}
+		}
+	}
+
+	private since(ws: WebSocket, session: Session, after: number): void {
+		const head = this.sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM attachments").one().seq;
+		if (after > head) return ws.close(CLOSE.badMessage, "attachment cursor past head");
+		let rows = 0, bytes = 0, last = after;
+		for (const r of this.sql.exec<StoredAttachment>("SELECT * FROM attachments WHERE seq > ? ORDER BY seq LIMIT ?", after, PAGE_ROWS + 1)) {
+			if (rows === PAGE_ROWS || bytes >= PAGE_BYTES) {
+				ws.serializeAttachment({ ...session, tableLive: false });
+				return ws.send(encodeServer({ t: "tableMore", seq: last }));
+			}
+			const frame = encodeServer({ t: "row", row: attachmentRow(r) });
+			ws.send(frame);
+			rows++;
+			bytes += frame.length;
+			last = r.seq;
+		}
+		ws.send(encodeServer({ t: "tableSynced", seq: head }));
+		ws.serializeAttachment({ ...session, tableLive: true });
+	}
+
 	// Complete the close handshake, or the client waits for it.
 	async webSocketClose(ws: WebSocket, code: number): Promise<void> {
 		// Last online is the Worker's own record of the connection, never the device's word.
-		const device = (ws.deserializeAttachment() as Session).device;
+		const { device, table } = ws.deserializeAttachment() as Session;
+		if (table && !this.deleted && !this.migrated) this.write("DELETE FROM attachment_stage WHERE session = ?", table);
 		if (device && !this.deleted) this.write("UPDATE devices SET last_online = ? WHERE id = ?", Date.now(), device);
 		// The last device going: write the counts now, as the object may sleep before the next minute is up.
 		if (!this.deleted && this.ctx.getWebSockets().length <= 1) this.flush();
@@ -493,7 +656,7 @@ export class Vault extends DurableObject<Env> {
 		const bytes = encodeServer(frame);
 		for (const ws of this.ctx.getWebSockets()) {
 			const s = ws.deserializeAttachment() as Session;
-			if (ws !== from && s.live && s.token === this.token) ws.send(bytes);
+			if (ws !== from && s.live && s.token === this.token && (!this.migrated || s.table)) ws.send(bytes);
 		}
 	}
 
@@ -514,7 +677,8 @@ export class Vault extends DurableObject<Env> {
 				for (const other of this.ctx.getWebSockets()) if (other !== ws) other.close(CLOSE.rekeyed, "the vault key changed");
 			} else {
 				for (const other of this.ctx.getWebSockets()) {
-					if (other !== ws && (other.deserializeAttachment() as Session).token === this.token) this.sendRecords(other, f.number);
+					const s = other.deserializeAttachment() as Session;
+					if (other !== ws && s.token === this.token && (!this.migrated || s.table)) this.sendRecords(other, f.number);
 				}
 			}
 		}
@@ -542,15 +706,18 @@ export class Vault extends DurableObject<Env> {
 				const owner = this.sql.exec<{ mine: number }>("SELECT tag = ? AS mine FROM version_chunks WHERE name = ?", f.tag, f.name).toArray()[0];
 				if (owner) {
 					if (!owner.mine) return;
-					this.write("INSERT OR IGNORE INTO chunks (name, envelope) VALUES (?, ?)", f.name, f.envelope); // put back, if it was removed
+					this.write("INSERT OR IGNORE INTO chunks (name, envelope, uploaded_at) VALUES (?, ?, ?)", f.name, f.envelope, Date.now()); // put back, if it was removed
 				} else {
-					if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM version_chunks WHERE tag = ?", f.tag).one().n >= MAX_MARK) return;
-					const cursor = this.sql.exec("INSERT OR IGNORE INTO chunks (name, envelope) VALUES (?, ?)", f.name, f.envelope);
+					const { n, capacity } = this.sql.exec<{ n: number; capacity: number }>(`SELECT COUNT(*) AS n,
+						COALESCE((SELECT expected_chunks FROM versions WHERE tag = ?), ?) AS capacity FROM version_chunks WHERE tag = ?`, f.tag, MAX_MARK, f.tag).one();
+					if (n >= capacity) return;
+					const cursor = this.sql.exec("INSERT OR IGNORE INTO chunks (name, envelope, uploaded_at) VALUES (?, ?, ?)", f.name, f.envelope, Date.now());
 					this.count(0, cursor.rowsWritten);
 					if (!cursor.rowsWritten) return; // there already, and nobody's: an old-style chunk, never to be removed
 					this.write("INSERT INTO version_chunks (name, tag) VALUES (?, ?)", f.name, f.tag);
 				}
-				this.write("INSERT INTO versions (tag, retired_at) VALUES (?, NULL) ON CONFLICT(tag) DO UPDATE SET retired_at = NULL, deleted = 0 WHERE retired_at IS NOT NULL", f.tag);
+				if (this.migrated) this.write("INSERT OR IGNORE INTO versions(tag) VALUES (?)", f.tag);
+				else this.write("INSERT INTO versions (tag, retired_at) VALUES (?, NULL) ON CONFLICT(tag) DO UPDATE SET retired_at = NULL, deleted = 0 WHERE retired_at IS NOT NULL", f.tag);
 				stored = true;
 			});
 		} catch {
@@ -630,6 +797,18 @@ export class Vault extends DurableObject<Env> {
 		}
 	}
 
+	// After genesis, liveness comes from the table. Orphaned scoped uploads are dated per chunk;
+	// old uploads without a timestamp stay out of both the dashboard total and the delete query.
+	private cleanupCandidates(): { query: string; args: number[] } {
+		const scoped = "FROM versions v JOIN version_chunks vc ON vc.tag = v.tag JOIN chunks c ON c.name = vc.name";
+		if (this.migrated) return {
+			query: `SELECT c.name, length(c.envelope) AS size, v.deleted, COALESCE(v.retired_at, c.uploaded_at) AS at ${scoped}
+				WHERE v.expected_chunks IS NOT ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = v.tag AND deleted IS NULL)`,
+			args: [LEGACY_CHUNKS],
+		};
+		return { query: `SELECT c.name, length(c.envelope) AS size, v.deleted, v.retired_at AS at ${scoped} WHERE v.retired_at < ?`, args: [this.listedAt()] };
+	}
+
 	/**
 	 * For Clean up on the owner's dashboard (an RPC from the Owner object, which checked the session and Origin): the
 	 * history that can be removed, by the quarter hour it stopped being current in. Every time zone's midnight falls
@@ -637,9 +816,10 @@ export class Vault extends DurableObject<Env> {
 	 */
 	async cleanupSizes(): Promise<{ at: number; old: number; deleted: number }[]> {
 		if (this.token === null || this.deleted) return [];
+		const { query, args } = this.cleanupCandidates();
 		return this.sql.exec<{ at: number; old: number; deleted: number }>(
-			`SELECT v.retired_at / 900000 * 900000 AS at, SUM(CASE WHEN v.deleted THEN 0 ELSE length(c.envelope) END) AS old, SUM(CASE WHEN v.deleted THEN length(c.envelope) ELSE 0 END) AS deleted
-			FROM versions v JOIN version_chunks vc ON vc.tag = v.tag JOIN chunks c ON c.name = vc.name WHERE v.retired_at < ? GROUP BY 1 ORDER BY 1`, this.listedAt(),
+			`SELECT at / 900000 * 900000 AS at, SUM(CASE WHEN deleted THEN 0 ELSE size END) AS old, SUM(CASE WHEN deleted THEN size ELSE 0 END) AS deleted
+			FROM (${query}) WHERE at IS NOT NULL GROUP BY 1 ORDER BY 1`, ...args,
 		).toArray();
 	}
 
@@ -656,13 +836,13 @@ export class Vault extends DurableObject<Env> {
 		try { start = periodStart(now, String(zone), months); } catch { return { error: "bad time zone" }; }
 		const ok = (r: unknown): r is [number, number] => Array.isArray(r) && r.length === 2 && Number.isSafeInteger(r[0]) && Number.isSafeInteger(r[1]) && r[0] < r[1] && r[1] <= start;
 		if (!Array.isArray(ranges) || !ranges.length || ranges.length > 1000 || !ranges.every(ok)) return { error: "Only past periods can be cleaned up." };
-		const listed = this.listedAt();
+		const { query, args } = this.cleanupCandidates();
 		let removed = 0;
 		this.ctx.storage.transactionSync(() => {
 			for (const [from, to] of ranges as [number, number][]) {
 				const names = this.sql.exec<{ name: ArrayBuffer }>(
-					"SELECT c.name AS name FROM versions v JOIN version_chunks vc ON vc.tag = v.tag JOIN chunks c ON c.name = vc.name WHERE v.retired_at >= ? AND v.retired_at < ? AND v.retired_at < ? LIMIT ?",
-					from, to, listed, limit - removed,
+					`SELECT name FROM (${query}) WHERE at >= ? AND at < ? LIMIT ?`,
+					...args, from, to, limit - removed,
 				).toArray();
 				for (const { name } of names) this.write("DELETE FROM chunks WHERE name = ?", name);
 				removed += names.length;
@@ -735,7 +915,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async erase(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "removed_snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists", "settings"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "removed_snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists", "settings", "attachments", "attachment_answers", "attachment_stage"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;
@@ -783,6 +963,7 @@ export class Vault extends DurableObject<Env> {
 
 	// One page of what the device is missing. No await in here, so nothing is published in the middle of it.
 	private subscribe(ws: WebSocket, session: Session, after: number): void {
+		ws.serializeAttachment({ ...session, subscribed: true, live: false });
 		let rows = 0, bytes = 0, last = after;
 		for (const r of this.sql.exec<Row>("SELECT seq, doc, snapshot, envelope FROM entries WHERE seq > ? ORDER BY seq LIMIT ?", after, PAGE_ROWS + 1)) {
 			if (rows === PAGE_ROWS || bytes >= PAGE_BYTES) return ws.send(encodeServer({ t: "more", seq: last }));
