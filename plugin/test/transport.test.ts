@@ -4,9 +4,13 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { VaultKeys, newRecovery, shortId, vaultIdOf } from "../src/keys";
 import { Transport, fetchRecords } from "../src/transport";
 import { hex, unhex, unpackPairing } from "../../protocol/ownsync";
+import { decodeServer, encodeClient } from "../../server/src/wire";
 import { TableDisk } from "../src/tableDisk";
 import { TableSync } from "../src/tableSync";
 import { attachmentFs } from "./table-fs";
@@ -30,7 +34,6 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	const d = new Device(name, new Server(), rng(name.length + devices.length * 7919));
 	// Real chunk names and sizes, not the simulator's. Version-scoped only if the test says the Worker takes them.
 	d.overrides = { chunkName: (data, scope) => link.chunkName(data, scope), versionTag: (u) => link.versionTag(u), chunkSize: 2 ** 20, ...overrides };
-	d.boot();
 	const problems: string[] = [], alerts: string[] = [], presence: [note: string, update: string][] = [];
 	const onProblem = (what: string, err: unknown) => problems.push(`${what}: ${String(err)}`);
 	keys ??= await VaultKeys.open(vault, memoryPorts(JSON.stringify({ 0: vaultKey })), { onProblem, onAlert: (m) => alerts.push(m) });
@@ -38,6 +41,8 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	const allowed = (p: string) => !p.startsWith(".") && !p.endsWith(".md");
 	const adapter: TableDisk = new TableDisk(fs,store,".private/table",allowed,b => table.hash(b),(h,n) => table.suffix(h,n));
 	const table = new TableSync(store,keys,adapter,allowed,overrides.attachments !== false,20*2**20,onProblem);
+	if (capable) d.overrides.tableNotes = table.notes;
+	d.boot();
 	const link = new Transport(host, keys, d.engine!, {
 		attachments:capable ? table : undefined, tableCapable:async () => capable,
 		owner: ownerCode ?? (await nextOwner()),
@@ -343,8 +348,63 @@ test("a live legacy vault migrates through the transport, then an updated peer d
 	assert.deepEqual([...a.problems,...b.problems,...a.d.problems,...b.d.problems],[]);
 });
 
+test("the device reports a failed migration and its legacy connection keeps syncing", async () => {
+	const dir = join(dev.persistDir, "v3/do/ownsync-Vault"), before = new Set(readdirSync(dir));
+	const old = await device("legacy", "write-limit");
+	await old.link.connect(); await until([old.d], () => old.link.status === "synced");
+	const file = readdirSync(dir).find(f => /^[0-9a-f]{64}\.sqlite$/.test(f) && !before.has(f));
+	assert.ok(file);
+	const db = new DatabaseSync(join(dir, file));
+	try {
+		db.exec("CREATE TRIGGER refuse_format BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'write quota'); END");
+		const a = await device("capable","write-limit",key,{},undefined,undefined,true);
+		await a.link.connect(); await until([a.d], () => a.link.status === "synced");
+		await migrateNow(host, hex(a.keys.vaultId));
+		await until([a.d], () => a.problems.some(p => p.includes("Migration could not complete today")));
+		assert.equal(a.d.engine!.tableActive, false);
+		old.d.write("still-legacy.md", "after a refused migration");
+		await until([old.d,a.d], () => a.d.files.get("still-legacy.md")?.content === "after a refused migration");
+	} finally { db.close(); }
+});
+
+test("table note rows bind the placed document and typing crosses the encrypted live channel", async () => {
+	const a = await device("a","table-notes",key,{},undefined,undefined,true);
+	await a.link.connect();
+	await until([a.d], () => a.d.data.has("table/initialized"));
+	const b = await device("b","table-notes",key,{},undefined,undefined,true);
+	await b.link.connect();
+	const path = "Note in all-files table.md";
+	a.d.write(path, "shared initial text");
+	await until([a.d,b.d], () => b.d.files.get(path)?.content === "shared initial text");
+	const id = a.d.engine!.noteAt(path)!;
+	// The disk planner will propose this row in the next part. Here both devices already
+	// have an agreed local file, and the Worker supplies its binding independently of text.
+	const row = await a.table.wireNote({ kind: "note", file: "1a".repeat(16), path, id, seq: 1, deleted: null });
+	const ws = new WebSocket(host.replace("http:", "ws:") + "/vault/" + hex(a.keys.vaultId));
+	ws.binaryType = "arraybuffer";
+	const next = () => new Promise<MessageEvent>(resolve => ws.addEventListener("message", resolve, { once: true }))
+		.then(e => decodeServer(new Uint8Array(e.data as ArrayBuffer)));
+	try {
+		await new Promise<void>((resolve,reject) => { ws.onopen = () => resolve(); ws.onerror = reject; });
+		ws.send(encodeClient({t:"hello",token:await a.keys.token()}));
+		const format = next(); ws.send(encodeClient({t:"table"}));
+		assert.deepEqual(await format, {t:"format",table:true});
+		const req = new Uint8Array(16), answer = next();
+		ws.send(encodeClient({t:"set", file:row.file, req, base:null, version:null, expectedChunks:null, pathkey:row.pathkey, record:row.record}));
+		assert.deepEqual(await answer, {t:"ok", req, seq:1});
+		await until([a.d,b.d], () => a.d.engine!.isTableNote(id) && b.d.engine!.isTableNote(id));
+		const x = await a.d.engine!.open(id), y = await b.d.engine!.open(id);
+		assert.ok(x && y);
+		x.getText("t").insert(0, "live ");
+		await until([a.d,b.d], () => y.getText("t").toString() === "live shared initial text");
+		assert.equal(a.table.notes.at(path)?.seq, 1);
+		assert.equal(b.table.notes.at(path)?.seq, 1);
+		assert.deepEqual([...a.problems,...b.problems,...a.d.problems,...b.d.problems], []);
+	} finally { ws.close(); }
+});
+
 test("the Worker's storage holds no note text, attachment content, file names, folder names or vault names", () => {
-	for (const secret of ["launch on", "Tuesday", "Secret plan", "Projects", "word1", "text of note", "Note 1", "vault-one", "vault-three", "Live typing", "everyone sees", "removed device", "lost laptop", "after recovery", "vault-five", "Kim's laptop", "HOLIDAY-PIXELS", "Holiday", "beach", "vault-four", "vault-attach"]) {
+	for (const secret of ["launch on", "Tuesday", "Secret plan", "Projects", "word1", "text of note", "Note 1", "vault-one", "vault-three", "Live typing", "everyone sees", "removed device", "lost laptop", "after recovery", "vault-five", "Kim's laptop", "HOLIDAY-PIXELS", "Holiday", "beach", "vault-four", "vault-attach", "Note in all-files table", "shared initial text"]) {
 		let hits = "";
 		try { hits = execFileSync("grep", ["-rlaF", secret, dev.persistDir], { encoding: "utf8" }).trim(); }
 		catch (e) { if ((e as { status?: number }).status !== 1) throw e; } // 1 = no match

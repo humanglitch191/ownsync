@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { Dashboard, VERSION, type VaultRpc, type VaultSettings, type VaultStats } from "./dashboard";
 import { SNAPSHOT_BUDGET, SNAPSHOT_DAYS, snapshotsToPrune } from "./snapshots";
-import { CHUNK_OVERHEAD, CLOSE, type AttachmentAnswer, type AttachmentMutation, type AttachmentRow, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer, validClientSize } from "./wire";
+import { CHUNK_OVERHEAD, CLOSE, type AttachmentAnswer, type AttachmentMutation, type AttachmentRow, type ClientFrame, DOC_TAG_BYTES, MARK, MAX_CHUNK, MAX_MARK, MAX_RECORD, RECOVERY_SEALED, type ServerFrame, decodeClient, encodeServer, unpackGenesis, validClientSize } from "./wire";
 
 interface Env {
 	VAULT: DurableObjectNamespace<Vault>;
@@ -35,6 +35,7 @@ type Row = { seq: number; doc: ArrayBuffer; snapshot: number; envelope: ArrayBuf
 
 // NULL in versions means upload started, count unknown. Only genesis may install this legacy marker.
 const LEGACY_CHUNKS = -1;
+class IncompleteGenesis extends Error {}
 
 // One catch-up page. Small enough to stay well inside a Worker's time and memory for one event.
 const PAGE_ROWS = 400;
@@ -99,6 +100,7 @@ export class Vault extends DurableObject<Env> {
 	private name: string | null = null; // this vault's ID (32 hex), from the first request's URL
 	private deleted: boolean;
 	private migrated = false;
+	private migrationFailureDay?: number; // Best effort: reporting a failed write must not require another write.
 	// Today's counters for the dashboard's free-plan meter, kept in memory and written at most once a minute.
 	private usage: { day: number; requests: number; rows: number; lastActivity: number | null };
 	private flushedAt = 0;
@@ -128,6 +130,18 @@ export class Vault extends DurableObject<Env> {
 	private schema(): void {
 		// seq is assigned here, not by AUTOINCREMENT (which costs a second row write per entry). It only ever
 		// grows: a snapshot is inserted before the entries it replaces are deleted.
+		const files = `
+			CREATE TABLE IF NOT EXISTS attachments (file BLOB PRIMARY KEY, version BLOB NOT NULL, pathkey BLOB NOT NULL, record BLOB NOT NULL, deleted INTEGER, seq INTEGER NOT NULL UNIQUE) WITHOUT ROWID;
+			CREATE UNIQUE INDEX IF NOT EXISTS attachments_path ON attachments(pathkey) WHERE deleted IS NULL;
+			CREATE INDEX IF NOT EXISTS attachments_version ON attachments(version) WHERE deleted IS NULL AND version != x'';`;
+		const old = this.sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE name = 'attachments'").toArray()[0];
+		if (old && !old.sql.includes("WITHOUT ROWID")) {
+			this.ctx.storage.transactionSync(() => {
+				this.sql.exec("ALTER TABLE attachments RENAME TO old_attachments; DROP INDEX attachments_version; DROP INDEX attachments_path");
+				this.sql.exec(files);
+				this.sql.exec("INSERT INTO attachments SELECT * FROM old_attachments; DROP TABLE old_attachments; DROP TABLE IF EXISTS attachment_stage");
+			});
+		} else this.sql.exec(files);
 		this.sql.exec(`
 			CREATE TABLE IF NOT EXISTS entries (seq INTEGER PRIMARY KEY, doc BLOB NOT NULL, snapshot INTEGER NOT NULL, envelope BLOB NOT NULL);
 			CREATE INDEX IF NOT EXISTS entries_doc ON entries (doc, seq);
@@ -150,12 +164,9 @@ export class Vault extends DurableObject<Env> {
 			CREATE INDEX IF NOT EXISTS versions_retired ON versions (retired_at);
 			CREATE TABLE IF NOT EXISTS version_chunks (name BLOB PRIMARY KEY, tag BLOB NOT NULL);
 			CREATE INDEX IF NOT EXISTS version_chunks_tag ON version_chunks (tag);
-			CREATE TABLE IF NOT EXISTS attachments (file BLOB PRIMARY KEY, version BLOB NOT NULL, pathkey BLOB NOT NULL, record BLOB NOT NULL, deleted INTEGER, seq INTEGER NOT NULL UNIQUE);
-			CREATE UNIQUE INDEX IF NOT EXISTS attachments_path ON attachments(pathkey) WHERE deleted IS NULL;
-			CREATE INDEX IF NOT EXISTS attachments_version ON attachments(version) WHERE deleted IS NULL;
+
 			CREATE TABLE IF NOT EXISTS attachment_answers (req BLOB PRIMARY KEY, answer BLOB NOT NULL);
-			CREATE TABLE IF NOT EXISTS attachment_stage (session TEXT NOT NULL, ordinal INTEGER NOT NULL, expected_chunks INTEGER NOT NULL, file BLOB NOT NULL, version BLOB NOT NULL, pathkey BLOB NOT NULL, record BLOB NOT NULL, deleted INTEGER, PRIMARY KEY(session, ordinal), UNIQUE(session, file));
-			CREATE UNIQUE INDEX IF NOT EXISTS attachment_stage_path ON attachment_stage(session, pathkey) WHERE deleted IS NULL;
+			CREATE TABLE IF NOT EXISTS genesis_parts (session TEXT NOT NULL, part INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(session, part)) WITHOUT ROWID;
 			CREATE TABLE IF NOT EXISTS lists (device TEXT PRIMARY KEY, at INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 		`);
@@ -459,14 +470,15 @@ export class Vault extends DurableObject<Env> {
 				ws.serializeAttachment({ ...session, wantsMigration: true });
 				return ws.send(encodeServer({ t: "migrationEligible", ready: !this.migrated && this.migrationEligible() }));
 			}
-			if (f.t === "stageRow" || f.t === "genesis") {
+			if (f.t === "stageRow") return ws.close(CLOSE.badMessage, "genesis rows belong inside parts");
+			if (f.t === "stagePart" || f.t === "genesis") {
 				if (!session.table) return ws.close(CLOSE.badMessage, "table handshake required");
 				if (f.t === "genesis") return this.genesis(ws, session.table, f.base, f.rows);
-				if (this.migrated || !f.row.seq) return ws.close(CLOSE.badMessage, "invalid genesis row");
-				const r = f.row;
-				if (r.version === null && f.expectedChunks !== null) return ws.close(CLOSE.badMessage, "note cannot declare chunks");
-				this.write("INSERT INTO attachment_stage(session, ordinal, expected_chunks, file, version, pathkey, record, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", session.table, r.seq, f.expectedChunks ?? LEGACY_CHUNKS, r.file, r.version ?? NO_VERSION, r.pathkey, r.record, f.dateAtCommit ? -1 : r.deleted);
-				return ws.send(encodeServer({ t: "stagedRow", seq: r.seq }));
+				if (this.migrated) return ws.send(encodeServer({ t: "format", table: true }));
+				try {
+					this.write("INSERT INTO genesis_parts(session, part, data) VALUES (?, ?, ?)", session.table, f.part, f.data);
+				} catch { return this.migrationWriteFailed(ws); }
+				return ws.send(encodeServer({ t: "stagedPart", seq: f.part }));
 			}
 			if (f.t === "forget" || f.t === "since" || f.t === "set" || f.t === "del" || f.t === "restore") {
 				if (!session.table || !this.migrated) return ws.close(CLOSE.badMessage, "attachment table required");
@@ -549,24 +561,30 @@ export class Vault extends DurableObject<Env> {
 		return { ok: true };
 	}
 
-	// Staging belongs to a connection. Only a complete import at the legacy whole-vault head changes the format.
+	private migrationWriteFailed(ws: WebSocket) {
+		this.migrationFailureDay = today();
+		ws.send(encodeServer({ t: "migrationWriteFailed" }));
+	}
+
+	private *genesisParts(session: string) {
+		let part = 0;
+		for (const r of this.sql.exec<{ part: number; data: ArrayBuffer }>("SELECT part, data FROM genesis_parts WHERE session = ? ORDER BY part", session)) {
+			if (r.part !== ++part) throw new IncompleteGenesis("missing genesis part");
+			yield new Uint8Array(r.data);
+		}
+	}
+
+	// Only stage blobs are visible before commit. The file rows, version retirements,
+	// format flag and disposal of all contenders' parts commit or roll back together.
 	private genesis(ws: WebSocket, session: string, base: number, rows: number): void {
 		if (!this.migrated && base === this.head && this.migrationEligible()) {
-			const staged = this.sql.exec<{ n: number; last: number }>("SELECT COUNT(*) AS n, COALESCE(MAX(ordinal), 0) AS last FROM attachment_stage WHERE session = ?", session).one();
-			if (staged.n === rows && staged.last === rows && this.genesisVersionsAvailable(session)) {
-				this.ctx.storage.transactionSync(() => {
-					const now = Date.now();
-					this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) SELECT file, version, pathkey, record, CASE deleted WHEN -1 THEN ? ELSE deleted END, ordinal FROM attachment_stage WHERE session = ?", now, session);
-					this.write(`INSERT INTO versions(tag, expected_chunks, retired_at, deleted)
-						SELECT version, MIN(expected_chunks), CASE WHEN COUNT(*) = COUNT(deleted) THEN CASE WHEN MIN(deleted) = -1 THEN ? ELSE MAX(deleted) END END, COUNT(*) = COUNT(deleted)
-						FROM attachment_stage WHERE session = ? AND version != x'' GROUP BY version
-						ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, deleted = excluded.deleted,
-						retired_at = CASE WHEN excluded.deleted THEN CASE WHEN excluded.retired_at = ? THEN excluded.retired_at
-							ELSE COALESCE(versions.retired_at, excluded.retired_at) END END`, now, session, now);
-					this.write("INSERT INTO settings(key, value) VALUES ('attachmentTable', 1)");
-					this.write("DELETE FROM attachment_stage");
-				});
+			try {
+				this.ctx.storage.transactionSync(() => this.installGenesis(session, rows));
 				this.migrated = true;
+			} catch (e) {
+				if (!(e instanceof IncompleteGenesis)) return this.migrationWriteFailed(ws);
+			}
+			if (this.migrated) {
 				for (const peer of this.ctx.getWebSockets()) {
 					if (peer === ws) continue;
 					const s = peer.deserializeAttachment() as Session;
@@ -576,21 +594,43 @@ export class Vault extends DurableObject<Env> {
 				}
 			}
 		}
-		if (!this.migrated) this.write("DELETE FROM attachment_stage WHERE session = ?", session);
+		if (!this.migrated) {
+			try { this.write("DELETE FROM genesis_parts WHERE session = ?", session); }
+			catch { return this.migrationWriteFailed(ws); }
+		}
 		ws.send(encodeServer({ t: "format", table: this.migrated }));
 	}
 
-	// A deleted scoped version can already have been cleaned. Import its declaration and tombstone;
-	// restore will still need all its chunks. An imported legacy version has no scoped chunk owners.
-	private genesisVersionsAvailable(session: string): boolean {
-		const bad = this.sql.exec(`WITH staged AS (
-				SELECT version, MIN(expected_chunks) AS expected, MAX(expected_chunks) AS largest, COUNT(*) > COUNT(deleted) AS live
-				FROM attachment_stage WHERE session = ? AND version != x'' GROUP BY version
-			) SELECT 1 FROM staged s LEFT JOIN version_chunks vc ON vc.tag = s.version LEFT JOIN chunks c ON c.name = vc.name
-			GROUP BY s.version HAVING expected != largest OR
-				(expected = ? AND COUNT(vc.name) != 0) OR
-				(expected >= 0 AND (COUNT(vc.name) > expected OR (live AND COUNT(c.name) != expected))) LIMIT 1`, session, LEGACY_CHUNKS);
-		return bad.toArray().length === 0;
+	private installGenesis(session: string, rows: number) {
+		let seq = 0;
+		const now = Date.now();
+		const versions = new Map<string, { tag: Uint8Array; count: number; retired: number | null }>();
+		for (const { row, expectedChunks, dateAtCommit } of unpackGenesis(this.genesisParts(session))) {
+			if (row.seq !== ++seq || (row.version === null && expectedChunks !== null)) throw new IncompleteGenesis("invalid genesis row");
+			const deleted = dateAtCommit ? now : row.deleted;
+			this.write("INSERT INTO attachments(file,version,pathkey,record,deleted,seq) VALUES (?,?,?,?,?,?)",
+				row.file, row.version ?? NO_VERSION, row.pathkey, row.record, deleted, seq);
+			if (row.version === null) continue;
+			const key = toHex(row.version), count = expectedChunks ?? LEGACY_CHUNKS, prior = versions.get(key);
+			if (!prior) versions.set(key, { tag: row.version.slice(), count, retired: deleted });
+			else {
+				if (prior.count !== count) throw new IncompleteGenesis("conflicting chunk declarations");
+				prior.retired = prior.retired === null || deleted === null ? null : Math.max(prior.retired, deleted);
+			}
+		}
+		if (seq !== rows) throw new IncompleteGenesis("incomplete genesis");
+		for (const { tag, count, retired } of versions.values()) {
+			const chunks = this.sql.exec<{ owned: number; stored: number }>(`SELECT COUNT(*) AS owned, COUNT(c.name) AS stored
+				FROM version_chunks vc LEFT JOIN chunks c ON c.name=vc.name WHERE vc.tag=?`, tag).one();
+			if (count === LEGACY_CHUNKS ? chunks.owned !== 0 : chunks.owned > count || (retired === null && chunks.stored !== count))
+				throw new IncompleteGenesis("incomplete genesis version");
+			this.write(`INSERT INTO versions(tag,expected_chunks,retired_at,deleted) VALUES (?,?,?,?)
+				ON CONFLICT(tag) DO UPDATE SET expected_chunks=excluded.expected_chunks, deleted=excluded.deleted,
+				retired_at=CASE WHEN excluded.deleted THEN CASE WHEN excluded.retired_at=? THEN excluded.retired_at
+				ELSE COALESCE(versions.retired_at,excluded.retired_at) END END`, tag, count, retired, Number(retired !== null), now);
+		}
+		this.write("INSERT INTO settings(key, value) VALUES ('attachmentTable', 1)");
+		this.write("DELETE FROM genesis_parts");
 	}
 
 	private hasAttachmentChunks(version: Uint8Array, expected: number | null, sameVersion: boolean): boolean {
@@ -632,7 +672,7 @@ export class Vault extends DurableObject<Env> {
 			this.write("INSERT INTO attachments(file, version, pathkey, record, deleted, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(file) DO UPDATE SET version=excluded.version, pathkey=excluded.pathkey, record=excluded.record, deleted=excluded.deleted, seq=excluded.seq",
 				changed.file, changed.version ?? NO_VERSION, changed.pathkey, changed.record, changed.deleted, seq);
 			if (!note && current && current.deleted === null && (f.t === "del" || !sameVersion)) {
-				this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = versions.tag AND deleted IS NULL)", now, Number(f.t === "del"), current.version);
+				this.write("UPDATE versions SET retired_at = ?, deleted = ? WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = versions.tag AND version != x'' AND deleted IS NULL)", now, Number(f.t === "del"), current.version);
 			}
 			if (!note && f.t !== "del") this.write(`INSERT INTO versions(tag, expected_chunks) VALUES (?, ?)
 				ON CONFLICT(tag) DO UPDATE SET expected_chunks = excluded.expected_chunks, retired_at = NULL, deleted = 0
@@ -685,7 +725,7 @@ export class Vault extends DurableObject<Env> {
 		// Last online is the Worker's own record of the connection, never the device's word.
 		const { device, table, token } = ws.deserializeAttachment() as Session;
 		if (!this.deleted && !this.migrated && token && !device && !table) this.write("INSERT OR REPLACE INTO settings(key,value) VALUES ('unidentifiedLegacy',?)", Date.now());
-		if (table && !this.deleted && !this.migrated) this.write("DELETE FROM attachment_stage WHERE session = ?", table);
+		if (table && !this.deleted && !this.migrated) this.write("DELETE FROM genesis_parts WHERE session = ?", table);
 		if (device && !this.deleted) this.write("UPDATE devices SET last_online = ? WHERE id = ?", Date.now(), device);
 		// The last device going: write the counts now, as the object may sleep before the next minute is up.
 		if (!this.deleted && this.ctx.getWebSockets().length <= 1) this.flush();
@@ -857,7 +897,7 @@ export class Vault extends DurableObject<Env> {
 		const scoped = "FROM versions v JOIN version_chunks vc ON vc.tag = v.tag JOIN chunks c ON c.name = vc.name";
 		if (this.migrated) return {
 			query: `SELECT c.name, length(c.envelope) AS size, v.deleted, COALESCE(v.retired_at, c.uploaded_at) AS at ${scoped}
-				WHERE v.expected_chunks IS NOT ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = v.tag AND deleted IS NULL)`,
+				WHERE v.expected_chunks IS NOT ? AND NOT EXISTS (SELECT 1 FROM attachments WHERE version = v.tag AND version != x'' AND deleted IS NULL)`,
 			args: [LEGACY_CHUNKS],
 		};
 		return { query: `SELECT c.name, length(c.envelope) AS size, v.deleted, v.retired_at AS at ${scoped} WHERE v.retired_at < ?`, args: [this.listedAt()] };
@@ -955,7 +995,7 @@ export class Vault extends DurableObject<Env> {
 			name: this.sql.exec<{ name: string }>("SELECT name FROM vault_name").toArray()[0]?.name ?? "",
 			deleted: this.deleted,
 			settings: this.settings(),
-			migration: this.deleted ? undefined : this.migrated ? "complete" : this.migrationRequested() ? "requested" : "legacy",
+			migration: this.deleted ? undefined : this.migrated ? "complete" : this.migrationFailureDay === today() ? "failedToday" : this.migrationRequested() ? "requested" : "legacy",
 			// Complete snapshots, newest first; history copies only as totals (the Worker doesn't know which device made one).
 			snapshots: this.sql.exec<{ at: number; size: number }>("SELECT at, size FROM snapshots WHERE received = parts ORDER BY day DESC").toArray(),
 			historyCopies: this.sql.exec<{ copies: number; bytes: number }>("SELECT COUNT(*) AS copies, COALESCE(SUM(size), 0) AS bytes FROM history").one(),
@@ -970,7 +1010,7 @@ export class Vault extends DurableObject<Env> {
 	// Everything goes but a tombstone, so the vault can't be created again with an owner code and its devices
 	// are told it was deleted instead of being asked for one.
 	private async erase(): Promise<void> {
-		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "removed_snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists", "settings", "attachments", "attachment_answers", "attachment_stage"]) this.sql.exec(`DELETE FROM ${table}`);
+		for (const table of ["entries", "auth", "records", "recovery", "chunks", "history", "snapshot_parts", "snapshots", "removed_snapshots", "devices", "usage", "usage_days", "vault_name", "versions", "version_chunks", "lists", "settings", "attachments", "attachment_answers", "genesis_parts"]) this.sql.exec(`DELETE FROM ${table}`);
 		this.sql.exec("INSERT OR REPLACE INTO tombstone (id, at) VALUES (0, ?)", Date.now());
 		this.deleted = true;
 		this.token = null;

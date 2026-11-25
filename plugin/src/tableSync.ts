@@ -2,6 +2,8 @@
 // bytes; the transport delivers those directly and queues live rows in wire order.
 import { KIND, chunkName, hex, nameKey, openEnvelope, parseHeader, randomBytes, scopedChunkName, sealEnvelope, tablePathKey, unhex, versionTag } from "../../protocol/ownsync";
 import { decodeClient, encodeClient, MAX_CHUNK, MAX_MARK, type AttachmentRow, type ClientFrame, type ServerFrame } from "../../server/src/wire";
+import * as Y from "yjs";
+import { NoteRows, type NoteRow } from "./core/table/notes";
 import type { VaultKeys } from "./keys";
 import type { Ref, Store } from "./core/ports";
 import { TableDevice, catchUp, conflictSuffix, packRequest, restore, type Answer, type RecordData, type Row } from "./core/table/device";
@@ -12,6 +14,7 @@ type Ask = (packet: Uint8Array, matches: (f: ServerFrame) => boolean) => Promise
 const id = () => hex(randomBytes(16));
 const validHash = (h: unknown) => typeof h === "string" && /^[a-f0-9]{64}$/.test(h);
 export class TableSync {
+	readonly notes: NoteRows;
 	private device?: TableDevice;
 	private ask?: Ask;
 	private synced = false;
@@ -21,7 +24,8 @@ export class TableSync {
 	private inputs: DiskInputs;
 	private key?: Promise<Uint8Array>;
 	constructor(private store: Store, private keys: VaultKeys, private disk: DiskPort, allowed: (p: string) => boolean,
-		attachments: boolean, maxFileSize: number, private problem: (what: string, err: unknown) => void) {
+		attachments: boolean, maxFileSize: number, private problem: (what: string, err: unknown) => void, private noteChanged?: () => void) {
+		this.notes = new NoteRows(store);
 		this.inputs = {
 			id, attachments, maxFileSize, allowed, hash: b => this.hash(b), suffix: (h, n) => this.suffix(h, n),
 			readStage: r => store.get("table/blob/" + r.u), fetch: r => this.fetch(r), stage: async o => {
@@ -55,6 +59,25 @@ export class TableSync {
 	async wireRow(r: GenesisRow): Promise<AttachmentRow> {
 		return { file: unhex(r.file), version: await this.version(r.bytes), pathkey: await this.pathkey(r.path), record: await this.seal(r.file, r), deleted: r.deleted, seq: r.seq };
 	}
+	async wireNote(row: NoteRow): Promise<AttachmentRow> {
+		const { file, seq, deleted, ...record } = row;
+		return { file: unhex(file), version: null, seq, deleted, pathkey: await this.pathkey(row.path),
+			record: await this.envelope(unhex(file), KIND.noteRecord, new TextEncoder().encode(JSON.stringify(record))) };
+	}
+
+	private async openNote(f: AttachmentRow): Promise<NoteRow> {
+		const opened = await openEnvelope(f.record, this.keys.vaultId, f.file, this.keys.keyFor);
+		if (opened.kind !== KIND.noteRecord) throw new Error("Invalid note envelope kind");
+		const { kind, path, id, vector } = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(opened.plaintext));
+		if (kind !== "note" || typeof path !== "string" || !path.endsWith(".md") || path.includes("\\") ||
+			path.split("/").some(part => !part || part === "." || part === "..") ||
+			typeof id !== "string" || !/^(?:[0-9a-f]{2})+$/.test(id) ||
+			hex(await this.pathkey(path)) !== hex(f.pathkey) ||
+			(f.deleted === null ? vector !== undefined : typeof vector !== "string")) throw new Error("Invalid note record");
+		if (vector !== undefined) Y.decodeStateVector(Uint8Array.from(atob(vector), c => c.charCodeAt(0)));
+		return { kind, path, id, ...(vector === undefined ? {} : { vector }), seq: f.seq, file: hex(f.file), deleted: f.deleted };
+	}
+
 	private async openRow(f: AttachmentRow): Promise<Row> {
 		if (f.version === null) throw new Error("Expected an attachment row");
 		const opened = await openEnvelope(f.record, this.keys.vaultId, f.file, this.keys.keyFor);
@@ -108,6 +131,7 @@ export class TableSync {
 	}
 	async open() {
 		if (!this.device) {
+			await this.notes.load();
 			this.device = await TableDevice.open(this.store);
 			this.initialized = !!await this.store.get("table/initialized");
 		}
@@ -123,6 +147,12 @@ export class TableSync {
 		return this.run(async () => {
 			if (!session || this.ask !== session) return;
 			try {
+				if (frame.version === null) {
+					await this.notes.receive(await this.openNote(frame));
+					await this.device!.change(s => catchUp(s, { cursor: frame.seq }));
+					this.noteChanged?.();
+					return;
+				}
 				const row = await this.openRow(frame);
 				await this.device!.change(s => catchUp(s, row));
 				if (this.synced) this.schedule();

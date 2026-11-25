@@ -7,7 +7,7 @@ import { request } from "node:http";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SNAPSHOT_BUDGET, snapshotsToPrune } from "../src/snapshots.ts";
-import { CLOSE, type ClientFrame, type ServerFrame, decodeClient, decodeServer, encodeClient, encodeServer } from "../src/wire.ts";
+import { CLOSE, GENESIS_PART_BYTES, packGenesis, unpackGenesis, type ClientFrame, type ServerFrame, decodeClient, decodeServer, encodeClient, encodeServer } from "../src/wire.ts";
 import { type Stats, claim, migrateNow, startDev, stats } from "./devServer.ts";
 
 const dev = await startDev();
@@ -114,7 +114,7 @@ test("every frame survives encoding and decoding", () => {
 	assert.throws(() => encodeClient({ t: "del", req: doc(1), file: name(2), base: 1 }), RangeError);
 	for (const f of client) assert.deepEqual(decodeClient(encodeClient(f)), f);
 	const server: ServerFrame[] = [
-		{ t: "format", table: true }, { t: "row", row }, { t: "stagedRow", seq: 1 }, { t: "tableMore", seq: row.seq }, { t: "tableSynced", seq: row.seq },
+		{ t: "format", table: true }, { t: "row", row }, { t: "stagedPart", seq: 1 }, { t: "tableMore", seq: row.seq }, { t: "tableSynced", seq: row.seq },
 		{ t: "ok", req: doc(1), seq: row.seq }, { t: "refused", req: doc(2), row, missing: false }, { t: "refused", req: doc(3), row: null, missing: true },
 		{ t: "entry", seq: 2 ** 40 + 1, doc: doc(1), snapshot: true, envelope: bytes("e") }, { t: "more", seq: 5 }, { t: "synced", seq: 6 },
 		{ t: "ack", id: 7, seq: 8 }, { t: "live", doc: doc(2), envelope: bytes("l") },
@@ -950,14 +950,90 @@ async function tablePeer(v: string, tok: Uint8Array, migrated: boolean) {
 	return peer;
 }
 
+// A single-row part for fixtures that stage rows individually.
+async function onePart(f: Extract<ClientFrame, {t: "stageRow"}>): Promise<ClientFrame> {
+	const [data] = await Array.fromAsync(packGenesis([f]));
+	return { t: "stagePart", part: f.row.seq, data: data! };
+}
+
+test("packed genesis streams across frame and length boundaries", async () => {
+	const row = { file: doc(1), version: null, pathkey: name(2), seq: 1, deleted: null, record: new Uint8Array(GENESIS_PART_BYTES + 1) };
+	const frames = [1, 2].map(seq => ({ t: "stageRow" as const, expectedChunks: null, row: { ...row, seq } }));
+	const parts = await Array.fromAsync(packGenesis(frames));
+	assert.equal(parts.length, 3);
+	assert.ok(parts.every(p => p.length <= GENESIS_PART_BYTES));
+	assert.deepEqual([...unpackGenesis([parts[0]!.slice(0, 1), parts[0]!.slice(1), ...parts.slice(1)])], frames);
+	assert.throws(() => [...unpackGenesis(parts.slice(0, -1))], /truncated/);
+});
+
+test("packed genesis pays only for parts, the format flag and required note indexes", async () => {
+	for (const deleted of [null, 1]) {
+		const v = vault(), a = await tablePeer(v, token(), false), count = 20000;
+		try {
+			const rows = function* () {
+				for (let seq = 1; seq <= count; seq++) {
+					const file = doc(0), pathkey = name(0);
+					new DataView(file.buffer).setUint32(0, seq);
+					new DataView(pathkey.buffer).setUint32(0, seq);
+					const row = { file, pathkey, seq, deleted, version: null, record: new Uint8Array(deleted ? 124 : 108) };
+					yield { t: "stageRow" as const, expectedChunks: null, row };
+				}
+			};
+			await migrateNow(`http://localhost:${PORT}`, v);
+			const writes = async () => (await stats(`http://localhost:${PORT}`, v)).rowsWrittenToday;
+			const before = await writes();
+			let part = 0;
+			for await (const data of packGenesis(rows())) {
+				a.send({ t: "stagePart", part: ++part, data });
+				assert.deepEqual(await a.next(), { t: "stagedPart", seq: part });
+			}
+			a.send({ t: "genesis", base: 0, rows: count });
+			assert.deepEqual(await a.next(), { t: "format", table: true });
+			assert.equal(part, 4);
+			assert.equal(await writes() - before, count * (deleted ? 2 : 3) + 2 * part + 2);
+		} finally { a.ws.close(); }
+	}
+});
+
+test("a failed genesis write leaves legacy sync active and exposes no partial table", async () => {
+	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+	const a = await tablePeer(v, tok, false);
+	try {
+		await migrateNow(`http://localhost:${PORT}`, v);
+		const frames = [1, 2].map(seq => ({ t: "stageRow" as const, expectedChunks: null, row: {
+			file: doc(seq), version: null, pathkey: name(seq), seq, deleted: null, record: bytes("sealed")
+		} }));
+		const [data] = await Array.fromAsync(packGenesis(frames));
+		const part = { t: "stagePart" as const, part: 1, data: data! };
+		db.exec("CREATE TRIGGER no_stage BEFORE INSERT ON genesis_parts BEGIN SELECT RAISE(ABORT,'write limit'); END");
+		a.send(part); assert.deepEqual(await a.next(), { t: "migrationWriteFailed" });
+		db.exec("DROP TRIGGER no_stage");
+		a.send(part); assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
+		db.exec("CREATE TRIGGER no_commit BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'write limit'); END");
+		a.send({ t: "genesis", base: 0, rows: 2 });
+		assert.deepEqual(await a.next(), { t: "migrationWriteFailed" });
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attachments").get()!.n, 0);
+		assert.equal(db.prepare("SELECT value FROM settings WHERE key='attachmentTable'").get(), undefined);
+		assert.equal((await (await fetch(`http://localhost:${PORT}/test-stats/${v}`)).json()).migration, "failedToday");
+		assert.equal(await legacy.publish(doc(3), "still legacy"), 1);
+		db.exec("DROP TRIGGER no_commit");
+		a.send({ t: "genesis", base: 0, rows: 2 });
+		assert.deepEqual(await a.next(), { t: "format", table: false });
+		a.send(part); assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
+		a.send({ t: "genesis", base: 1, rows: 2 });
+		assert.deepEqual(await a.next(), { t: "format", table: true });
+		assert.equal(await legacy.closed, CLOSE.updateNeeded);
+	} finally { db.close(); a.ws.close(); legacy.ws.close(); }
+});
+
 test("genesis checks the legacy head and complete row count, switches once and closes old devices", async () => {
 	const v = vault(), tok = token();
 	const legacy = await connect(v, tok), a = await tablePeer(v, tok, false), b = await tablePeer(v, tok, false);
 	const row = { file: doc(1), version: name(2), pathkey: name(3), record: bytes("sealed"), deleted: null, seq: 1 };
 	try {
 		const stage = async () => {
-			a.send({ t: "stageRow", expectedChunks: null, row });
-			assert.deepEqual(await a.next(), { t: "stagedRow", seq: 1 });
+			a.send(await onePart({ t: "stageRow", expectedChunks: null, row }));
+			assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
 		};
 		a.send({ t: "migrationCheck" });
 		assert.deepEqual(await a.next(), { t: "migrationEligible", ready: false });
@@ -999,7 +1075,7 @@ test("notes share path CAS and keep text across deletion, replay and restore", a
 		const head = await legacy.publish(doc(22), "original Yjs state");
 		await migrateNow(`http://localhost:${PORT}`, v);
 		for (const row of [note, deleted])
-			assert.deepEqual(await send({ t: "stageRow", expectedChunks: null, row }), { t: "stagedRow", seq: row.seq });
+			assert.deepEqual(await send(await onePart({ t: "stageRow", expectedChunks: null, row })), { t: "stagedPart", seq: row.seq });
 		assert.deepEqual(await send({ t: "genesis", base: head, rows: 2 }), { t: "format", table: true });
 		assert.equal(await legacy.closed, CLOSE.updateNeeded);
 		const peer = await tablePeer(v, tok, true);
@@ -1165,10 +1241,10 @@ test("genesis checks scoped live versions, preserves cleaned tombstones, and gra
 	const tombstone = { ...scoped, file: doc(7), version: name(8), pathkey: name(9), seq: 3, deleted: past };
 	const stage = async () => {
 		for (const [row, expectedChunks] of [[scoped, 2], [legacy, null], [tombstone, 1]] as const) {
-			assert.deepEqual(await send({ t: "stageRow", row, expectedChunks }), { t: "stagedRow", seq: row.seq });
+			assert.deepEqual(await send(await onePart({ t: "stageRow", row, expectedChunks })), { t: "stagedPart", seq: row.seq });
 		}
-		assert.deepEqual(await send({ t:"stageRow", row:{...tombstone,file:doc(20),version:name(21),seq:4,deleted:null},
-			expectedChunks:1,dateAtCommit:true }), {t:"stagedRow",seq:4});
+		assert.deepEqual(await send(await onePart({ t:"stageRow", row:{...tombstone,file:doc(20),version:name(21),seq:4,deleted:null},
+			expectedChunks:1,dateAtCommit:true })), {t:"stagedPart",seq:4});
 	};
 	try {
 		await migrateNow(`http://localhost:${PORT}`, v);

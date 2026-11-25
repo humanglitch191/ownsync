@@ -1,16 +1,16 @@
 // shortcut: A stale compare restarts both passes from zero (index first, then attachment docs).
 // Neither the device's legacy replica nor an unstored live update can contribute to genesis. The Worker compares the whole-vault head at commit.
 import { KIND, docTag, hex, openEnvelope, unpackEntry } from "../../protocol/ownsync";
-import { decodeServer, encodeClient, type ClientFrame } from "../../server/src/wire";
-import { LegacyProjection, type GenesisRow } from "./core/table/migration";
+import { decodeServer, encodeClient, packGenesis, type ClientFrame } from "../../server/src/wire";
+import { LegacyProjection } from "./core/table/migration";
 import type { VaultKeys } from "./keys";
 import type { TableSync } from "./tableSync";
 
 export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, finished: (stale: boolean, error?: unknown) => void) {
 	const ws = new WebSocket(url), projection = new LegacyProjection(), epoch = keys.epoch, vmk = keys.vmk;
 	ws.binaryType = "arraybuffer";
-	let pass: "format" | "index" | "docs" | "stage" | "compare" = "format", base = 0, staged = 0, ended = false;
-	let rows: AsyncGenerator<GenesisRow>;
+	let pass: "format" | "index" | "docs" | "stage" | "compare" = "format", base = 0, staged = 0, part = 0, ended = false;
+	let parts: AsyncGenerator<Uint8Array>;
 	const tags = new Map<string, string>(), older = new Map<string, string>();
 	const seen = new Set<string>(), oldOnly = new Set<string>();
 	const watch = async (doc: string) => {
@@ -25,11 +25,16 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 		if (ended || keys.epoch !== epoch || keys.state.pending?.tokenHash) throw new Error("Vault keys changed during migration");
 		ws.send(encodeClient(f));
 	};
+	async function* stagedRows(): AsyncGenerator<Extract<ClientFrame, { t: "stageRow" }>> {
+		for await (const r of projection.rows(await sync.nameKey())) {
+			staged++;
+			yield { t: "stageRow", row: await sync.wireRow(r), dateAtCommit: r.dateAtCommit, expectedChunks: r.bytes.s ? r.bytes.c.length : null };
+		}
+	}
 	const next = async () => {
-		const row = await rows.next();
-		if (row.done) return send({ t: "genesis", base, rows: staged });
-		const r = row.value;
-		send({ t: "stageRow", row: await sync.wireRow(r), dateAtCommit: r.dateAtCommit, expectedChunks: r.bytes.s ? r.bytes.c.length : null });
+		const p = await parts.next();
+		if (p.done) return send({ t: "genesis", base, rows: staged });
+		send({ t: "stagePart", part: ++part, data: p.value });
 	};
 	let queue = Promise.resolve();
 	ws.onopen = () => {
@@ -41,6 +46,7 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 		queue = queue.then(async () => {
 			if (ended) return;
 			const f = decodeServer(new Uint8Array(e.data as ArrayBuffer));
+			if (f.t === "migrationWriteFailed") throw new Error("Migration could not complete today. The Worker could not store the migration. This vault still uses legacy sync.");
 			if (f.t === "format") {
 				if (f.table) return finish();
 				if (pass === "stage") {
@@ -55,8 +61,8 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 				return;
 			}
 			if (pass === "stage") {
-				if (f.t === "stagedRow") {
-					if (f.seq !== ++staged) throw new Error("Wrong staged row");
+				if (f.t === "stagedPart") {
+					if (f.seq !== part) throw new Error("Wrong staged part");
 					await next();
 				}
 				return;
@@ -86,10 +92,10 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 				pass = "docs"; send({ t: "subscribe", after: 0 });
 			} else if (pass === "docs") {
 				if (base !== f.seq) return finish(true);
-				pass = "stage"; rows = projection.rows(await sync.nameKey()); await next();
+				pass = "stage"; parts = packGenesis(stagedRows()); await next();
 			}
 		}).catch(err => finish(false, err));
 	};
-	ws.onclose = () => finish(false, new Error("Migration reader disconnected"));
+	ws.onclose = () => finish(false, new Error("Migration could not complete today. The migration connection closed before the Worker confirmed the result."));
 	return () => finish();
 }

@@ -49,6 +49,7 @@
 
 import * as Y from "yjs";
 import { conflictName, places, type IndexValue } from "./places";
+import type { NoteRows } from "./table/notes";
 import { legacyBases } from "./table/migration";
 import { applyText, onlyInserts } from "./text";
 import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, MarkState, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
@@ -65,6 +66,8 @@ const WINDOW = 4;
 const MAX_MARK = 1024;
 
 export interface EngineOptions {
+	tableNotes?: NoteRows;
+	onNoteReady?(): void;
 	tableHistory?: {
 		deleted(): Promise<DeletedNote[]>;
 		restore(id: string): Promise<string | undefined>;
@@ -280,6 +283,7 @@ export class Engine {
 	start(): Promise<void> {
 		return this.run("start", async () => {
 			this.table = !!await this.store.get("table/migrated");
+			if (this.table) await this.opts.tableNotes?.load();
 			this.meta = (await this.store.get<Meta>("meta")) ?? this.meta;
 			this.committedCursor = this.meta.cursor;
 			const index = await this.store.get<Uint8Array>("index");
@@ -334,7 +338,7 @@ export class Engine {
 		this.later(() => void this.run(`disk ${path}`, async () => {
 			this.mark(path, -1);
 			if (this.table && !isNote(path)) return;
-			if (!this.meta.synced || this.dirty.has(path)) return; // a later event covers this path
+			if (this.tableNotePath(path) || !this.meta.synced || this.dirty.has(path)) return; // a later event covers this path
 			const id = this.byPath.get(path);
 			if (id) await this.settle(id);
 			else if (await this.disk.stat(path)) {
@@ -355,7 +359,7 @@ export class Engine {
 		this.later(() => void this.run(`rename ${from}`, async () => {
 			this.mark(from, -1);
 			this.mark(to, -1);
-			if (this.table && !isNote(from) && !isNote(to)) return;
+			if (this.tableNotePath(from) || this.tableNotePath(to) || (this.table && !isNote(from) && !isNote(to))) return;
 			if (!this.meta.synced) return;
 			const id = this.byPath.get(from), occupant = this.byPath.get(to);
 			if (occupant && occupant !== id) await this.lost(occupant);
@@ -390,30 +394,52 @@ export class Engine {
 		let doc: Y.Doc | undefined;
 		return this.run(`open ${id}`, async () => {
 			if (requestedPath !== undefined && this.noteAt(requestedPath) !== id) return;
+			const row = this.opts.tableNotes?.get(id);
+			if (row) {
+				if (row.deleted === null && this.noteAt(row.path) === id) doc = await this.bindDocument(id, true);
+				return;
+			}
 			if (this.opened.has(id)) return void (doc = this.opened.get(id));
 			await this.settle(id); // the editor is about to show the file: take in what's on disk first
 			if (this.effectivePath(id) === undefined) return;
-			doc = this.load(await this.state(id), this.clientId);
-			const opened = doc;
-			opened.on("update", (update: Uint8Array, origin: unknown) => {
-				if (origin !== REMOTE) void this.run(`edit ${id}`, async () => { if (this.opened.get(id) === opened) await this.merge(id, update, true); });
-			});
-			this.opened.set(id, doc);
-			this.metaOf(id).open = true;
-			this.put(`note:${id}`, this.metaOf(id));
+			doc = await this.bindDocument(id, false);
 		}).then(() => doc);
+	}
+
+	// Both file models bind the very same Y.Doc used by the live channel and durable
+	// outbox. Only the caller knows which ID owns an editor's local file.
+	private async bindDocument(id: string, requireState: boolean) {
+		const existing = this.opened.get(id);
+		if (existing) return existing;
+		const state = await this.state(id);
+		if (requireState && !state) return;
+		const doc = this.load(state, this.clientId);
+		if (requireState && (doc.store.pendingStructs || doc.store.pendingDs)) {
+			doc.destroy();
+			return;
+		}
+		doc.on("update", (update: Uint8Array, origin: unknown) => {
+			if (origin !== REMOTE && this.opened.get(id) === doc) void this.run(`edit ${id}`, () => this.merge(id, update, true));
+		});
+		this.opened.set(id, doc);
+		this.metaOf(id).open = true;
+		this.put(`note:${id}`, this.metaOf(id));
+		return doc;
+	}
+
+	private releaseDocument(id: string) {
+		const doc = this.opened.get(id);
+		if (!doc) return false;
+		this.opened.delete(id);
+		doc.destroy();
+		this.owe(id, "doc");
+		return true;
 	}
 
 	close(id: string): Promise<void> {
 		this.waitingOpens.delete(id);
 		return this.run(`close ${id}`, async () => {
-			const doc = this.opened.get(id);
-			if (!doc) return;
-			this.opened.delete(id);
-			doc.destroy();
-			// Every keystroke is on record by now, so the file is at most an older save of the document.
-			this.owe(id, "doc");
-			await this.settle(id);
+			if (this.releaseDocument(id)) await this.settle(id);
 		});
 	}
 
@@ -606,7 +632,9 @@ export class Engine {
 				if (msg.entry.doc === INDEX) await this.applyIndex(msg.entry.data);
 				else if (!this.table || !this.isAttachment(msg.entry.doc)) {
 					await this.merge(msg.entry.doc, msg.entry.data, false);
-					if (this.meta.synced) await this.settle(msg.entry.doc);
+					if (this.isTableNote(msg.entry.doc)) {
+						if (!this.opened.has(msg.entry.doc)) this.opts.onNoteReady?.();
+					} else if (this.meta.synced) await this.settle(msg.entry.doc);
 				}
 			} else if (msg.t === "more") {
 				// One page of the catch-up is in; everything up to `seq` has been sent. Ask for the next.
@@ -645,7 +673,7 @@ export class Engine {
 		return this.run("snapshot all", async () => {
 			if (!this.link || !this.live) return;
 			await this.flush(); // the cursor they name must be on record first
-			for (const doc of [INDEX, ...this.notes.keys()]) {
+			for (const doc of new Set([INDEX, ...this.notes.keys(), ...(this.opts.tableNotes?.ids() ?? [])])) {
 				if (this.table && this.isAttachment(doc)) continue;
 				const data = doc === INDEX ? Y.encodeStateAsUpdate(this.index) : await this.state(doc);
 				if (!data) continue;
@@ -662,11 +690,25 @@ export class Engine {
 	}
 
 	noteAt(path: string): string | undefined {
-		return this.byPath.get(path);
+		const local = this.byPath.get(path), rows = this.opts.tableNotes;
+		if (rows && (rows.at(path) || (local && rows.get(local)))) {
+			// A row alone cannot bind an editor to an arbitrary disk file at its path.
+			// The device must already have placed that very document there.
+			return rows.at(path)?.id === local ? local : undefined;
+		}
+		return local;
 	}
 
 	pathOf(id: string): string | undefined {
-		return this.effectivePath(id);
+		const row = this.opts.tableNotes?.get(id);
+		return row ? (row.deleted === null ? row.path : undefined) : this.effectivePath(id);
+	}
+
+	isTableNote(id: string) { return !!this.opts.tableNotes?.get(id); }
+
+	private tableNotePath(path: string) {
+		const local = this.byPath.get(path);
+		return this.opts.tableNotes?.at(path) !== undefined || (local !== undefined && this.isTableNote(local));
 	}
 
 	isOpen(id: string): boolean {
@@ -982,7 +1024,7 @@ export class Engine {
 	 * unrelated new note, and an edit made to it on another device meanwhile would bring back a second copy.
 	 */
 	private async scan(): Promise<void> {
-		const files = (await this.disk.list()).filter((f) => !this.notesOnly || isNote(f.path));
+		const files = (await this.disk.list()).filter((f) => !this.tableNotePath(f.path) && (!this.notesOnly || isNote(f.path)));
 		const onDisk = new Map(files.map((f) => [f.path, f]));
 		const todo = new Set<string>();
 
@@ -997,7 +1039,7 @@ export class Engine {
 		const home = new Map<string, string>(); // note → its path, when a file is still there
 		const changed = new Map<string, string>(); // attachment → its path, where its file now has other content
 		for (const [path, id] of [...this.byPath]) {
-			if (this.table && !isNote(path)) continue;
+			if (this.tableNotePath(path) || (this.table && !isNote(path))) continue;
 			const f = onDisk.get(path), m = this.metaOf(id);
 			if (f && m.mtime === f.mtime && m.size === f.size) continue; // untouched
 			// An attachment changed in place is a new version of it. One that's gone is matched by exact content
@@ -1137,7 +1179,7 @@ export class Engine {
 	private async findMoved(hash: string, id: string): Promise<DiskFile | undefined> {
 		const note = !this.isAttachment(id), size = this.metaOf(id).size;
 		for (const f of await this.disk.list()) {
-			if (this.dirty.has(f.path)) continue; // waiting events will say what that file is
+			if (this.tableNotePath(f.path) || this.dirty.has(f.path)) continue; // waiting events will say what that file is
 			if (isNote(f.path) !== note || (!note && f.size !== size)) continue; // can't be it: no need to read it
 			const owner = this.byPath.get(f.path);
 			if (owner !== undefined) {
@@ -1265,7 +1307,7 @@ export class Engine {
 	 * Bring one note's file and document into agreement, and put the file where the index says.
 	 */
 	private async settle(id: string): Promise<void> {
-		if (this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
+		if (this.isTableNote(id) || this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
 		this.settling.add(id);
 		this.deferred.delete(id);
 		try {
@@ -1405,6 +1447,7 @@ export class Engine {
 
 	/** Make sure `path` is free for note `id`: move the note that's there, or take in a file nobody knows. */
 	private async vacate(path: string, id: string): Promise<boolean> {
+		if (this.tableNotePath(path)) return false;
 		if (!(await this.disk.stat(path))) return true;
 		const other = this.byPath.get(path);
 		if (other === id) return true;

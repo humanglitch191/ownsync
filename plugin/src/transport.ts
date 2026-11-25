@@ -278,7 +278,7 @@ export class Transport {
 			if (f.ready && !this.switched && !this.stopGenesis && !this.keys.state.pending?.tokenHash)
 				this.stopGenesis = importGenesis(vaultUrl(this.host,this.keys.vaultId),this.keys,sync,(stale,err) => {
 					this.stopGenesis = undefined;
-					if (err) this.opts.onProblem?.("building attachment genesis",err);
+					if (err) this.opts.onProblem?.("migrating the vault",err);
 					if (stale && !this.switched && ws === this.ws) ws.send(encodeClient({t:"migrationCheck"}));
 				});
 			return;

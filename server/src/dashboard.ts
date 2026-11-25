@@ -28,7 +28,7 @@ export interface VaultStats {
 	deleted: boolean;
 	devices: { id: string; name: string; lastOnline: number; online: boolean; version: string; conflicts: number; mobile: boolean; notesOnly: boolean }[];
 	settings: VaultSettings;
-	migration?: "legacy" | "requested" | "complete";
+	migration?: "legacy" | "requested" | "complete" | "failedToday";
 	/** Complete vault snapshots, newest first: when the last part arrived, and their size. */
 	snapshots: { at: number; size: number }[];
 	/** History backup copies, all devices together. */

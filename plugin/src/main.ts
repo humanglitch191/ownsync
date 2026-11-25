@@ -337,9 +337,11 @@ export default class OwnsyncPlugin extends Plugin {
 		const scratch = (this.manifest.dir ?? vault.configDir+"/plugins/"+this.manifest.id)+"/attachments/"+vaultId;
 		const tableDisk: TableDisk = new TableDisk(vault.adapter,store,scratch,allowed,
 			b => table.hash(b),(h,n) => table.suffix(h,n));
-		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem);
+		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem,() => refresh());
 		const engine = new Engine(store, disk, {
 			tableHistory: table,
+			tableNotes: table.notes,
+			onNoteReady: () => refresh(),
 			hash: async (text) => hex(await sha256(new TextEncoder().encode(text))),
 			chunkName: (data, scope): Promise<string> => transport.chunkName(data, scope),
 			versionTag: (u): Promise<string> => transport.versionTag(u),
