@@ -29,9 +29,26 @@ function pairOf(app: App, file: unknown): Pair | null {
 
 const allPairs = (app: App) => app.vault.getFiles().flatMap((f) => pairOf(app, f) ?? []);
 
+export function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
+	if (a.byteLength !== b.byteLength) return false;
+	const x = new Uint8Array(a), y = new Uint8Array(b);
+	for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+	return true;
+}
+
+/** Copies whose bytes are exactly their original's. */
+async function identical(app: App, pairs: Pair[]): Promise<Set<Pair>> {
+	const same = new Set<Pair>();
+	for (const p of pairs) {
+		if (!p.original || p.original.stat.size !== p.copy.stat.size) continue;
+		if (sameBytes(await app.vault.readBinary(p.original), await app.vault.readBinary(p.copy))) same.add(p);
+	}
+	return same;
+}
+
 // Built on first use, so this file loads (for the tests) where obsidian's Modal does not exist.
 const conflictModal = () => class ConflictModal extends Modal {
-	constructor(app: App, private pairs: Pair[]) { super(app); }
+	constructor(app: App, private pairs: Pair[], private same: Set<Pair>) { super(app); }
 
 	onOpen(): void {
 		this.setTitle("Attachment conflicts");
@@ -41,6 +58,25 @@ const conflictModal = () => class ConflictModal extends Modal {
 	private render(): void {
 		this.contentEl.empty();
 		if (!this.pairs.length) return this.close();
+		const same = this.pairs.filter((p) => this.same.has(p));
+		if (same.length) {
+			const box = this.contentEl.createDiv({ cls: "ownsync-conflict" });
+			const b = box.createEl("button", { text: same.length === 1 ? "Delete 1 identical copy" : `Delete ${same.length} identical copies`, cls: "mod-cta" });
+			box.createDiv({ cls: "ownsync-quiet", text: "Same bytes as their originals. Moves the copies to the trash; the originals stay." });
+			b.addEventListener("click", () => {
+				b.disabled = true;
+				void (async () => {
+					let failed = 0;
+					for (const p of same) {
+						try { await this.app.fileManager.trashFile(p.copy); this.pairs = this.pairs.filter((x) => x !== p); }
+						catch { failed++; }
+					}
+					if (failed) new Notice(`Could not delete ${failed === 1 ? "1 copy" : `${failed} copies`}.`, 6000);
+					this.same.clear();
+					this.render();
+				})();
+			});
+		}
 		for (const p of this.pairs) {
 			const box = this.contentEl.createDiv({ cls: "ownsync-conflict" });
 			box.createEl("h4", { text: p.path });
@@ -85,7 +121,7 @@ export function installConflictNotice(plugin: ConflictHost): void {
 	const review = () => {
 		const pairs = allPairs(app);
 		if (!pairs.length) return void new Notice("No attachment conflicts.");
-		const M = conflictModal(); new M(app, pairs).open();
+		void identical(app, pairs).then((same) => { const M = conflictModal(); new M(app, pairs, same).open(); });
 	};
 
 	const announce = (pairs: Pair[]) => {
