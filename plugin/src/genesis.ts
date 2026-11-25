@@ -26,9 +26,14 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 		ws.send(encodeClient(f));
 	};
 	async function* stagedRows(): AsyncGenerator<Extract<ClientFrame, { t: "stageRow" }>> {
-		for await (const r of projection.rows(await sync.nameKey())) {
+		const key = await sync.nameKey();
+		for await (const r of projection.rows(key)) {
 			staged++;
 			yield { t: "stageRow", row: await sync.wireRow(r), dateAtCommit: r.dateAtCommit, expectedChunks: r.bytes.s ? r.bytes.c.length : null };
+		}
+		for await (const { row, dateAtCommit } of projection.noteRows(key, staged)) {
+			staged++;
+			yield { t: "stageRow", row: await sync.wireNote(row), dateAtCommit: dateAtCommit || undefined, expectedChunks: null };
 		}
 	}
 	const next = async () => {

@@ -49,9 +49,10 @@
 
 import * as Y from "yjs";
 import { conflictName, places, type IndexValue } from "./places";
-import { completeText, noteInventory, planNoteContent, type NoteStructure } from "./table/noteDisk";
+import { completeText, noteInventory, planNoteContent, type NoteStructure, type NoteRequest } from "./table/noteDisk";
 import type { DiskPort } from "./table/disk";
-import type { NoteRows } from "./table/notes";
+import { restorePath } from "../historyRules";
+import type { NoteRows, NoteRow } from "./table/notes";
 import { legacyBases } from "./table/migration";
 import { applyText, onlyInserts } from "./text";
 import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, MarkState, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
@@ -71,6 +72,8 @@ export interface EngineOptions {
 	tableNotes?: NoteRows;
 	noteDisk?: DiskPort;
 	onNoteReady?(): void;
+	onNoteChanges?(ids: string[]): void;
+	onLegacyNotePlacements?(placed: ReadonlyMap<string, string>): Promise<void>;
 	tableHistory?: {
 		deleted(): Promise<DeletedNote[]>;
 		restore(id: string): Promise<string | undefined>;
@@ -244,7 +247,9 @@ export class Engine {
 	// One Yjs client ID per run, so a crash or a copied profile can never reuse an ID with different edits.
 	private clientId: number;
 	private table = false;
+	private oldAttachments = new Set<string>();
 	private noteAuthority = false;
+	get tableNotesReady() { return this.noteAuthority && this.scanned; }
 	get tableActive() { return this.table; }
 
 	constructor(private readonly store: Store, private readonly disk: Disk, private readonly opts: EngineOptions) {
@@ -258,6 +263,7 @@ export class Engine {
 		// Which index paths have live notes, kept up to date cheaply: most lookups only need to know whether
 		// a path is claimed at all, and recomputing the whole layout for each of 10,000 imported notes is slow.
 		this.notes.observe((e) => {
+			if (this.table) return;
 			for (const [id, change] of e.changes.keys) {
 				this.touched.add(id);
 				const was = change.oldValue as IndexValue | undefined, now = this.notes.get(id);
@@ -312,7 +318,21 @@ export class Engine {
 				for (const [key, state] of await this.store.list<MarkState>("mark:")) this.marks.set(key.slice(5), state);
 			}
 			// Before the first catch-up, local files can't be told apart from the vault's notes yet.
-			if (this.meta.synced) await this.scan();
+			if (this.meta.synced && (!this.table || this.noteAuthority)) await this.scan();
+		});
+	}
+
+	/** A live dependency may be absent from storage. Publish a repair through the
+	 * durable outbox only if this replica can actually complete the stored index. */
+	repairIndex(partial: Uint8Array) {
+		return this.run("completing the stored index", async () => {
+			if (this.table || !this.live) return;
+			const doc = this.load(Y.encodeStateAsUpdate(this.index));
+			try {
+				Y.applyUpdate(doc, partial);
+				if (!doc.store.pendingStructs && !doc.store.pendingDs)
+					this.send(INDEX, Y.encodeStateAsUpdate(doc), "snapshot");
+			} finally { doc.destroy(); }
 		});
 	}
 
@@ -322,9 +342,14 @@ export class Engine {
 			if (this.table) return;
 			await this.flush();
 			const bases = await legacyBases(this.store,nameKey);
-			const obsolete = this.outbox.filter(o => this.isAttachment(o.entry.doc));
+			await this.opts.onLegacyNotePlacements?.(new Map([...this.byPath].filter(([path]) => isNote(path))));
+			bases.set("table/first-sync", !this.meta.synced);
+			for (const [id, v] of this.notes) if (!isNote(v.p)) this.oldAttachments.add(id);
+			const obsolete = this.outbox.filter(o => this.oldAttachments.has(o.entry.doc));
 			await this.store.commit(bases,obsolete.map(o => "out:" + o.id));
 			this.table = true;
+			for (const [k, v] of bases) if (k.startsWith("note:")) this.metas.set(k.slice(5), v as NoteMeta);
+			this.shifted.clear();
 			for (const path of this.byPath.keys()) if (!isNote(path)) this.byPath.delete(path);
 			this.uploading = null; this.fetching = null; this.ups.clear(); this.toFetch.clear(); this.retry.clear();
 			this.cur.clear(); this.holders.clear(); this.marks.clear();
@@ -345,7 +370,7 @@ export class Engine {
 		this.mark(path, 1);
 		this.later(() => void this.run(`disk ${path}`, async () => {
 			this.mark(path, -1);
-			if (this.table && !isNote(path)) return;
+			if (this.table && (!isNote(path) || !this.noteAuthority)) return;
 			if (this.noteAuthority && isNote(path)) {
 				if (this.dirty.has(path)) return;
 				const id = this.byPath.get(path);
@@ -378,6 +403,13 @@ export class Engine {
 		this.later(() => void this.run(`rename ${from}`, async () => {
 			this.mark(from, -1);
 			this.mark(to, -1);
+			if (this.table && !this.noteAuthority) {
+				const id = this.byPath.get(from);
+				if (id && isNote(to)) {
+					this.place(id, to); this.structure(id, { t: "set", path: to, basePath: this.metaOf(id).basePath });
+				}
+				return;
+			}
 			if (this.noteAuthority && isNote(from) && isNote(to)) {
 				this.del("table/note-join/" + from);
 				const id = this.byPath.get(from), prior = this.byPath.get(to);
@@ -442,6 +474,7 @@ export class Engine {
 				if (path && this.noteAt(path) === id) doc = await this.bindDocument(id, true);
 				return;
 			}
+			if (this.table) return;
 			if (this.opened.has(id)) return void (doc = this.opened.get(id));
 			await this.settle(id); // the editor is about to show the file: take in what's on disk first
 			if (this.effectivePath(id) === undefined) return;
@@ -462,7 +495,10 @@ export class Engine {
 			return;
 		}
 		doc.on("update", (update: Uint8Array, origin: unknown) => {
-			if (origin !== REMOTE && this.opened.get(id) === doc) void this.run(`edit ${id}`, () => this.merge(id, update, true));
+			if (origin !== REMOTE && this.opened.get(id) === doc) void this.run(`edit ${id}`, async () => {
+				await this.merge(id, update, true);
+				if (this.noteAuthority && this.opts.tableNotes?.get(id)?.deleted != null) await this.settleTableNote(id);
+			});
 		});
 		this.opened.set(id, doc);
 		this.metaOf(id).open = true;
@@ -482,7 +518,9 @@ export class Engine {
 	close(id: string): Promise<void> {
 		this.waitingOpens.delete(id);
 		return this.run(`close ${id}`, async () => {
-			if (this.releaseDocument(id)) await this.settle(id);
+			if (!this.releaseDocument(id)) return;
+			if (this.noteAuthority) await this.settleTableNote(id);
+			else await this.settle(id);
 		});
 	}
 
@@ -495,7 +533,14 @@ export class Engine {
 		const deleted: DeletedNote[] = [], candidates: DeletedNote[] = [];
 		await this.run("list deleted notes", async () => {
 			const since = (this.opts.now?.() ?? Date.now()) - DELETED_DAYS * DAY_MS;
-			for (const [id, v] of this.notes) {
+			if (this.table) {
+				// The confirmed tombstone is listable even while its text is catching up.
+				for (const id of this.opts.tableNotes?.ids() ?? []) {
+					const row = this.opts.tableNotes!.get(id)!;
+					if (row.deleted !== null && row.deleted >= since)
+						deleted.push({ id, path: row.path, deletedAt: row.deleted, deletionSeq: row.seq });
+				}
+			} else for (const [id, v] of this.notes) {
 				if (v.d === undefined || (this.notesOnly && !isNote(v.p))) continue;
 				const deletedAt = Number.isSafeInteger(v.t) ? v.t : undefined;
 				if (deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
@@ -521,8 +566,8 @@ export class Engine {
 			const gone = new Set((await Promise.all(answers)).flatMap((missing) => missing ?? []));
 			for (const note of held) if (!tags.get(note.id)?.some((tag) => gone.has(tag))) deleted.push(note);
 		}
-		if (this.table && this.opts.attachments !== false && this.opts.tableHistory) {
-			deleted.push(...await this.opts.tableHistory.deleted());
+		if (this.table) {
+			if (this.opts.attachments !== false && this.opts.tableHistory) deleted.push(...await this.opts.tableHistory.deleted());
 			deleted.sort((a,b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity));
 		}
 		return deleted.slice(0,MAX_DELETED);
@@ -532,7 +577,9 @@ export class Engine {
 	deletedText(id: string): Promise<string | undefined> {
 		let text: string | undefined;
 		return this.run(`read deleted ${id}`, async () => {
-			if (this.notes.get(id)?.d !== undefined) text = await this.storedText(id);
+			if (this.table) {
+				if (this.opts.tableNotes?.get(id)?.deleted != null) text = completeText(await this.state(id));
+			} else if (this.notes.get(id)?.d !== undefined) text = await this.storedText(id);
 		}).then(() => text);
 	}
 
@@ -541,9 +588,20 @@ export class Engine {
 	 * old path now, it comes back as "<name> (restored).md": the path tie-break would rename the live note.
 	 * Resolves to the path it was given.
 	 */
-	restoreDeleted(id: string, path?: string): Promise<string | undefined> {
+	restoreDeleted(id: string, path?: string, deletionSeq?: number): Promise<string | undefined> {
 		let restored: string | undefined;
 		return this.run(`restore ${id}`, async () => {
+			if (this.table) {
+				const row = this.opts.tableNotes?.get(id), state = await this.state(id);
+				if (!this.noteAuthority || !row || row.deleted === null || (deletionSeq !== undefined && row.seq !== deletionSeq)
+					|| !state || completeText(state) === undefined || (path !== undefined && !isNote(path))) return;
+				const to = await restorePath(path ?? row.path, async p => !!this.opts.tableNotes!.at(p) ||
+					(this.byPath.get(p) !== id && !!await this.opts.noteDisk!.stat(p)));
+				this.send(id, state, "snapshot"); // deliver text to live peers even if their local state is absent
+				this.structure(id, { t: "restore", path: to, base: row.seq });
+				restored = to;
+				return;
+			}
 			const v = this.notes.get(id);
 			if (v?.d === undefined || !isNote(v.p) || (path !== undefined && !isNote(path))) return;
 			restored = await this.bringBack(id, path);
@@ -676,11 +734,9 @@ export class Engine {
 				else if (!this.table || !this.isAttachment(msg.entry.doc)) {
 					await this.merge(msg.entry.doc, msg.entry.data, false);
 					if (this.isTableNote(msg.entry.doc)) {
-						if (!this.opened.has(msg.entry.doc)) {
-							if (this.noteAuthority) await this.settleTableNote(msg.entry.doc);
-							this.opts.onNoteReady?.();
-						}
-					} else if (this.meta.synced) await this.settle(msg.entry.doc);
+						if (this.noteAuthority) await this.settleTableNote(msg.entry.doc);
+						if (!this.opened.has(msg.entry.doc)) this.opts.onNoteReady?.();
+					} else if (!this.table && this.meta.synced) await this.settle(msg.entry.doc);
 				}
 			} else if (msg.t === "more") {
 				// One page of the catch-up is in; everything up to `seq` has been sent. Ask for the next.
@@ -690,7 +746,7 @@ export class Engine {
 			} else if (msg.t === "synced") {
 				if (msg.seq > this.meta.cursor) this.setCursor(msg.seq);
 				this.live = true;
-				if (!this.scanned) {
+				if (!this.scanned && !this.table) {
 					this.meta.synced = true;
 					this.put("meta", this.meta);
 					this.joining = true;
@@ -719,8 +775,10 @@ export class Engine {
 		return this.run("snapshot all", async () => {
 			if (!this.link || !this.live) return;
 			await this.flush(); // the cursor they name must be on record first
-			for (const doc of new Set([INDEX, ...this.notes.keys(), ...(this.opts.tableNotes?.ids() ?? [])])) {
-				if (this.table && this.isAttachment(doc)) continue;
+			if (this.table && !this.tableNotesReady) return;
+			const ids = this.table ? new Set([...(this.opts.tableNotes?.ids() ?? []),
+				...[...this.metas].filter(([, m]) => m.tableNote).map(([id]) => id)]) : this.notes.keys();
+			for (const doc of [INDEX, ...ids]) {
 				const data = doc === INDEX ? Y.encodeStateAsUpdate(this.index) : await this.state(doc);
 				if (!data) continue;
 				this.tail.set(doc, 0);
@@ -728,6 +786,19 @@ export class Engine {
 			}
 			sent = true;
 		}).then(() => sent);
+	}
+
+	/** Snapshot confirmed row identities and their Yjs text, including live typing
+	 * which an editor has not saved to disk. Never silently skip a missing stream. */
+	async *tableSnapshotNotes() {
+		await this.idle();
+		if (!this.tableNotesReady) throw new Error("Waiting for the note table");
+		const rows = Array.from(this.opts.tableNotes!.ids(), id => this.opts.tableNotes!.get(id)!);
+		for (const row of rows) if (row.deleted === null) {
+			const text = completeText(await this.store.get<Uint8Array>("state:" + row.id));
+			if (text === undefined) throw new Error("Waiting for the text of " + row.path);
+			yield { id: row.id, path: row.path, text };
+		}
 	}
 
 	/** Resolves when every input so far has been handled. */
@@ -837,8 +908,10 @@ export class Engine {
 			this.live = false; // nothing sent, and no snapshot offered, until it's read again
 			throw err;
 		}
+		const changed = [...this.puts.keys()].filter(k => k.startsWith("table/note-change/")).map(k => k.slice("table/note-change/".length));
 		this.puts = new Map();
 		this.dels = new Set();
+		if (changed.length) this.opts.onNoteChanges?.(changed);
 		this.committedCursor = this.meta.cursor;
 	}
 
@@ -897,7 +970,7 @@ export class Engine {
 
 	// Once enough small entries have piled up for a document, give the server the whole thing so it can drop them.
 	private async offerSnapshot(doc: DocId): Promise<void> {
-		if (this.table && this.isAttachment(doc)) return;
+		if (this.table && doc !== INDEX && !this.isTableNote(doc)) return;
 		if (!this.link || !this.live || (this.tail.get(doc) ?? 0) < (this.opts.snapshotAfter ?? 50)) return;
 		if (this.outbox.some((o) => o.entry.doc === doc)) return; // wait until our own edits are acknowledged
 		const data = doc === INDEX ? Y.encodeStateAsUpdate(this.index) : await this.state(doc);
@@ -977,6 +1050,11 @@ export class Engine {
 	}
 
 	private async applyIndex(update: Uint8Array): Promise<void> {
+		if (this.table) {
+			Y.applyUpdate(this.index, update, REMOTE); // keep Yjs dependencies for the snapshot ledger
+			this.indexDirty = true;
+			return;
+		}
 		const touched = new Set<string>();
 		const watch = (e: Y.YMapEvent<IndexValue>) => e.keysChanged.forEach((k) => touched.add(k));
 		this.notes.observe(watch);
@@ -985,7 +1063,7 @@ export class Engine {
 		// Always save: an update that has to wait for one this device hasn't got yet changes nothing visible
 		// (and fires no event), but must not be forgotten once the cursor has moved past it.
 		this.indexDirty = true;
-		if (!this.meta.synced) return;
+		if (this.table || !this.meta.synced) return;
 		// A path gained or lost a claimant, so other notes' places may have changed too.
 		for (const [id, m] of this.metas) if (m.diskPath !== this.effectivePath(id)) touched.add(id);
 		for (const id of touched) await this.settle(id);
@@ -1028,7 +1106,7 @@ export class Engine {
 		if (!isNote(path) || this.metaOf(id).baseHash !== undefined) this.metaOf(id).writing = undefined;
 		this.place(id, path, file);
 		if (this.effectivePath(id) !== path) {
-			if (from && !isNote(path) && !this.renameSources.has(id)) this.renameSources.set(id, from);
+			if (from && !this.renameSources.has(id)) this.renameSources.set(id, from);
 			this.notes.set(id, { p: path });
 		}
 	}
@@ -1062,10 +1140,13 @@ export class Engine {
 
 	/** All-files genesis calls this after both cursors have caught up and migrated
 	 * placements are installed. An attachment-only handoff cannot enable this scan. */
-	startTableNoteFiles(firstSync: boolean): Promise<void> {
+	startTableNoteFiles(firstSync?: boolean): Promise<void> {
 		return this.run("placing table notes", async () => {
+			if (firstSync === undefined && this.tableNotesReady) return;
 			if (!this.table || !this.opts.tableNotes || !this.opts.noteDisk) throw new Error("Missing note table or disk");
-			await this.scanTableNotes(firstSync && !this.noteAuthority);
+			await this.scanTableNotes(!this.noteAuthority && (firstSync ?? !!await this.read("table/first-sync")));
+			this.meta.synced = true; this.put("meta", this.meta);
+			this.del("table/first-sync");
 			this.scanned = true;
 			this.finishStartup(true);
 			this.opts.onNoteReady?.();
@@ -1076,6 +1157,31 @@ export class Engine {
 		return this.run("placing a changed note", async () => {
 			if (this.noteAuthority) await this.settleTableNote(id);
 			this.opts.onNoteReady?.();
+		});
+	}
+
+	/** Complete a row proposal on the same queue that records disk events. A later
+	 * rename keeps its own path and takes the successful proposal as its base. */
+	finishNoteChange(id: string, was: NoteStructure, request?: NoteRequest, retry = false) {
+		return this.run("confirming a note change", async () => {
+			const key = "table/note-change/" + id;
+			const now = await this.read<NoteStructure>(key);
+			if (request) {
+				this.del("table/note-request/" + id);
+				if (request.accepted !== undefined) {
+					this.put("table/note-forget/" + request.req, true);
+					if (request.action !== "del") {
+						this.metaOf(id).basePath = request.path;
+						this.put("note:" + id, this.metaOf(id));
+					}
+				}
+			}
+			if (!retry && now) {
+				if (JSON.stringify(now) === JSON.stringify(was) && !(was.t === "del" && request?.action === "set")) this.del(key);
+				else if (now.t === "set" && request?.action === "set" && request.accepted !== undefined)
+					this.structure(id, { ...now, basePath: request.path });
+			}
+			if (this.noteAuthority) await this.settleTableNote(id);
 		});
 	}
 
@@ -1187,7 +1293,10 @@ export class Engine {
 		if (!m.diskPath) return;
 		const base = await this.read<Uint8Array>("base:" + id) ?? await this.state(id);
 		if (completeText(base) === undefined) return;
-		this.structure(id, { t: "del", path: m.diskPath, vector: b64(Y.encodeStateVectorFromUpdate(base!)) });
+		const doc = this.load(base);
+		const snapshot = b64(Y.encodeSnapshot(Y.snapshot(doc)));
+		doc.destroy();
+		this.structure(id, { t: "del", path: m.diskPath, snapshot });
 		this.place(id, undefined);
 		if (row?.deleted != null) this.del("table/note-change/" + id);
 	}
@@ -1270,13 +1379,31 @@ export class Engine {
 		return !this.byPath.has(path) && !await disk.stat(path);
 	}
 
+	private outsideDeletion(row: NoteRow, state: Uint8Array) {
+		if (row.snapshot !== undefined) return !Y.snapshotContainsUpdate(Y.decodeSnapshot(unb64(row.snapshot)), state);
+		const seen = Y.decodeStateVector(unb64(row.vector!));
+		return [...Y.decodeStateVector(Y.encodeStateVectorFromUpdate(state))].some(([client, clock]) => clock > (seen.get(client) ?? 0));
+	}
+
 	private async settleTableNote(id: string, changed = false): Promise<void> {
 		const disk = this.opts.noteDisk!, rows = this.opts.tableNotes!, row = rows.get(id), m = this.metaOf(id);
-		if (this.opened.has(id) || (m.diskPath && this.dirty.has(m.diskPath))) return;
+		const open = this.opened.get(id);
+		if (open) {
+			if (row?.deleted == null) return;
+			if (this.outsideDeletion(row, Y.encodeStateAsUpdate(open))) {
+				const pending = await this.read<NoteStructure>("table/note-change/" + id);
+				if (pending?.t !== "restore" || pending.base !== row.seq) this.structure(id, { t: "restore", path: row.path, base: row.seq });
+				return;
+			}
+			this.releaseDocument(id);
+			this.opts.onClosed?.(id);
+		}
+		if (m.diskPath && this.dirty.has(m.diskPath)) return;
 		const key = "table/note-write/" + id;
 		const intended = await this.read<Uint8Array>(key);
 		const change = await this.read<NoteStructure>("table/note-change/" + id);
 		if (!row && !m.tableNote) return;
+		if (await this.read("table/note-request/" + id)) return;
 		if (change?.t === "del" && !m.diskPath && row?.deleted == null) return;
 		if (await this.read("table/note-remove/" + id)) {
 			await this.finishTableRemove(id);
@@ -1353,12 +1480,14 @@ export class Engine {
 			return this.settleTableNote(id);
 		}
 		if (row && row.deleted !== null) {
-			const covered = Y.decodeStateVector(unb64(row.vector!));
-			for (const [client, clock] of Y.decodeStateVector(Y.encodeStateVectorFromUpdate(state))) {
-				if (clock > (covered.get(client) ?? 0)) {
-					this.structure(id, { t: "restore", path: want, base: row.seq });
-					return;
-				}
+			if (change?.t === "restore" && change.base === row.seq) return;
+			if (change?.t === "set" && change.legacyRestore && row.vector) {
+				this.structure(id, { t: "restore", path: change.path, base: row.seq });
+				return;
+			}
+			if (this.outsideDeletion(row, state)) {
+				this.structure(id, { t: "restore", path: want, base: row.seq });
+				return;
 			}
 			if (seen) {
 				this.put("table/note-remove/" + id, { path: at, hash: await this.opts.hash(seen.text), seq: row.seq });
@@ -1704,7 +1833,7 @@ export class Engine {
 			if (this.noteAuthority) await this.settleTableNote(id);
 			return;
 		}
-		if (this.noteAuthority || this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
+		if (this.table || this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
 		this.settling.add(id);
 		this.deferred.delete(id);
 		try {
@@ -1977,6 +2106,7 @@ export class Engine {
 	legacyAttachment(id: string) { return this.isAttachment(id); }
 
 	private isAttachment(id: string): boolean {
+		if (this.table) return this.oldAttachments.has(id);
 		const v = this.notes.get(id);
 		return !!v && !isNote(v.p);
 	}

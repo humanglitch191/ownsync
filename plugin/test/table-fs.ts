@@ -7,6 +7,7 @@ export function attachmentFs(files = new Map<string, { content: string | Uint8Ar
 	const folders = new Set<string>([""]);
 	const bytes = (p: string) => {
 		const b = files.get(p)?.content;
+		if (typeof b === "string") return new TextEncoder().encode(b);
 		if (!(b instanceof Uint8Array)) throw new Error("Missing binary file " + p);
 		return b;
 	};
@@ -20,7 +21,7 @@ export function attachmentFs(files = new Map<string, { content: string | Uint8Ar
 			return f ? { type: "file", size: f.content.length, ctime: f.mtime, mtime: f.mtime } : null;
 		},
 		async readBinary(p) { return bytes(p).slice().buffer; },
-		async writeBinary(p, b) { files.set(p, { content: new Uint8Array(b).slice(), mtime: ++time }); },
+		async writeBinary(p, b) { files.set(p, { content: p.endsWith(".md") ? new TextDecoder().decode(b) : new Uint8Array(b).slice(), mtime: ++time }); },
 		async exists(p) { return folders.has(p) || files.has(p); },
 		async mkdir(p) { folders.add(p); },
 		async remove(p) { files.delete(p); },

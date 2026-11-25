@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deletedWhenLabel, diffLines, keepCopies, mergeCopies, restoreDeletedPrompt, restorePath, whenLabel, whenLabels, type Copy } from "../src/historyRules";
+import { belongsToNote, deletedWhenLabel, diffLines, keepCopies, mergeCopies, restoreDeletedPrompt, restorePath, whenLabel, whenLabels, type Copy } from "../src/historyRules";
 
 const HOUR = 60 * 60_000;
 const now = new Date(2026, 10, 22, 15, 0).getTime();
@@ -16,6 +16,17 @@ test("older copies keep the newest per local calendar day and note", () => {
 	const keep = [copy(23), copy(29), copy(30, "b.md"), copy(40), copy(24 * 30)];
 	const drop = [copy(30), copy(31), copy(42), copy(24 * 30 + 1)];
 	assert.deepEqual(keepCopies([...drop, ...keep].reverse(), now), keep);
+});
+
+test("local history follows a restored note's ID and a different occupant keeps its own daily copy", () => {
+	const first = { ...copy(29), noteId: "first", gone: true };
+	const moved = { ...copy(28, "new.md"), noteId: "first" };
+	const occupant = { ...copy(30), noteId: "other" };
+	assert.ok(belongsToNote(first, "new.md", "first"));
+	assert.ok(!belongsToNote(first, "a.md", "other"));
+	assert.ok(belongsToNote(copy(1), "a.md", "other")); // path-only local history
+	assert.ok(!belongsToNote({ ...copy(1), gone: true }, "a.md", "other"));
+	assert.deepEqual(keepCopies([first, moved, occupant], now), [moved, occupant]);
 });
 
 test("recently deleted notes are kept for 30 days without daily thinning", () => {

@@ -4,6 +4,7 @@
 // before it says hello with the epoch's token. Editors' presence (cursors) travels as live frames, but
 // never reaches the engine.
 
+import { IncompleteIndex } from "./core/table/migration";
 import { importGenesis } from "./genesis";
 import type { TableSync } from "./tableSync";
 import type { Engine } from "./core/engine";
@@ -72,7 +73,9 @@ export class Transport {
 
 	private negotiated = false;
 	private engineConnected = false;
+	private textCaughtUp = false;
 	private switched = false;
+	private waitingForIndex = false;
 	private stopGenesis?: () => void;
 	private waiting?: { matches: (f: ServerFrame) => boolean; resolve: (f: ServerFrame) => void; reject: (err: Error) => void };
 	constructor(private readonly host: string, private readonly keys: VaultKeys, private readonly engine: Engine, private readonly opts: TransportOptions = {}) {}
@@ -84,7 +87,7 @@ export class Transport {
 		ws.binaryType = "arraybuffer";
 		this.ws = ws;
 		this.authed = false; this.negotiated = false; this.engineConnected = false; this.switched = false;
-		this.batch = [];
+		this.batch = []; this.waitingForIndex = false; this.textCaughtUp = false;
 		this.held = []; // the engine sends what it still needs again on the new connection
 		this.offered = -1;
 		this.reported = -1;
@@ -265,8 +268,10 @@ export class Transport {
 			try {
 				if (f.table && !this.switched) {
 					this.switched = true; this.stopGenesis?.();
+					this.set("catching up");
 					await this.engine.useTable(await sync.nameKey());
-					const after = await sync.connect((p,match) => this.ask(ws,p,match));
+					const after = await sync.connect((p,match) => this.ask(ws,p,match), this.engine);
+					if (this.textCaughtUp) void sync.notesCaughtUp().then(() => this.finishCatchUp(ws)).catch(() => ws.close());
 					if (ws !== this.ws) return;
 					ws.send(encodeClient({t:"since",after}));
 				} else if (!f.table && this.engine.tableActive) throw new Error("Worker no longer holds the migrated attachment table");
@@ -278,6 +283,10 @@ export class Transport {
 			if (f.ready && !this.switched && !this.stopGenesis && !this.keys.state.pending?.tokenHash)
 				this.stopGenesis = importGenesis(vaultUrl(this.host,this.keys.vaultId),this.keys,sync,(stale,err) => {
 					this.stopGenesis = undefined;
+					if (err instanceof IncompleteIndex && ws === this.ws && !this.switched) {
+						this.waitingForIndex = true;
+						void this.engine.repairIndex(err.partial);
+					}
 					if (err) this.opts.onProblem?.("migrating the vault",err);
 					if (stale && !this.switched && ws === this.ws) ws.send(encodeClient({t:"migrationCheck"}));
 				});
@@ -286,7 +295,7 @@ export class Transport {
 		if (sync && this.switched) {
 			if (f.t === "row" || f.t === "tableSynced") {
 				const apply = f.t === "row" ? sync.row(f.row) : sync.ready(f.seq);
-				void apply.catch(() => ws.close()); return;
+				void apply.then(() => this.finishCatchUp(ws)).catch(() => ws.close()); return;
 			}
 			if (f.t === "tableMore") { ws.send(encodeClient({t:"since",after:f.seq})); return; }
 			if (f.t === "stored" || f.t === "chunk" || f.t === "missing" || f.t === "marked") return;
@@ -310,11 +319,11 @@ export class Transport {
 				if (this.negotiated && !this.switched) ws.send(encodeClient({t:"migrationCheck"}));
 			}
 			await this.engine.receive(f);
+			if (f.t === "ack") this.retryIndex(ws);
 			if (f.t === "synced") {
-				this.set("synced");
-				this.report();
-				this.offer();
-				if (this.keys.state.resnapshot) await this.resnapshot();
+				this.textCaughtUp = true;
+				if (sync && this.switched) void sync.notesCaughtUp().then(() => this.finishCatchUp(ws)).catch(() => ws.close());
+				else await this.finishCatchUp(ws);
 			}
 			return;
 		}
@@ -329,6 +338,23 @@ export class Transport {
 		if (kind !== KIND.update && kind !== KIND.snapshot) throw new Error(`unexpected envelope kind ${kind}`);
 		const entry: Entry = { doc: docId, kind: kind === KIND.snapshot ? "snapshot" : "update", data: update };
 		await this.engine.receive(f.t === "entry" ? { t: "entry", seq: f.seq, entry } : { t: "live", entry });
+		if (f.t === "entry" && entry.doc === "index") this.retryIndex(ws);
+	}
+
+	// The text subscription and table catch-up finish independently. Rotation must
+	// enumerate the confirmed note rows before it declares the new epoch backed up.
+	private async finishCatchUp(ws: WebSocket) {
+		if (ws !== this.ws || !this.textCaughtUp || this.status !== "catching up" ||
+			(this.switched && !this.opts.attachments?.caughtUp)) return;
+		this.set("synced");
+		this.report();
+		this.offer();
+		if (this.keys.state.resnapshot) await this.resnapshot();
+	}
+
+	private retryIndex(ws: WebSocket) {
+		if (!this.waitingForIndex || this.switched) return;
+		this.waitingForIndex = false; ws.send(encodeClient({ t: "migrationCheck" }));
 	}
 
 	private async records(ws: WebSocket): Promise<void> {

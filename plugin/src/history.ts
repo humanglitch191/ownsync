@@ -7,12 +7,12 @@ import { type EditorView, ViewPlugin } from "@codemirror/view";
 import { ySyncAnnotation, ySyncFacet } from "y-codemirror.next";
 import { type Doc, type Transaction as YTransaction, UndoManager } from "yjs";
 import type { createHistoryBackup } from "./historyBackup";
-import { MAX_BYTES, type Copy, deletedWhenLabel, diffLines, keepCopies, mergeCopies, restoreDeletedPrompt, restorePath, whenLabels } from "./historyRules";
+import { MAX_BYTES, type Copy, belongsToNote, deletedWhenLabel, diffLines, keepCopies, mergeCopies, restoreDeletedPrompt, restorePath, whenLabels } from "./historyRules";
 
 interface DeletedNotesEngine {
-	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number }[]>;
+	deletedNotes(): Promise<{ id: string; path: string; deletedAt?: number; deletionSeq?: number }[]>;
 	deletedText(id: string): Promise<string | undefined>;
-	restoreDeleted(id: string, path?: string): Promise<string | undefined>;
+	restoreDeleted(id: string, path?: string, deletionSeq?: number): Promise<string | undefined>;
 	restoreAttachment(id: string): Promise<string | "gone" | "offline" | undefined>;
 }
 
@@ -67,7 +67,7 @@ const META = "meta", TEXT = "text";
 
 /** `gone`: a copy of a note since deleted, kept only for its deleted copy's sake; another note at its path doesn't list it. */
 interface Entry extends Copy { id: string; mtime: number; gone?: boolean }
-interface Sample { path: string; text: string; mtime: number }
+interface Sample { noteId?: string; path: string; text: string; mtime: number }
 interface LocalEdit { text: Text; consumed?: boolean }
 interface Pending { sample: Sample; edit?: LocalEdit; timer?: number }
 
@@ -120,12 +120,12 @@ class HistoryDb {
 			const result = await update({
 				entries,
 				read: (id) => request(texts.get(id)),
-				add: ({ path, text, mtime }, time, deleted) => {
+				add: ({ path, text, mtime, noteId }, time, deleted) => {
 					// Budget UTF-16 text and path plus the metadata for each entry, including empty notes.
 					const size = 2 * (text.length + path.length) + 128;
 					if (size > MAX_BYTES) return false;
 					const id = crypto.randomUUID();
-					entries.set(id, { id, path, time, mtime, size, deleted });
+					entries.set(id, { id, path, time, mtime, size, deleted, noteId });
 					additions.set(id, text);
 					return true;
 				},
@@ -194,7 +194,8 @@ class History {
 		const { path, stat: { mtime, size } } = file;
 		if (size > MAX_BYTES) return;
 		try {
-			return { path, mtime, text: await this.app.vault.cachedRead(file) };
+			const noteId = this.backup()?.client.noteIdForPath(path);
+			return { path, mtime, noteId, text: await this.app.vault.cachedRead(file) };
 		} catch (err) {
 			if (this.app.vault.getFileByPath(path) === file) this.problem(err);
 		}
@@ -279,14 +280,15 @@ class History {
 			return [pending];
 		});
 		if (!samples.length) return;
-		const noteIds = new Map(samples.map(({ sample: { path } }) => [path, this.backupFor(path)?.noteId]));
+
 		const { due, uploads } = await this.db.edit(async ({ entries, read, add }) => {
 			const newest = newestByPath(entries.values());
 			const now = Date.now();
 			const due = new Map<string, number>();
 			const uploads: { sample: Sample; takenAt: number }[] = [];
 			for (const { sample, edit } of samples) {
-				const last = newest.get(sample.path);
+				const atPath = newest.get(sample.path);
+				const last = atPath && belongsToNote(atPath, sample.path, sample.noteId) ? atPath : undefined;
 				if (last && !force && last.time + EVERY > now) {
 					due.set(sample.path, last.time + EVERY);
 				} else if (last && await read(last.id) === sample.text) {
@@ -314,10 +316,10 @@ class History {
 				pending.timer = timer;
 			}
 		}
-		for (const { sample: { path, text }, takenAt } of uploads) {
+		for (const { sample: { path, text, noteId }, takenAt } of uploads) {
 			const target = this.backupFor(path);
 			// The same note's before and after the wait: the path can change hands meanwhile (a rename moves another note onto it).
-			if (target?.connected && target.noteId === noteIds.get(path)) void target.client.upload(target.noteId, text, takenAt).catch(() => {});
+			if (target?.connected && target.noteId === noteId) void target.client.upload(target.noteId, text, takenAt).catch(() => {});
 		}
 	}
 
@@ -356,7 +358,7 @@ class History {
 						if (!last || last.time <= (previous?.time ?? -Infinity)) continue;
 						const text = await read(last.id);
 						if (text === undefined) continue;
-						sample = { path: p, text, mtime: last.mtime };
+						sample = { path: p, text, mtime: last.mtime, noteId: last.noteId };
 					}
 					if (previous?.mtime === sample.mtime && (last?.time ?? -Infinity) <= previous.time &&
 						await read(previous.id) === sample.text) continue;
@@ -400,10 +402,23 @@ class History {
 		});
 	}
 
+	async bindPlacements(placements: ReadonlyMap<string, string>) {
+		await this.queue(async () => {
+			for (const { sample } of this.pending.values()) sample.noteId ??= placements.get(sample.path);
+			await this.db.edit(({ entries }) => {
+				for (const e of entries.values()) {
+					const noteId = placements.get(e.path);
+					if (!e.noteId && !e.deleted && !e.gone && noteId) entries.set(e.id, { ...e, noteId });
+				}
+			});
+		});
+	}
+
 	async list(path?: string): Promise<Entry[]> {
 		await this.work;
 		const entries = keepCopies(await this.db.entries(), Date.now());
-		return entries.filter((e) => path === undefined ? e.deleted : !e.deleted && !e.gone && e.path === path);
+		const id = path && this.backup()?.client.noteIdForPath(path);
+		return entries.filter(e => path === undefined ? e.deleted : belongsToNote(e, path, id));
 	}
 
 	text(entry: Entry): Promise<string | undefined> {
@@ -423,12 +438,13 @@ class History {
 
 	forgetNote(path: string) {
 		const target = this.backupFor(path);
+		const noteId = this.backup()?.client.noteIdForPath(path);
 		const edit = this.localEdits.get(path);
 		if (edit) edit.consumed = true;
 		this.localEdits.delete(path);
 		return this.queue(async () => {
 			await this.db.edit(({ entries }) => {
-				for (const [id, entry] of entries) if (!entry.deleted && entry.path === path) entries.delete(id);
+				for (const [id, entry] of entries) if (belongsToNote(entry, path, noteId)) entries.delete(id);
 			});
 			this.clearPending(path);
 			// The client orders this after earlier uploads. Its HTTP request stays off the local queue.
@@ -518,8 +534,9 @@ class HistoryModal extends Modal {
 					read: () => engine.deletedText(entry.id),
 					restore: this.deletedRestore(entry.path, async () => {
 						if (this.plugin.engine?.() !== engine) throw new Error("Reopen Recently deleted notes and try again.");
-						const path = await engine.restoreDeleted(entry.id);
-						say(path ? `Restored ${path}.` : "Note restored.");
+						const path = await engine.restoreDeleted(entry.id, undefined, entry.deletionSeq);
+						if (!path) throw new Error("This deletion is no longer available. Reopen Recently deleted notes.");
+						say(entry.deletionSeq === undefined ? `Restored ${path}.` : `Restore requested for ${path}.`);
 					}),
 				} : {
 					// An attachment: Clean up may have removed its content, which only the Worker can say.
@@ -761,7 +778,7 @@ class HistoryModal extends Modal {
 	}
 }
 
-export function installHistory(plugin: HistoryHost, backup: ActiveBackup): void {
+export function installHistory(plugin: HistoryHost, backup: ActiveBackup) {
 	const { app } = plugin, { vault, workspace } = app;
 	const key = `${plugin.manifest.id}-history-id`;
 	const existing: unknown = app.loadLocalStorage(key);
@@ -822,4 +839,5 @@ export function installHistory(plugin: HistoryHost, backup: ActiveBackup): void 
 	plugin.registerEvent(workspace.on("file-menu", (menu, file) => {
 		if (isNote(file)) menu.addItem((item) => item.setTitle("Show history").setIcon("history").onClick(() => open(file)));
 	}));
+	return (placements: ReadonlyMap<string, string>) => history.bindPlacements(placements);
 }

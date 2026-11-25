@@ -149,7 +149,7 @@ The owner's rule: only a release I author and sign myself can install. Each Work
 
 **Local note history.** Each device keeps copies of the notes edited on it in its own IndexedDB, at most one every 10 minutes per note: everything from the last day, then one a day per note for 30 days, up to 50 MB in all. Only an explicit restore writes to the vault.
 
-**Recently deleted.** A deleted note's ID stays in the synced index, marked deleted, and every device keeps its state (see "Deleted notes keep their state" below). So any device can list deleted notes and bring one back; the restore is an ordinary change to the index that syncs like any other.
+**Recently deleted.** After genesis the file table keeps the deleted row, and the note’s Yjs document keeps its text. Restore names the deletion’s sequence number and preserves the document ID, including when another note occupies the old name. A device with edits outside the deleter’s Yjs snapshot requests a restore. Migrated tombstones use their original state vector. Vaults awaiting genesis keep using the synced index for deletion and restore.
 
 **Encrypted history backup.** The plugin can upload copies from its local note history and list them from another device. Each copy is a separate encrypted envelope filed under the note's current-epoch document tag. The plugin pads the encoded copy to a power-of-two KiB bucket and skips copies larger than 1 MiB. When opening history, it checks the current epoch, vault, note tag, note ID and copy time. Copies appear newest first by their sealed timestamp. The reported device ID comes from the envelope and is a claim any vault member can make.
 

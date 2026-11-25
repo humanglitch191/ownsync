@@ -56,8 +56,8 @@ export function planNoteContent(disk: string | undefined, latest: string | undef
 }
 
 export type NoteStructure =
-	| { t: "set"; path: string; basePath?: string }
-	| { t: "del"; path: string; vector: string }
+	| { t: "set"; path: string; basePath?: string; legacyRestore?: true }
+	| ({ t: "del"; path: string } & ({ snapshot: string; vector?: never } | { vector: string; snapshot?: never }))
 	| { t: "restore"; path: string; base: number };
 
 // No cross-path pairing, even when the old and new files have identical bytes.
@@ -69,4 +69,15 @@ export function noteInventory(files: Iterable<string>, placements: ReadonlyMap<s
 		missing: [...placements].filter(([path]) => !present.has(path)),
 		unknown: [...present].filter(path => !placements.has(path)),
 	};
+}
+
+// One immutable CAS per document. The desired change may advance while it is in flight.
+export interface NoteRequest {
+	req: string;
+	file: string;
+	base: number | null;
+	action: NoteStructure["t"];
+	path: string;
+	change: NoteStructure;
+	accepted?: number;
 }

@@ -154,7 +154,7 @@ export default class OwnsyncPlugin extends Plugin {
 		this.registerDomEvent(activeDocument, "visibilitychange", viewChanged);
 		this.registerDomEvent(window, "focus", viewChanged);
 		this.registerDomEvent(window, "blur", viewChanged);
-		installHistory(this, () => this.session && {
+		this.bindHistory = installHistory(this, () => this.session && {
 			client: this.session.historyBackup,
 			connected: this.session.transport.status === "synced",
 		});
@@ -283,6 +283,7 @@ export default class OwnsyncPlugin extends Plugin {
 	}
 
 	private setup?: SetupModal;
+	private bindHistory?: ReturnType<typeof installHistory>;
 	openSetup(code = ""): void {
 		this.setup?.close();
 		(this.setup = new SetupModal(this, code)).open();
@@ -344,7 +345,9 @@ export default class OwnsyncPlugin extends Plugin {
 		const engine = new Engine(store, disk, {
 			noteDisk,
 			tableHistory: table,
+			onLegacyNotePlacements: this.bindHistory,
 			tableNotes: table.notes,
+			onNoteChanges: ids => table.noteChanges(ids),
 			onNoteReady: () => refresh(),
 			hash: async (text) => hex(await sha256(new TextEncoder().encode(text))),
 			chunkName: (data, scope): Promise<string> => transport.chunkName(data, scope),
@@ -399,9 +402,10 @@ export default class OwnsyncPlugin extends Plugin {
 		const snapshots = createSnapshots({
 			...backupConnection,
 			mobile: Platform.isMobile,
-			ready: () => connected() && !keys.state.removed && !keys.state.fork,
+			ready: () => connected() && (!engine.tableActive || table.caughtUp) && !keys.state.removed && !keys.state.fork,
 			vmkFor: keys.keyFor,
 			async *listNotes(maxBytes) {
+				if (engine.tableActive) { yield* engine.tableSnapshotNotes(); return; }
 				let bytes = 0;
 				for (const file of vault.getMarkdownFiles()) {
 					if (!disk.synced(file)) continue;
@@ -413,8 +417,8 @@ export default class OwnsyncPlugin extends Plugin {
 					yield { id, path, text: await vault.cachedRead(file) };
 				}
 			},
-			// The engine keeps attachment references private. Use notes-only mode if any would be omitted.
-			listAttachments: () => !this.attachments || vault.getFiles().some((file) => disk.synced(file) && !file.path.endsWith(".md")) ? undefined : [],
+			// Table snapshots can include the confirmed attachment references without downloading their bytes.
+			listAttachments: () => engine.tableActive ? table.snapshotAttachments() : !this.attachments || vault.getFiles().some((file) => disk.synced(file) && !file.path.endsWith(".md")) ? undefined : [],
 			snapshotLedger: () => engine.snapshotLedger(),
 			recordSnapshot: (id, entry) => engine.recordSnapshot(id, entry),
 			forgetSnapshots: (ids) => engine.forgetSnapshots(ids),

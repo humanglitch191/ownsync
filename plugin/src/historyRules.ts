@@ -1,8 +1,16 @@
 export interface Copy {
+	noteId?: string;
 	path: string;
 	time: number;
 	size: number;
 	deleted?: boolean;
+}
+
+/** Old local copies used the path until a sync placement supplied their note ID. */
+export function belongsToNote(copy: Copy & { gone?: boolean }, path: string, noteId?: string) {
+	if (copy.deleted) return false;
+	if (noteId && copy.noteId) return copy.noteId === noteId;
+	return !copy.gone && copy.path === path;
 }
 
 const DAY = 24 * 60 * 60_000;
@@ -22,7 +30,7 @@ export function keepCopies<T extends Copy>(copies: readonly T[], now: number, ca
 		const age = now - copy.time;
 		if (age > 30 * DAY) break;
 		if (!copy.deleted && age > DAY) {
-			const day = `${copy.path}\n${localDay(new Date(copy.time))}`;
+			const day = `${copy.noteId ?? copy.path}\n${localDay(new Date(copy.time))}`;
 			if (days.has(day)) continue;
 			days.add(day);
 		}

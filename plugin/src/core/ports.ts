@@ -6,6 +6,8 @@ export type DocId = string;
 
 /** A deleted markdown note whose text is stored on this device. */
 export interface DeletedNote {
+	/** The exact table deletion selected in Recently deleted. */
+	deletionSeq?: number;
 	id: string;
 	path: string;
 	/** Milliseconds since the epoch on the deleting device. Older tombstones have no timestamp. */

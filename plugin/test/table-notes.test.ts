@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
+import { decodeClient, type AttachmentRow, type ServerFrame } from "../../server/src/wire";
 import { TableSync } from "../src/tableSync";
 import type { NoteRow } from "../src/core/table/notes";
 import type { VaultKeys } from "../src/keys";
@@ -25,10 +26,11 @@ test("table note editors use the placed ID and the durable Yjs stream regardless
 		d.data.set("table/migrated", true);
 		d.data.set("note:" + note.id, { diskPath: note.path, baseHash: "draft", size: 5, mtime: 1 });
 		d.files.set(note.path, { content: "draft", mtime: 1 });
-		d.overrides = { tableNotes: t.notes };
+		const disk = new Files(); disk.edit(note.path, "draft");
+		d.overrides = { tableNotes: t.notes, noteDisk: disk, hash: async text => hash(enc.encode(text)) };
 		d.boot(); await d.idle();
 		await t.connect(async () => assert.fail("typing sent a table request"));
-		d.connect();
+		d.connect(); await d.engine!.startTableNoteFiles(false);
 	}
 	await ta.row(await ta.wireNote(note));
 	await quiesce([a,b]);
@@ -100,7 +102,7 @@ async function planner() {
 	d.data.set("table/migrated", true);
 	const boot = async () => {
 		const t = table(d);
-		d.overrides = { tableNotes: t.notes, noteDisk: disk, hash: hashText, defer: f => f() };
+		d.overrides = { tableNotes: t.notes, noteDisk: disk, hash: hashText, defer: f => f(), onNoteChanges: ids => t.noteChanges(ids) };
 		d.boot(); await d.idle();
 		return t;
 	};
@@ -354,4 +356,96 @@ test("a new file at the source of an interrupted move keeps its own ID", async (
 	assert.equal(d.storedText(newId), "newly created");
 	assert.equal(d.storedText(note.id), "moved note");
 	assert.equal(disk.files.size, 2);
+});
+
+test("deleting a note respects deletion-only edits outside the deleter's full Yjs snapshot", async () => {
+	for (const sawEdit of [false, true]) {
+		const { d, disk, t, change } = await planner();
+		const doc = new Y.Doc();
+		doc.getText("t").insert(0, "keep this");
+		const original = Y.encodeStateAsUpdate(doc);
+		const snap = () => Buffer.from(Y.encodeSnapshot(Y.snapshot(doc))).toString("base64");
+		const before = snap();
+		doc.getText("t").delete(4, 5);
+		d.data.set("state:" + note.id, Y.encodeStateAsUpdate(doc));
+		disk.edit(note.path, "keep"); await d.engine!.startTableNoteFiles(true);
+		assert.deepEqual(Y.encodeStateVector(doc), Y.encodeStateVectorFromUpdate(original));
+		await t.notes.receive({ ...note, seq: 2, deleted: 1, snapshot: sawEdit ? snap() : before });
+		await d.engine!.tableNoteChanged(note.id);
+		assert.equal(change(note.id)?.t, sawEdit ? undefined : "restore");
+		assert.equal(disk.text(note.path), sawEdit ? undefined : "keep");
+		doc.destroy();
+	}
+});
+
+test("a lost note-create answer replays its request and preserves a later offline rename", async () => {
+	const { d, disk, t, boot } = await planner();
+	let active = t, seq = 1, firstReq: string | undefined, stored: AttachmentRow | undefined;
+	const sent: string[] = [];
+	const ask = async (packet: Uint8Array): Promise<ServerFrame> => {
+		const f = decodeClient(packet);
+		if (f.t === "forget") return { t: "forgotten", req: f.req };
+		if (f.t !== "set") throw new Error("unexpected request");
+		const req = Buffer.from(f.req).toString("hex");
+		sent.push(req);
+		if (!firstReq) {
+			firstReq = req;
+			stored = { file: f.file, seq: ++seq, pathkey: f.pathkey, record: f.record, deleted: null, version: null };
+			throw new Error("lost answer");
+		}
+		if (req === firstReq) return { t: "ok", req: f.req, seq: stored!.seq };
+		assert.equal(f.base, stored!.seq);
+		void active.row({ file: f.file, seq: ++seq, pathkey: f.pathkey, record: f.record, deleted: null, version: null });
+		return { t: "ok", req: f.req, seq };
+	};
+	await t.connect(ask, d.engine!); await t.ready(1); await t.notesCaughtUp();
+	disk.edit("one.md", "draft"); d.engine!.diskChanged("one.md"); await d.idle(); await t.idle();
+	assert.ok(stored); const doc = d.engine!.noteAt("one.md")!;
+	t.disconnect(); disk.files.set("two.md", disk.files.get("one.md")!); disk.files.delete("one.md");
+	d.engine!.diskRenamed("one.md", "two.md"); await d.idle();
+	d.crash(); active = await boot();
+	await active.connect(ask, d.engine!); await active.row(stored); await active.ready(seq);
+	await active.notesCaughtUp(); await active.idle();
+	assert.equal(active.notes.at("two.md")?.id, doc);
+	assert.equal(sent.length, 3); assert.equal(sent[0], sent[1]); assert.notEqual(sent[1], sent[2]);
+	assert.equal(disk.text("two.md"), "draft"); assert.equal(disk.text("one.md"), undefined);
+	assert.ok(![...d.data.keys()].some(k => /^table\/note-(request|change|forget)\//.test(k)));
+});
+
+test("table snapshots require complete text and capture unsaved typing under the confirmed path", async () => {
+	const { d, t } = await planner();
+	await d.engine!.startTableNoteFiles(false);
+	const collect = async () => {
+		const notes = [];
+		for await (const row of d.engine!.tableSnapshotNotes()) notes.push(row);
+		return notes;
+	};
+	await assert.rejects(collect, /Waiting for the text/);
+	await d.engine!.receive({ t: "live", entry: { doc: note.id, kind: "update", data: version("draft") } });
+	const editor = await d.engine!.open(note.id);
+	assert.ok(editor); editor.getText("t").insert(5, " typed");
+	assert.deepEqual(await collect(), [{ id: note.id, path: note.path, text: "draft typed" }]);
+	const snapshot = Buffer.from(Y.encodeSnapshot(Y.snapshot(editor))).toString("base64");
+	await t.notes.receive({ ...note, deleted: 1, seq: 2, snapshot });
+	await d.engine!.tableNoteChanged(note.id);
+	assert.deepEqual(await collect(), []);
+});
+
+test("a deleted row can be listed before its text arrives, but its preview and restore wait", async () => {
+	const { d, t, change } = await planner();
+	const state = version("still stored");
+	const doc = new Y.Doc(); Y.applyUpdate(doc, state);
+	const snapshot = Buffer.from(Y.encodeSnapshot(Y.snapshot(doc))).toString("base64");
+	doc.destroy();
+	await t.notes.receive({ ...note, seq: 2, deleted: Date.now(), snapshot });
+	await d.engine!.startTableNoteFiles(false);
+	const [entry] = await d.engine!.deletedNotes();
+	assert.equal(entry?.deletionSeq, 2);
+	assert.equal(await d.engine!.deletedText(note.id), undefined);
+	assert.equal(await d.engine!.restoreDeleted(note.id, undefined, 2), undefined);
+	assert.equal(change(note.id), undefined);
+	await d.engine!.receive({ t: "entry", seq: 1, entry: { doc: note.id, kind: "update", data: state } });
+	assert.equal(await d.engine!.deletedText(note.id), "still stored");
+	assert.equal(await d.engine!.restoreDeleted(note.id, undefined, 2), note.path);
+	assert.equal(change(note.id)?.t, "restore");
 });

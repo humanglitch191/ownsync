@@ -9,8 +9,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { VaultKeys, newRecovery, shortId, vaultIdOf } from "../src/keys";
 import { Transport, fetchRecords } from "../src/transport";
-import { hex, unhex, unpackPairing } from "../../protocol/ownsync";
-import { decodeServer, encodeClient } from "../../server/src/wire";
+import { hex, unhex, sha256, unpackPairing } from "../../protocol/ownsync";
 import { TableDisk } from "../src/tableDisk";
 import { TableSync } from "../src/tableSync";
 import { attachmentFs } from "./table-fs";
@@ -40,8 +39,15 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	const { fs,store } = attachmentFs(d.files,d.data);
 	const allowed = (p: string) => !p.startsWith(".") && !p.endsWith(".md");
 	const adapter: TableDisk = new TableDisk(fs,store,".private/table",allowed,b => table.hash(b),(h,n) => table.suffix(h,n));
-	const table = new TableSync(store,keys,adapter,allowed,overrides.attachments !== false,20*2**20,onProblem);
-	if (capable) d.overrides.tableNotes = table.notes;
+	const table = new TableSync(store,keys,adapter,allowed,overrides.attachments !== false,20*2**20,onProblem, id => { void d.engine!.tableNoteChanged(id); });
+	if (capable) {
+		d.overrides.tableNotes = table.notes;
+		d.overrides.tableHistory = table;
+		d.overrides.hash = async text => hex(await sha256(new TextEncoder().encode(text)));
+		d.overrides.noteDisk = new TableDisk(fs,store,".private/notes",p => !p.startsWith(".") && p.endsWith(".md"),
+			async b => hex(await sha256(b)),(h,n) => table.suffix(h,n),"table/note-fs");
+		d.overrides.onNoteChanges = ids => table.noteChanges(ids);
+	}
 	d.boot();
 	const link = new Transport(host, keys, d.engine!, {
 		attachments:capable ? table : undefined, tableCapable:async () => capable,
@@ -326,18 +332,32 @@ test("a live legacy vault migrates through the transport, then an updated peer d
 	const content = (s: string) => new TextEncoder().encode(s);
 	const val = (d: Device,p: string) => new TextDecoder().decode(d.files.get(p)?.content as Uint8Array | undefined);
 	old.d.write("legacy.png",content("before genesis"));
+	old.d.write("kept.md", "existing note"); old.d.write("removed.md", "legacy deleted text");
+	await until([old.d,a.d], () => disk(a.d)["removed.md"] === "legacy deleted text");
+	const kept = old.d.engine!.noteAt("kept.md")!, removed = old.d.engine!.noteAt("removed.md")!;
+	old.d.remove("removed.md");
+	await until([old.d,a.d], () => !a.d.files.has("removed.md"));
 	await until([old.d,a.d],() => val(a.d,"legacy.png") === "before genesis");
 	assert.equal(a.d.engine!.tableActive,false);
 	old.link.disconnect();
 	await migrateNow(host,hex(a.keys.vaultId));
 	await until([a.d],() => a.d.data.has("table/initialized"));
 	assert.equal(a.d.engine!.tableActive,true);
+	await until([a.d], () => a.d.engine!.tableNotesReady);
+	assert.equal(a.table.notes.at("kept.md")?.id, kept);
+	assert.ok(a.table.notes.get(removed)?.vector);
 	const b = await device("joining",vault,key,opts,undefined,undefined,true);
 	await b.link.connect();
 	await until([a.d,b.d],() => val(b.d,"legacy.png") === "before genesis");
 	b.d.write("legacy.png",content("after genesis"));
 	await b.table.event({kind:"changed",path:"legacy.png"});
 	await until([a.d,b.d],() => val(a.d,"legacy.png") === "after genesis");
+	assert.equal(b.d.engine!.noteAt("kept.md"), kept);
+	b.d.rename("kept.md", "moved.md");
+	await until([a.d,b.d], () => disk(a.d)["moved.md"] === "existing note");
+	assert.equal(a.table.notes.at("moved.md")?.id, kept);
+	b.d.remove("moved.md");
+	await until([a.d,b.d], () => !!a.table.notes.get(kept)?.snapshot && !a.d.files.has("moved.md"));
 	a.d.write("migration-note.md","still text");
 	await until([a.d,b.d],() => b.d.files.get("migration-note.md")?.content === "still text");
 	a.d.remove("legacy.png"); await a.table.event({kind:"deleted",path:"legacy.png"});
@@ -377,30 +397,61 @@ test("table note rows bind the placed document and typing crosses the encrypted 
 	a.d.write(path, "shared initial text");
 	await until([a.d,b.d], () => b.d.files.get(path)?.content === "shared initial text");
 	const id = a.d.engine!.noteAt(path)!;
-	// The disk planner will propose this row in the next part. Here both devices already
-	// have an agreed local file, and the Worker supplies its binding independently of text.
-	const row = await a.table.wireNote({ kind: "note", file: "1a".repeat(16), path, id, seq: 1, deleted: null });
-	const ws = new WebSocket(host.replace("http:", "ws:") + "/vault/" + hex(a.keys.vaultId));
-	ws.binaryType = "arraybuffer";
-	const next = () => new Promise<MessageEvent>(resolve => ws.addEventListener("message", resolve, { once: true }))
-		.then(e => decodeServer(new Uint8Array(e.data as ArrayBuffer)));
-	try {
-		await new Promise<void>((resolve,reject) => { ws.onopen = () => resolve(); ws.onerror = reject; });
-		ws.send(encodeClient({t:"hello",token:await a.keys.token()}));
-		const format = next(); ws.send(encodeClient({t:"table"}));
-		assert.deepEqual(await format, {t:"format",table:true});
-		const req = new Uint8Array(16), answer = next();
-		ws.send(encodeClient({t:"set", file:row.file, req, base:null, version:null, expectedChunks:null, pathkey:row.pathkey, record:row.record}));
-		assert.deepEqual(await answer, {t:"ok", req, seq:1});
-		await until([a.d,b.d], () => a.d.engine!.isTableNote(id) && b.d.engine!.isTableNote(id));
+	await until([a.d,b.d], () => !!a.table.notes.at(path) && !!b.table.notes.at(path));
+	const seq = a.table.notes.at(path)!.seq;
+	{
 		const x = await a.d.engine!.open(id), y = await b.d.engine!.open(id);
 		assert.ok(x && y);
 		x.getText("t").insert(0, "live ");
 		await until([a.d,b.d], () => y.getText("t").toString() === "live shared initial text");
-		assert.equal(a.table.notes.at(path)?.seq, 1);
-		assert.equal(b.table.notes.at(path)?.seq, 1);
+		assert.equal(a.table.notes.at(path)?.seq, seq);
+		assert.equal(b.table.notes.at(path)?.seq, seq);
 		assert.deepEqual([...a.problems,...b.problems,...a.d.problems,...b.d.problems], []);
-	} finally { ws.close(); }
+	}
+});
+
+test("a notes-only device restores the selected deletion across a rotation and keeps the occupied name", async () => {
+	const vault = "table-restore";
+	const full = await device("full", vault, key, {}, undefined, undefined, true);
+	await full.link.connect();
+	await until([full.d], () => full.table.caughtUp);
+	const peer = await device("reader", vault, key, { attachments: false }, undefined, undefined, true);
+	await peer.link.connect();
+	const ds = [full.d, peer.d], path = "draft.md", restored = "draft (restored).md";
+	await until(ds, () => peer.link.status === "synced" && peer.table.caughtUp);
+	full.d.write(path, "first document"); full.d.write("image.png", new Uint8Array([1,2,3]));
+	await full.table.event({ kind: "changed", path: "image.png" });
+	await until(ds, () => peer.d.files.get(path)?.content === "first document");
+	await full.table.idle();
+	const id = peer.d.engine!.noteAt(path)!;
+	assert.equal(await peer.table.snapshotAttachments(), undefined);
+	assert.deepEqual((await full.table.snapshotAttachments())?.map(v => [v.path, v.ref.n]), [["image.png", 3]]);
+	assert.ok(!peer.d.files.has("image.png"));
+	full.d.remove(path);
+	await until(ds, () => peer.table.notes.get(id)?.deleted != null && !peer.d.files.has(path));
+	const [deletion] = await peer.d.engine!.deletedNotes();
+	assert.equal(deletion?.id, id);
+	assert.equal(await peer.d.engine!.deletedText(id), "first document");
+	full.d.write(path, "different document");
+	await until(ds, () => peer.d.files.get(path)?.content === "different document");
+	assert.equal(await peer.d.engine!.restoreDeleted(id, undefined, deletion!.deletionSeq), restored);
+	await until(ds, () => ds.every(d => d.files.get(restored)?.content === "first document"));
+	assert.equal(full.d.engine!.noteAt(restored), id);
+	assert.notEqual(full.d.engine!.noteAt(path), id);
+	peer.d.remove(restored);
+	await until(ds, () => peer.table.notes.get(id)?.deleted != null && !full.d.files.has(restored));
+	assert.equal(await peer.d.engine!.restoreDeleted(id, undefined, deletion!.deletionSeq), undefined);
+	await full.keys.remove(peer.keys.me.id); full.link.offer();
+	await until(ds, () => peer.link.status === "removed" && full.keys.epoch === 1 && !full.keys.state.resnapshot);
+	const p = unpackPairing(full.keys.pairingPayload()!);
+	const keys = await VaultKeys.fresh(vault, memoryPorts(), {}, new Map([[p.epoch, p.vmk]]),
+		{ number: p.number, hash: p.hash, pairedBy: p.pairerId });
+	const joined = await device("new", vault, key, { attachments: false }, keys, undefined, true);
+	await joined.link.connect();
+	await until([full.d, joined.d], () => joined.link.status === "synced" && joined.d.files.get(path)?.content === "different document");
+	assert.equal(await joined.d.engine!.deletedText(id), "first document");
+	assert.ok(!joined.d.files.has("image.png"));
+	assert.deepEqual([...full.problems, ...peer.problems, ...joined.problems, ...ds.flatMap(d => d.problems), ...joined.d.problems], []);
 });
 
 test("the Worker's storage holds no note text, attachment content, file names, folder names or vault names", () => {
