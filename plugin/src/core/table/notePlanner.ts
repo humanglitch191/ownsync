@@ -576,7 +576,7 @@ function receiveRow(s: VaultNoteState, row: NoteRow, env: StepEnv) {
 		file: row.file,
 		editor: "closed",
 	};
-	next = { ...next, row, legacy: undefined };
+	next = { ...next, row };
 	if (next.inFlight?.accepted !== undefined && next.inFlight.accepted <= row.seq) {
 		const req = next.inFlight.req;
 		const finishedAction = next.inFlight.action;
@@ -1122,6 +1122,14 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 		let n = s.notes.get(id);
 		if (!n) continue;
 
+		if (n.legacy && n.row) {
+			// Catch-up can commit the row and restart before the first inventory.
+			// Keep the holder's legacy name until settlement can report the choice.
+			if (n.legacy.t === "set" && n.legacy.path !== n.row.path && desiredPath(n) === n.row.path)
+				actions.push({ t: "problem", path: n.legacy.path, message: `Migration kept the table name "${n.row.path}" for this note.` });
+			n = { ...n, legacy: undefined };
+			setEntry(s, n);
+		}
 		if (n.legacy && !n.row && s.listingComplete) {
 			const doc = s.docs.get(id);
 			const path = n.legacy.path;
@@ -1497,6 +1505,11 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 	const sorted = [...s.notes.values()].sort((a, b) => a.id.localeCompare(b.id));
 
 	const declinedIncoming = new Set(s.brakePaused?.declined ? (s.brakePaused.declinedIds ?? []) : []);
+	const placementPath = (n: NoteEntry) => {
+		const want = desiredPath(n);
+		const confirmed = want && s.rowsByPath.get(want);
+		return confirmed && confirmed !== n.id ? undefined : want;
+	};
 
 	// P1: Remove live disk files for confirmed tombstones (held when brake declined).
 	for (const n of sorted) {
@@ -1518,7 +1531,7 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 	// P2: Move placed files whose desired path moved to a free path (run before vacating occupants).
 	for (const n of sorted) {
 		if (!n.diskPath || n.held || n.editor === "open" || s.blocked.has(n.id) || n.row?.deleted != null) continue;
-		const want = desiredPath(n);
+		const want = placementPath(n);
 		if (!want || want === n.diskPath) continue;
 		if (isDirty(s, n.diskPath) || isDirty(s, want)) continue;
 		if (s.byPath.has(want) || s.observed.has(want) || caseClashPath(s, want)) continue;
@@ -1547,7 +1560,9 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 			continue;
 		}
 		const ownerId = s.byPath.get(want);
-		if (ownerId && ownerId !== n.id) {
+		// Only a confirmed claimant can displace a placed file. Two outstanding
+		// creates can request the same path while their answers are in flight.
+		if (ownerId && ownerId !== n.id && s.rowsByPath.get(want) === n.id) {
 			const owner = s.notes.get(ownerId)!;
 			if (owner.editor === "open" || owner.held || declinedIncoming.has(noteDeletionKey(owner, true)) || s.blocked.has(ownerId) || isDirty(s, want)) continue;
 			if (owner.row?.deleted === null && owner.row.path === want) continue;
@@ -1575,7 +1590,7 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 	for (const n of writeOrder) {
 		if (n.editor === "open" || n.held || s.blocked.has(n.id) || n.row?.deleted != null) continue;
 		if (n.inFlight && !n.diskPath) continue; // unplaced local create waits for row/text gating if needed
-		const want = desiredPath(n);
+		const want = placementPath(n);
 		if (!want || isDirty(s, want)) continue;
 		if (!n.diskPath && (s.byPath.has(want) || s.observed.has(want) || caseClashPath(s, want))) continue;
 		if (n.diskPath && n.diskPath !== want) continue;

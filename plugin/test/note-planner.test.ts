@@ -346,6 +346,36 @@ test("unreadable files and incomplete listings never delete; remote rename moves
 	assert.equal(s.notes.get(idB)?.diskPath, "a.md");
 });
 
+test("pending creates at a reused path wait for confirmed ownership before displacing the file", () => {
+	const env = makeEnv(), path = "note.md";
+	const write = (state: VaultNoteState, text: string) => runStep(state, {
+		t: "diskObs", event: "changed", path, listingComplete: true, files: new Map([[path, obsFile(path,text)]])
+	}, env).state;
+	const ackText = (state: VaultNoteState, id: string) => runStep(state, {
+		t: "yjsUpdate", id, docState: state.docs.get(id)!, isFirstTextAck: true
+	}, env).state;
+	let s = write(emptyVaultNoteState(), "first");
+	const a = s.byPath.get(path)!;
+	s = ackText(s, a);
+	s = runStep(s, { t: "diskObs", event: "deleted", path, files: new Map(), listingComplete: true }, env).state;
+	s = write(s, "second");
+	const b = s.byPath.get(path)!;
+	assert.notEqual(a,b);
+	s = ackText(s,b);
+	assert.equal(s.notes.get(a)?.inFlight?.path,path);
+	assert.equal(s.notes.get(b)?.inFlight?.path,path);
+	assert.equal(s.intent,undefined);
+
+	// A's row arrives before either request's answer. B must not move back
+	// into the newly freed path while its old request still names it.
+	s = runStep(s,{t:"row",row:{kind:"note",id:a,file:s.notes.get(a)!.file,path,seq:1,deleted:null}},env).state;
+	const park = s.intent;
+	assert.ok(park?.kind === "move" && park.park && park.id === b);
+	s = runStep(s,{t:"intentDone",intent:park,outcome:"applied",after:obsFile(park.path,"second")},env).state;
+	assert.equal(s.notes.get(b)?.diskPath,park.path);
+	assert.ok(!s.intent || s.intent.id !== b);
+});
+
 test("mass-change deletion brake: approval lasts until zero deletes; decline undoes local and holds remote", () => {
 	const env = makeEnv(80, { brake: { minCount: 2, minFraction: 0.25 } });
 	let s = emptyVaultNoteState();

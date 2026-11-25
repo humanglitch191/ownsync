@@ -595,3 +595,45 @@ test("a holder repairs a note omitted from genesis with its complete body, then 
 		assert.ok(d.problems.some(p=>p.includes(note.path)));
 	} finally { worker.destroy(); index.destroy(); doc.destroy(); d.crash(); }
 });
+
+test("a three-name legacy gap keeps the table name and tells the holder both names once", async () => {
+	const { LegacyProjection, legacyBases } = await import("../src/core/table/migration");
+	const index = new Y.Doc(), projection = new LegacyProjection(), updates: Uint8Array[] = [];
+	const d = new Device("holder",new Server(),rng(28)), disk = new Files();
+	try {
+		index.on("update", u => updates.push(u));
+		for (const p of ["before.md","middle.md","after.md"]) index.getMap("notes").set(note.id,{p});
+		for (const n of [0,2]) projection.applyIndex({doc:"index",kind:"update",data:updates[n]!});
+		const body = version("keep my text");
+		projection.applyDocument({doc:note.id,kind:"snapshot",data:body});
+		assert.ok(projection.gaps().includes("after.md"));
+		const {row} = (await projection.noteRows(key,0).next()).value!;
+		assert.equal(row.path,"before.md");
+
+		d.data.set("index",Y.encodeStateAsUpdate(index));
+		d.data.set("state:"+note.id,body);
+		d.data.set("note:"+note.id,{diskPath:"after.md",baseHash:hash(enc.encode("keep my text"))});
+		disk.edit("after.md","keep my text");
+		const {store} = attachmentFs(d.files,d.data);
+		await store.commit(await legacyBases(store,key),[]);
+		const boot = async () => {
+			const t = table(d);
+			d.overrides = {tableNotes:t.notes,noteDisk:disk};
+			d.boot(); await d.idle();
+			return t;
+		};
+		const first = await boot();
+		await first.notes.input({t:"row",row,catchUp:true});
+		d.crash(); // row durable, but the local inventory has not run
+		const returning = await boot();
+		await returning.notes.input({t:"row",row,catchUp:true});
+		await d.engine!.initializeNoteFiles(false);
+		await returning.notes.input({t:"recheck"});
+		assert.equal(returning.notes.state!.notes.get(note.id)?.inFlight,undefined);
+		assert.deepEqual([...disk.files.keys()],["before.md"]);
+		assert.equal(disk.text("before.md"),"keep my text");
+		assert.equal(d.problems.length,1);
+		assert.match(d.problems[0]!,/after\.md/);
+		assert.match(d.problems[0]!,/before\.md/);
+	} finally { projection.close(); index.destroy(); d.crash(); }
+});

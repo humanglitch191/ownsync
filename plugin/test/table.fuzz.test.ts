@@ -294,6 +294,9 @@ test("the oracle rejects orphan-only bytes, a divergent disk and byte-identical 
 });
 
 const seed = process.env.FUZZ_SEED;
+test("the note fuzz oracle checks a held edit and converges after the user renames its conflict copy", { skip: !!seed || !!process.env.FUZZ_FIRST }, async () => {
+	await runNoteSeed(64,"held conflict");
+});
 const regressions = [2728545, 2747157, 2781512, 2808104, 2833507, 2845892, 2860885, 3145936];
 test("table fuzz: regression seeds", { skip: !!seed || !!process.env.FUZZ_FIRST }, async () => {
 	for (const n of regressions) await run(n,250);

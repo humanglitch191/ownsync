@@ -9,6 +9,7 @@ import type { NoteRow } from "../src/core/table/notes";
 import type { VaultKeys } from "../src/keys";
 import { TableDisk } from "../src/tableDisk";
 import { TableSync } from "../src/tableSync";
+import type { VaultNoteState } from "../src/core/table/notePlanner";
 import { Crashed, Device, Server, quiesce, rng } from "./sim";
 import { attachmentFs } from "./table-fs";
 import { enc, hash } from "./table-sim";
@@ -21,7 +22,12 @@ type Effect = "writeTemp" | "installTemp" | "moveIf" | "removeIf";
 interface Peer { d: Device; sync: TableSync; cursor: number; lose: boolean; fault?: { effect: Effect; side: Side } }
 
 export const noteCoverage = { migrated: 0, copiedJoins: 0, lostAnswers: 0, replays: 0, offlineMoves: 0,
-	liveRenames: 0, deleteEdits: 0, restoreEdits: 0, crashes: {} as Record<string, number> };
+	liveRenames: 0, deleteEdits: 0, restoreEdits: 0, heldNotices: 0, crashes: {} as Record<string, number> };
+
+function unresolvedCopies(state: VaultNoteState, id: string) {
+	return [...state.notes.values()].filter(n => n.copyOf === id && n.conflictOriginPath !== undefined
+		&& (!n.diskPath || n.diskPath === n.conflictOriginPath) && n.row?.deleted == null && n.change?.t !== "del");
+}
 
 // Note branch of the Worker's CAS. Keep every committed envelope for live delivery;
 // since() after reconnect returns only each file's latest row, in sequence order.
@@ -71,7 +77,7 @@ class NoteWorker {
 	}
 }
 
-export async function runNoteSeed(seed: number, steps: number) {
+export async function runNoteSeed(seed: number, steps: number | "held conflict") {
 	const random = rng(seed), pick = <T>(xs: T[]) => xs[Math.floor(random() * xs.length)]!;
 	const server = new Server(), worker = new NoteWorker(server), peers: Peer[] = [], log: string[] = [];
 	const required = new Set<string>();
@@ -90,14 +96,21 @@ export async function runNoteSeed(seed: number, steps: number) {
 	}
 	function configure(p: Peer) {
 		const d = p.d;
-		d.afterCommit = puts => {
+		const { fs, store } = attachmentFs(d.files, d.data);
+		const commit = store.commit.bind(store);
+		store.commit = async (puts, deletes) => {
+			await commit(puts, deletes);
+			// Capture inherited markers on the planner commit that creates the copy.
 			for (const [k, v] of puts) {
 				if (!k.startsWith("table/note-state/")) continue;
 				const id = k.slice("table/note-state/".length), parent = (v as {copyOf?: string}).copyOf;
-				if (parent && !copied.has(id)) copied.set(id, { parent, markers: markers(d.storedText(id)) });
+				if (parent && puts.has("state:" + id) && !copied.has(id)) {
+					const source = markers(d.storedText(parent));
+					const inherited = [...markers(d.storedText(id))].filter(marker => source.has(marker));
+					copied.set(id, { parent, markers: new Set(inherited) });
+				}
 			}
 		};
-		const { fs, store } = attachmentFs(d.files, d.data);
 		// The adapter's visible filesystem changes also wake Obsidian's planner.
 		const rename = fs.rename.bind(fs), copy = fs.copy.bind(fs);
 		fs.rename = async (from,to) => {
@@ -132,6 +145,15 @@ export async function runNoteSeed(seed: number, steps: number) {
 				if (d.alive) d.problems.push(what + ": " + e);
 			});
 		Object.assign(d.overrides, { noteDisk: disk, tableNotes: sync.notes, tableHistory: sync, onNoteWork: () => sync.noteWork() });
+		d.overrides.onProblem = (path, err) => {
+			if (err instanceof Crashed) return;
+			const state = sync.notes.state, id = state?.byPath.get(path);
+			if (err instanceof Error && err.message === path + " has an unresolved conflict copy; resolve it to keep syncing this note's outside edits"
+				&& state && id && state.notes.get(id)?.held && unresolvedCopies(state,id).length === 1
+				&& typeof d.files.get(path)?.content === "string" && state.observed.get(path)?.text === d.files.get(path)!.content) {
+				noteCoverage.heldNotices++;
+			} else d.problems.push(path + ": " + err);
+		};
 	}
 	function add(d = device()) {
 		const p = { d, cursor: 0, lose: false } as Peer;
@@ -184,6 +206,27 @@ export async function runNoteSeed(seed: number, steps: number) {
 	};
 	async function check() {
 		await drain();
+		// A held edit needs an explicit user decision before all disks can agree.
+		// Keep the copy under a fresh name and run the ordinary convergence oracle.
+		const resolved = new Set<string>();
+		for (;;) {
+			let acted = false;
+			for (const p of peers) {
+				const state = p.sync.notes.state!, held = [...state.notes.values()].find(n => n.held);
+				if (!held) continue;
+				assert.ok(held.diskPath && p.d.files.has(held.diskPath), "held edit lost its disk file");
+				assert.equal(p.d.files.get(held.diskPath)!.content,state.observed.get(held.diskPath)?.text);
+				const copies = unresolvedCopies(state,held.id);
+				assert.equal(copies.length,1);
+				const copy = copies[0]!;
+				assert.ok(copy.diskPath && p.d.files.has(copy.diskPath) && !resolved.has(copy.id), "held copy cannot be resolved");
+				resolved.add(copy.id);
+				p.d.rename(copy.diskPath,nextPath("resolved"));
+				await drain();
+				acted = true;
+			}
+			if (!acted) break;
+		}
 		const docs = new Map<string,Y.Doc>(), rows = new Map<string, NoteRow>();
 		try {
 			for (const row of worker.rows.values()) {
@@ -287,6 +330,23 @@ export async function runNoteSeed(seed: number, steps: number) {
 		for (const [path,file] of a.d.files) if (visible(path)) joined.d.files.set(path,structuredClone(file));
 		await wire(joined); await drain();
 		assert.equal(joined.d.engine!.noteAt("draft.md"),id); noteCoverage.copiedJoins++;
+		if (steps === "held conflict") {
+			const notices = noteCoverage.heldNotices;
+			for (const local of [token(),token()]) {
+				await write(a,"draft.md");
+				// The outside save lands before its watcher fires; B receives the
+				// remote edit while its last agreed bytes are still the old ones.
+				const file = b.d.files.get("draft.md")!;
+				assert.equal(typeof file.content,"string");
+				b.d.files.set("draft.md",{ content: file.content + local, mtime: file.mtime + 1 });
+				await drain();
+				b.d.engine!.diskChanged("draft.md"); await drain();
+			}
+			assert.equal(b.sync.notes.state!.notes.get(id)?.held,true);
+			assert.equal(noteCoverage.heldNotices,notices + 1);
+			await check(); // resolve the first copy and verify all three texts on every disk
+			return;
+		}
 		const sharedPath = "independent.md";
 		await write(a,sharedPath); await write(b,sharedPath);
 		const firstId = a.d.engine!.noteAt(sharedPath), secondId = b.d.engine!.noteAt(sharedPath);
