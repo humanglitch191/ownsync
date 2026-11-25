@@ -283,35 +283,3 @@ test("a deleted attachment whose head is old-style is listed and restored, thoug
 	await nextDay(server, devs);
 	for (const d of devs) assert.deepEqual(missingChunks(server, d), []);
 });
-
-test("of two identical attachments at one path, both versions stay until a new one replaces them, then both are cleaned up", async () => {
-	const { server, devs } = world();
-	const [a, b] = devs as [Device, Device];
-	await quiesce(devs);
-	a.disconnect();
-	a.write("p.png", bytes(PIC));
-	b.write("p.png", bytes(PIC));
-	await quiesce(devs);
-	a.connect();
-	await quiesce(devs);
-	assert.deepEqual(disk(a), { "p.png": PIC });
-	assert.deepEqual(disk(b), disk(a));
-	await nextDay(server, devs);
-	await nextDay(server, devs);
-	// The dropped one's version moved into the kept one: both current, nothing to clean up.
-	assert.equal(server.cleanUp(0, server.clock), 0);
-	a.write("p.png", bytes(PIC2));
-	await quiesce(devs);
-	assert.deepEqual(disk(b), { "p.png": PIC2 });
-	await nextDay(server, devs);
-	await nextDay(server, devs);
-	assert.equal(server.cleanUp(0, server.clock), 2 * Math.ceil(PIC.length / 4)); // each upload's own scoped chunks
-	for (const d of devs) assert.deepEqual(missingChunks(server, d), []);
-	const c = new Device("d2", server, rng(9));
-	c.overrides = { ...SCOPED };
-	c.boot();
-	c.connect();
-	await quiesce([a, b, c]);
-	assert.deepEqual(disk(c), disk(a));
-	noProblems([a, b, c]);
-});

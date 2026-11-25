@@ -36,9 +36,6 @@
 //     made concurrently both stay in the document. The first keeps the attachment; each other one becomes
 //     an attachment of its own named "(conflict …)", under an ID the version carries, so every device that
 //     splits them makes the same copy.
-//   - Attachments claiming one path with exactly the same content are one file: the smallest ID keeps it, and
-//     the others' versions move into it before they are deleted, so a version that replaces it meanwhile
-//     elsewhere still leaves theirs as a copy. Identical bytes never make a "(conflict …)" copy.
 //   - At startup, an attachment is matched to a file by exact content only.
 //   - From 0.2.0 a version's chunks can be its own (Ref.s, DESIGN.md section 10), so the owner can remove old
 //     versions on the dashboard (Clean up). Every device reports which versions stop or start being current, and
@@ -769,7 +766,10 @@ export class Engine {
 	}
 
 	private async storedText(id: string): Promise<string | undefined> {
-		const state = await this.state(id);
+		return this.textFrom(await this.state(id));
+	}
+
+	private textFrom(state: Uint8Array | undefined): string | undefined {
 		if (!state) return undefined;
 		const doc = this.load(state);
 		const text = doc.getText("t").toString();
@@ -799,7 +799,11 @@ export class Engine {
 		const after = Y.encodeStateAsUpdate(doc); // also drops the content of deleted text
 		doc.destroy();
 		this.touched.add(id);
-		if (changed && !fromDisk && before && this.metaOf(id).baseHash !== undefined && !(await this.read(`base:${id}`))) this.put(`base:${id}`, before);
+		const m = this.metaOf(id);
+		// A first write interrupted before agreement can already be on disk. Keep the text it wrote
+		// when a remote edit advances the document, just as for an agreed file.
+		if (changed && !fromDisk && before && (m.baseHash !== undefined || (m.writing && isNote(m.diskPath ?? ""))) &&
+			!(await this.read(`base:${id}`))) this.put(`base:${id}`, before);
 		this.put(`state:${id}`, after);
 		if (local) return this.send(id, update);
 		const open = this.opened.get(id);
@@ -1197,10 +1201,7 @@ export class Engine {
 			await this.takeFile(id, m.diskPath, seen, open ? "doc" : mode);
 		}
 		await this.resurrect(id);
-		if (this.isAttachment(id)) {
-			await this.split(id);
-			await this.dropDuplicates(id);
-		}
+		if (this.isAttachment(id)) await this.split(id);
 
 		// 2. Put the file where the index says the note lives.
 		const want = this.effectivePath(id);
@@ -1326,9 +1327,20 @@ export class Engine {
 		const text = await this.disk.read(path);
 		const hash = await this.opts.hash(text);
 		if ((await this.text(id)) === text) return this.agree(id, file, hash);
-		// The engine stopped before writing this note's first file here, and another file was put here since: not
-		// this note's, so not an edit of it. Step 3 makes room for the note, taking that file in as a note of its own.
-		if (m.writing && m.baseHash === undefined) return this.forget(id);
+		if (m.writing && m.baseHash === undefined) {
+			// A remote edit may have arrived after the first write landed. Its base is the
+			// text we meant to write. An unrelated file at the old path belongs to the user.
+			if (this.textFrom(await this.read<Uint8Array>(`base:${id}`)) !== text) {
+				await this.forget(id);
+				if (path !== this.effectivePath(id) && await this.disk.stat(path)) {
+					const other = await this.takeUnknown(path);
+					if (other) this.deferred.add(other);
+				}
+				return;
+			}
+			m.baseHash = hash;
+			m.writing = undefined;
+		}
 		if (hash === m.baseHash || mode !== "merge") {
 			// Same text as last agreed, or an editor's older save: the document is ahead and will be written.
 			Object.assign(m, { mtime: file.mtime, size: file.size });
@@ -1537,38 +1549,6 @@ export class Engine {
 		const m = this.metaOf(id);
 		if (m.baseHash !== undefined && m.baseHash !== first.h && !(await this.read(`base:${id}`))) this.put(`base:${id}`, state); // the file now owes a write
 		await this.merge(id, update, true, true);
-	}
-
-	/**
-	 * Attachments claiming one path with exactly the same content are one file, not a conflict: the smallest ID keeps
-	 * it (on every device alike), so no "(conflict …)" copy is made of identical bytes. Each other one's versions move
-	 * into the one kept, beside its own, and the other is deleted. Identical versions side by side are one content
-	 * (split leaves them be), and a new version replaces them all at once (publish). But if a device that hasn't seen
-	 * this replaces the kept version meanwhile, the moved one is still there, and split makes it a copy: identical
-	 * now is no promise the kept one stays so, and its content must not go with the deleted one.
-	 */
-	private async dropDuplicates(id: string): Promise<void> {
-		const v = this.notes.get(id), group = v && v.d === undefined ? this.places().groups.get(v.p) : undefined;
-		if (!group || group.length < 2) return;
-		const kept = new Map<string, string>(); // content → the attachment keeping it
-		for (const other of [...group].sort()) {
-			if (await this.read(`up:${other}`)) continue; // its file is ahead of the vault here
-			const state = await this.state(other);
-			if (!state) continue;
-			const doc = this.load(state), refs = doc.getArray<Ref>("v").toArray(), hs = new Set(refs.map((r) => r.h));
-			doc.destroy();
-			if (hs.size !== 1) continue; // no content yet, or versions still to split
-			const h = [...hs][0]!, keeper = kept.get(h);
-			if (!keeper) { kept.set(h, other); continue; }
-			const into = this.load(await this.state(keeper), this.clientId), to = into.getArray<Ref>("v"), before = Y.encodeStateVector(into);
-			const have = new Set(to.toArray().map((r) => r.u));
-			into.transact(() => { for (const r of refs) if (!have.has(r.u)) to.push([r]); });
-			const update = Y.encodeStateAsUpdate(into, before);
-			into.destroy();
-			await this.merge(keeper, update, true, true);
-			await this.tombstone(other);
-			if (other !== id) this.deferred.add(other); // its file goes too
-		}
 	}
 
 	/** Step 3 for an attachment: make the file the vault's version, once all of it is here. */
