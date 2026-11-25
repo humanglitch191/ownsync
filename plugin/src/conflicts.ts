@@ -1,9 +1,14 @@
 import { type App, type EventRef, Modal, Notice, TFile } from "obsidian";
 
-import { conflictOriginal } from "./core/conflictPath";
-export { conflictOriginal } from "./core/conflictPath";
-
+const COPY = /^(.*) \(conflict [0-9a-f]{6}\)(\.[^./]*)?$/;
 const IMAGE = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
+
+/** The engine's conflictName() in reverse: the path this copy was made from, or null if it is not a copy. A copy of a copy gives the first copy. */
+export function conflictOriginal(path: string): string | null {
+	if (path.endsWith(".md")) return null;
+	const m = COPY.exec(path);
+	return m ? m[1]! + (m[2] ?? "") : null;
+}
 
 export interface ConflictHost {
 	app: App;

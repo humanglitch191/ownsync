@@ -36,12 +36,9 @@
 //     made concurrently both stay in the document. The first keeps the attachment; each other one becomes
 //     an attachment of its own named "(conflict …)", under an ID the version carries, so every device that
 //     splits them makes the same copy.
-//   - Equal content at one claimed path shares one file. A split child's own suffix identifies its original
-//     claim. The smallest ID represents each content; hidden members keep their documents and scoped chunks.
-//   - The device carries the hidden members it sees along with a rename or deletion. A save records their
-//     IDs and versions before uploading. Publication checks them at the edited file's current claim.
-//   - A user deletion has one Recently deleted entry for the group. A replacement retires observed members
-//     quietly. A restore can use any available member of the deleted group.
+//   - Attachments claiming one path with exactly the same content are one file: the smallest ID keeps it, and
+//     the others' versions move into it before they are deleted, so a version that replaces it meanwhile
+//     elsewhere still leaves theirs as a copy. Identical bytes never make a "(conflict …)" copy.
 //   - At startup, an attachment is matched to a file by exact content only.
 //   - From 0.2.0 a version's chunks can be its own (Ref.s, DESIGN.md section 10), so the owner can remove old
 //     versions on the dashboard (Clean up). Every device reports which versions stop or start being current, and
@@ -54,13 +51,12 @@
 //     only with one of their snapshots. Edits built on it wait (inside Yjs) until then.
 
 import * as Y from "yjs";
-import { claimOf, conflictName } from "./conflictPath";
 import { applyText } from "./text";
 import type { ClientMsg, DeletedNote, Disk, DiskFile, DocId, Entry, Link, MarkState, Meta, NoteMeta, Ref, ServerMsg, SnapshotLedgerEntry, Store, Upload } from "./ports";
 
 const INDEX: DocId = "index";
 const REMOTE = "ownsync-remote"; // transaction origin for changes that didn't start on this device
-type IndexValue = { p: string; d?: string; t?: number; g?: string; r?: 1 };
+type IndexValue = { p: string; d?: string; t?: number };
 const SNAPSHOT_ID = /^[0-9a-f]{32}$/;
 const PART_HASH = /^[0-9a-f]{64}$/i;
 // Recently deleted lists at most this many notes, from at most this many days back (as local history keeps them).
@@ -155,6 +151,8 @@ function alike(a: Set<string>, b: Set<string>): number {
 	for (const u of a) if (b.has(u)) shared++;
 	return shared / Math.min(a.size, b.size) + shared / Math.max(a.size, b.size) / 1000;
 }
+// Before the extension, so a copy keeps its file type.
+const conflictName = (path: string, id: string) => path.replace(/(\.[^./]*)?$/, ` (conflict ${id.slice(0, 6)})$1`);
 /** Everything else is an attachment. Exactly Obsidian's rule, so a file is the same kind everywhere. */
 const isNote = (path: string) => path.endsWith(".md");
 
@@ -187,10 +185,8 @@ export class Engine {
 	private paceTimer: number | null = null;
 	private indexOut: Uint8Array[] = []; // this input's index changes, sent as one entry
 	private indexDirty = false;
-	/** A known hash means every version in the attachment agrees on its content. */
-	private heads = new Map<string, string | undefined>();
-	private priorPaths?: Map<string, string>; // before a change that can displace a suffix in another claim
-	private layout: { hidden: Map<string, string>; paths: Map<string, string>; owners: Map<string, string>; groups: Map<string, string[]> } | null = null;
+	/** Where every live note's file belongs, worked out from the index alone, so every device agrees. */
+	private layout: { paths: Map<string, string>; owners: Map<string, string>; groups: Map<string, string[]> } | null = null;
 	private claimed = new Map<string, number>(); // index path → how many live notes claim it
 	private shifted = new Map<string, Set<string>>(); // index path → notes this device moved onto or off it, this input
 	private link: Link | null = null;
@@ -249,7 +245,7 @@ export class Engine {
 				const was = change.oldValue as IndexValue | undefined, now = this.notes.get(id);
 				if (was && was.d === undefined) this.claimed.set(was.p, (this.claimed.get(was.p) ?? 1) - 1);
 				if (now && now.d === undefined) this.claimed.set(now.p, (this.claimed.get(now.p) ?? 0) + 1);
-				for (const v of [was, now]) if (v && (e.transaction.origin !== REMOTE || !isNote(v.p))) this.shift(id, v.p);
+				if (e.transaction.origin !== REMOTE) for (const p of new Set([was?.p, now?.p])) if (p !== undefined) this.shifted.set(p, (this.shifted.get(p) ?? new Set()).add(id));
 			}
 		});
 	}
@@ -277,8 +273,6 @@ export class Engine {
 			const index = await this.store.get<Uint8Array>("index");
 			if (index) Y.applyUpdate(this.index, index, REMOTE);
 			this.indexDirty = false;
-			this.shifted.clear(); // loading the saved index did not move any files; scan finds the actual changes
-			for (const [claim, members] of this.places().groups) if (!isNote(claim)) await this.readSharedHeads(members);
 			for (const [key, m] of await this.store.list<NoteMeta>("note:")) {
 				this.metas.set(key.slice(5), m);
 				if (m.diskPath) this.byPath.set(m.diskPath, key.slice(5));
@@ -377,15 +371,15 @@ export class Engine {
 	 * time with `deletedText`, so a phone never decodes them all at once.
 	 */
 	async deletedNotes(): Promise<DeletedNote[]> {
-		const deleted: DeletedNote[] = [], candidates: DeletedNote[] = [], listed = new Set<string>();
+		const deleted: DeletedNote[] = [], candidates: DeletedNote[] = [];
 		await this.run("list deleted notes", async () => {
 			const since = (this.opts.now?.() ?? Date.now()) - DELETED_DAYS * DAY_MS;
 			for (const [id, v] of this.notes) {
-				if (v.d === undefined || v.r || (this.notesOnly && !isNote(v.p))) continue;
+				if (v.d === undefined || (this.notesOnly && !isNote(v.p))) continue;
 				const deletedAt = Number.isSafeInteger(v.t) ? v.t : undefined;
 				if (deletedAt === undefined || deletedAt >= since) candidates.push({ id, path: v.p, deletedAt });
 			}
-			candidates.sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity) || a.id.localeCompare(b.id));
+			candidates.sort((a, b) => (b.deletedAt ?? -Infinity) - (a.deletedAt ?? -Infinity));
 		});
 		// A page at a time, as many as are still wanted. Whether Clean up removed an attachment's file only the Worker
 		// can say; offline, or with no answer, it is listed, and restoring it says so.
@@ -404,12 +398,7 @@ export class Engine {
 				for (let j = 0; j < all.length; j += MAX_MARK) answers.push(this.ask("ask", all.slice(j, j + MAX_MARK)));
 			});
 			const gone = new Set((await Promise.all(answers)).flatMap((missing) => missing ?? []));
-			for (const note of held) {
-				const v = this.notes.get(note.id);
-				if (!v || v.d === undefined || v.r || (v.g && listed.has(v.g)) || tags.get(note.id)?.some((tag) => gone.has(tag))) continue;
-				if (v.g) listed.add(v.g);
-				deleted.push(note);
-			}
+			for (const note of held) if (!tags.get(note.id)?.some((tag) => gone.has(tag))) deleted.push(note);
 		}
 		return deleted;
 	}
@@ -443,24 +432,10 @@ export class Engine {
 	 * "gone" (its file is no longer stored: nothing was restored), or "offline".
 	 */
 	async restoreAttachment(id: string): Promise<string | "gone" | "offline" | undefined> {
-		await this.idle();
-		const v = this.notes.get(id);
-		if (!v || v.d === undefined || v.r || this.notesOnly || isNote(v.p)) return;
-		const members = v.g ? [...this.notes].filter(([, other]) => other.d !== undefined && !other.r && other.g === v.g).map(([member]) => member).sort() : [id];
-		let result: "gone" | "offline" | undefined;
-		for (const member of members) {
-			const restored = await this.restoreMember(member, v.g);
-			if (restored && restored !== "gone" && restored !== "offline") return restored;
-			if (restored === "offline" || (restored === "gone" && !result)) result = restored;
-		}
-		return result;
-	}
-
-	private async restoreMember(id: string, group: string | undefined): Promise<string | "gone" | "offline" | undefined> {
 		let us: string[] = [], head: string | undefined, answer: Promise<string[] | undefined> | undefined, offline = false, ours = false;
 		await this.run(`check ${id}`, async () => {
 			const v = this.notes.get(id);
-			if (v?.d === undefined || v.r || v.g !== group || !(await this.state(id))) return;
+			if (v?.d === undefined || isNote(v.p) || this.notesOnly) return;
 			ours = true;
 			us = await this.scopedVersions(id);
 			if (!us.length) return; // chunks from before 0.2.0: never removed
@@ -474,14 +449,7 @@ export class Engine {
 		const answered = answer ? await answer : [], missing = answered && head !== undefined && answered.includes(head); // undefined: no answer
 		let restored: string | undefined;
 		await this.run(`restore ${id}`, async () => {
-			const v = this.notes.get(id);
-			if (missing === false && v?.d !== undefined && !v.r && v.g === group && head === await this.headTag(id)) {
-				if (group) for (const [member, other] of this.notes) {
-					// Restoring the file consumes its single history entry, even if this member is deleted again later.
-					if (member !== id && other.g === group && other.d !== undefined) this.notes.set(member, { ...other, r: 1 });
-				}
-				restored = await this.bringBack(id);
-			}
+			if (missing === false && this.notes.get(id)?.d !== undefined) restored = await this.bringBack(id);
 			// Not back: the check made its versions current on the Worker again, so they are retired again.
 			if (!restored) for (const u of us) if (!this.holders.has(u)) this.report(u, "deleted");
 		});
@@ -497,7 +465,6 @@ export class Engine {
 		}
 		// Publish the full state with an ack: live devices may no longer hold it, and an offline
 		// restore must keep it in the outbox. Compaction snapshots don't reach live devices.
-		if (!isNote(v.p)) await this.readHead(id);
 		this.send(id, state, "snapshot");
 		this.notes.set(id, { p: to });
 		await this.settle(id);
@@ -829,7 +796,6 @@ export class Engine {
 		let changed = false;
 		doc.on("update", () => (changed = true));
 		Y.applyUpdate(doc, update, REMOTE);
-		if (doc.share.has("v")) this.cacheHead(id, doc);
 		const after = Y.encodeStateAsUpdate(doc); // also drops the content of deleted text
 		doc.destroy();
 		this.touched.add(id);
@@ -852,84 +818,33 @@ export class Engine {
 		// Always save: an update that has to wait for one this device hasn't got yet changes nothing visible
 		// (and fires no event), but must not be forgotten once the cursor has moved past it.
 		this.indexDirty = true;
-		for (const id of touched) await this.readClaimHeads(id);
 		if (!this.meta.synced) return;
 		// A path gained or lost a claimant, so other notes' places may have changed too.
 		for (const [id, m] of this.metas) if (m.diskPath !== this.effectivePath(id)) touched.add(id);
 		for (const id of touched) await this.settle(id);
 	}
 
-	private shift(id: string, path: string): void {
-		if (!this.meta.synced && !isNote(path)) return; // the first scan adopts local files after catch-up
-		const claim = claimOf(id, path);
-		// A disappearing explicit suffix can also release a name allocated to another claim.
-		if (path.includes(" (conflict ") || (this.layout?.groups.get(claim)?.length ?? 0) > 1) this.priorPaths ??= this.layout?.paths;
-		this.shifted.set(claim, (this.shifted.get(claim) ?? new Set()).add(id));
-	}
-
-	private cacheHead(id: string, doc: Y.Doc): void {
-		const refs = doc.getArray<Ref>("v").toArray(), h = refs[0]?.h;
-		const head = refs.every((r) => r.h === h) ? h : undefined;
-		const previous = this.heads.get(id);
-		this.heads.set(id, head);
-		if (previous === head) return;
-		const v = this.notes.get(id);
-		if (v && v.d === undefined) this.shift(id, v.p);
-		this.layout = null;
-	}
-
-	private async readHead(id: string): Promise<void> {
-		const doc = this.load(await this.state(id));
-		this.cacheHead(id, doc);
-		doc.destroy();
-	}
-
-	/** Singletons need no comparison. A rename or a new index entry can make a cold singleton a group member. */
-	private async readClaimHeads(id: string): Promise<void> {
-		const v = this.notes.get(id);
-		if (v && v.d === undefined && !isNote(v.p)) await this.readSharedHeads(this.places().groups.get(claimOf(id, v.p))!);
-	}
-
-	private async readSharedHeads(members: string[]): Promise<void> {
-		if (members.length > 1) for (const id of members) if (!this.heads.has(id)) await this.readHead(id);
-	}
-
 	private places() {
 		if (this.layout) return this.layout;
-		const groups = new Map<string, string[]>(), shown = new Map<string, string[]>();
-		const add = (map: Map<string, string[]>, key: string, id: string) => {
-			const members = map.get(key);
-			if (members) members.push(id);
-			else map.set(key, [id]);
-		};
-		for (const [id, v] of this.notes) if (v.d === undefined) add(groups, claimOf(id, v.p), id);
-		const hidden = new Map<string, string>();
-		for (const [claim, members] of groups) {
-			const byHash = new Map<string, string>(), names = new Map<string, string>();
-			for (const id of members.sort()) {
-				const path = this.notes.get(id)!.p, h = this.heads.get(id);
-				const rep = h === undefined ? undefined : byHash.get(h);
-				if (rep !== undefined) {
-					hidden.set(id, rep);
-					if (path === claim) names.set(rep, claim);
-				} else {
-					names.set(id, path);
-					if (h !== undefined) byHash.set(h, id);
-				}
-			}
-			for (const [id, name] of names) add(shown, name, id);
+		const groups = new Map<string, string[]>(); // index path → the notes claiming it
+		for (const [id, v] of this.notes) {
+			if (v.d !== undefined) continue;
+			const g = groups.get(v.p);
+			if (g) g.push(id);
+			else groups.set(v.p, [id]);
 		}
+		// The smallest ID keeps the path; the others get a suffix, and again if that name is itself claimed.
 		const paths = new Map<string, string>(), owners = new Map<string, string>();
-		for (const [path, g] of shown) owners.set(path, g.sort()[0]!);
-		for (const path of [...shown.keys()].sort()) {
-			for (const id of shown.get(path)!.slice(1)) {
+		for (const [path, g] of groups) owners.set(path, g.sort()[0]!);
+		for (const path of [...groups.keys()].sort()) {
+			for (const id of groups.get(path)!.slice(1)) {
 				let name = conflictName(path, id);
 				while (owners.has(name)) name = conflictName(name, id);
 				owners.set(name, id);
 			}
 		}
 		for (const [path, id] of owners) paths.set(id, path);
-		return (this.layout = { paths, owners, groups, hidden });
+		return (this.layout = { paths, owners, groups });
 	}
 
 	private effectivePath(id: string): string | undefined {
@@ -958,12 +873,10 @@ export class Engine {
 	 * The note's file is at `path` now. That is a move by the user, to be recorded in the index, unless
 	 * `path` is simply where the index already puts the note (its own conflict-suffixed name included).
 	 */
-	private movedTo(id: string, path: string, file?: DiskFile, members = this.hiddenCopies(id)): void {
+	private movedTo(id: string, path: string, file?: DiskFile): void {
 		this.metaOf(id).writing = undefined; // a file of this note's was there to move: its write landed
 		this.place(id, path, file);
-		if (this.effectivePath(id) !== path) this.index.transact(() => {
-			for (const member of [id, ...members]) this.notes.set(member, { p: path });
-		});
+		if (this.effectivePath(id) !== path) this.notes.set(id, { p: path });
 	}
 
 	/**
@@ -980,7 +893,7 @@ export class Engine {
 
 	/** The note has no file on this device any more. */
 	private async forget(id: string): Promise<void> {
-		Object.assign(this.metaOf(id), { baseHash: undefined, mtime: undefined, size: undefined, owed: undefined, writing: undefined, removingHidden: undefined });
+		Object.assign(this.metaOf(id), { baseHash: undefined, mtime: undefined, size: undefined, owed: undefined, writing: undefined });
 		this.place(id, undefined);
 		this.del(`base:${id}`);
 		await this.dropUpload(id); // its content went with the file
@@ -1016,14 +929,6 @@ export class Engine {
 		const changed = new Map<string, string>(); // attachment → its path, where its file now has other content
 		for (const [path, id] of [...this.byPath]) {
 			const f = onDisk.get(path), m = this.metaOf(id);
-			if (!isNote(path) && (m.removingHidden || this.places().hidden.has(id))) {
-				if (f) todo.add(id);
-				else {
-					const owner = await this.missingHiddenFile(id, path);
-					if (owner) adrift.set(owner, []);
-				}
-				continue;
-			}
 			if (f && m.mtime === f.mtime && m.size === f.size) continue; // untouched
 			// An attachment changed in place is a new version of it. One that's gone is matched by exact content
 			// below; it is alike no file (no units).
@@ -1088,10 +993,9 @@ export class Engine {
 				if (h === m.baseHash) { moved.set(id, f.path); break; }
 			}
 		}
-		const followers = new Map([...adrift.keys()].map((id) => [id, this.hiddenCopies(id)]));
 		for (const id of adrift.keys()) this.place(id, undefined); // everyone out, then into their new places
 		for (const [id, path] of moved) {
-			this.movedTo(id, path, undefined, followers.get(id));
+			this.movedTo(id, path);
 			todo.add(id);
 		}
 		// A note with no file left was deleted, unless the document has an edit the file never showed.
@@ -1099,7 +1003,7 @@ export class Engine {
 			if (moved.has(id)) continue;
 			const pending = await this.ahead(id);
 			await this.forget(id);
-			if (!pending) await this.deleteFile(id, followers.get(id));
+			if (!pending) await this.tombstone(id);
 			todo.add(id);
 		}
 		// A file that is nobody's is a new note (or, on a device joining the vault, a note it already has).
@@ -1126,7 +1030,7 @@ export class Engine {
 			const owner = this.byPath.get(f.path);
 			if (owner !== undefined) {
 				const om = this.metaOf(owner);
-				if (this.places().hidden.has(owner) || owner === id || this.losing.has(owner) || this.opened.has(owner) || (om.mtime === f.mtime && om.size === f.size)) continue;
+				if (owner === id || this.losing.has(owner) || this.opened.has(owner) || (om.mtime === f.mtime && om.size === f.size)) continue;
 			}
 			let h = this.unknown.get(f.path);
 			if (h === undefined) {
@@ -1159,7 +1063,7 @@ export class Engine {
 			}
 			const pending = await this.ahead(id);
 			await this.forget(id);
-			if (!pending) await this.deleteFile(id);
+			if (!pending) await this.tombstone(id);
 		} finally {
 			this.losing.delete(id);
 		}
@@ -1230,36 +1134,29 @@ export class Engine {
 	 * one of them may now own it, or lose it. Nobody else claiming it, as for a new note, is the usual case.
 	 */
 	private regrouped(): string[] {
-		const ids = new Set<string>();
-		if (this.priorPaths) {
-			for (const [id, path] of this.places().paths) if (this.priorPaths.get(id) !== path) ids.add(id);
-			this.priorPaths = undefined;
-		}
+		const ids: string[] = [];
 		for (const [p, changed] of this.shifted) {
-			if (!isNote(p)) { for (const id of this.places().groups.get(p) ?? []) ids.add(id); }
-			else if ((this.claimed.get(p) ?? 0) > [...changed].filter((id) => this.notes.get(id)?.p === p && this.notes.get(id)?.d === undefined).length)
-				for (const id of this.places().groups.get(p) ?? []) if (!changed.has(id)) ids.add(id);
+			const own = [...changed].filter((id) => { const v = this.notes.get(id); return v?.d === undefined && v?.p === p; }).length;
+			if ((this.claimed.get(p) ?? 0) > own) for (const id of this.places().groups.get(p) ?? []) if (!changed.has(id)) ids.push(id);
 		}
 		this.shifted.clear();
-		return [...ids];
+		return ids;
 	}
 
 	/** Settle a note and every note claiming the same path (their places depend on each other). */
 	private async settleGroup(id: string): Promise<void> {
 		const path = this.notes.get(id)?.p;
-		for (const other of new Set([id, ...((path !== undefined && this.places().groups.get(claimOf(id, path))) || [])])) await this.settle(other);
+		for (const other of new Set([id, ...((path !== undefined && this.places().groups.get(path)) || [])])) await this.settle(other);
 	}
 
 	/**
 	 * Bring one note's file and document into agreement, and put the file where the index says.
 	 */
 	private async settle(id: string): Promise<void> {
-		if (this.settling.has(id)) return;
+		if (this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
 		this.settling.add(id);
 		this.deferred.delete(id);
 		try {
-			await this.readClaimHeads(id);
-			if (this.notesOnly && this.isAttachment(id)) return;
 			let blocked = false;
 			for (let attempt = 0; attempt < 3; attempt++) {
 				const done = await this.settleOnce(id);
@@ -1288,34 +1185,24 @@ export class Engine {
 			return true;
 		}
 		let seen = m.diskPath ? await this.disk.stat(m.diskPath) : undefined;
-		if (m.removingHidden && seen) {
-			m.removingHidden = undefined; // the old unlink did not land, or a new file is here
-			this.put(`note:${id}`, m);
-		}
 
 		// 1. Take in what the user did to the file.
 		if (m.diskPath && !seen && !m.writing) {
 			// A file can be seen missing before its rename is announced, so look for it before calling it deleted.
 			// (With `writing` set, the engine's own write never landed: step 3 writes it.)
-			if (m.removingHidden || this.places().hidden.has(id)) {
-				const owner = await this.missingHiddenFile(id, m.diskPath);
-				if (owner) await this.lost(owner);
-			} else await this.lost(id);
+			await this.lost(id);
 			seen = m.diskPath ? await this.disk.stat(m.diskPath) : undefined;
 		} else if (m.diskPath && seen && (seen.mtime !== m.mtime || seen.size !== m.size)) {
 			if (this.tooLarge(seen)) return true;
 			await this.takeFile(id, m.diskPath, seen, open ? "doc" : mode);
 		}
 		await this.resurrect(id);
-		if (this.isAttachment(id)) await this.split(id);
+		if (this.isAttachment(id)) {
+			await this.split(id);
+			await this.dropDuplicates(id);
+		}
 
 		// 2. Put the file where the index says the note lives.
-		const hidden = this.places().hidden.has(id);
-		if (this.isAttachment(id) && seen && (hidden || this.notes.get(id)?.d !== undefined)) {
-			const done = await this.releaseAttachmentFile(id, seen, hidden);
-			if (done !== undefined) return done;
-		}
-		if (hidden) return true;
 		const want = this.effectivePath(id);
 		if (want !== undefined && this.dirty.has(want)) {
 			this.deferred.add(id);
@@ -1345,7 +1232,6 @@ export class Engine {
 				return true;
 			}
 			if (!(await this.vacate(want, id))) return this.deferred.has(id) || "blocked"; // waiting, or places shifted: look again
-			if (m.diskPath === want) return true; // the occupant handed this file over
 			if (!(await this.disk.stat(m.diskPath))) return false; // gone while its place was made: look again
 			this.ownRenames.set(want, m.diskPath);
 			await this.disk.rename(m.diskPath, want);
@@ -1418,16 +1304,13 @@ export class Engine {
 			this.ownRenames.set(parked, path);
 			await this.disk.rename(path, parked);
 			this.place(other, parked);
-		} else if (other && this.ups.has(other) && this.places().hidden.has(other)) {
-			this.deferred.add(id); // its file stays put until its upload publishes
-			return false;
 		} else if (other && this.notes.get(other) === undefined) {
 			// That note's index entry hasn't arrived yet, so it stays where it is (see settleOnce): wait for it.
 			this.deferred.add(id);
 			return false;
 		} else if (other) {
 			await this.settle(other);
-			if (this.deferred.has(other) || (this.byPath.get(path) === other && this.places().hidden.has(other))) this.deferred.add(id); // an upload, download or file event still owns the path
+			if (this.deferred.has(other)) this.deferred.add(id); // it is waiting for file events, so this note waits too
 		} else {
 			const taken = await this.takeUnknown(path);
 			if (taken === id) return true;
@@ -1503,38 +1386,16 @@ export class Engine {
 		return sv;
 	}
 
-	private hiddenCopies(id: string): string[] {
-		const v = this.notes.get(id);
-		if (!v || v.d !== undefined || isNote(v.p)) return [];
-		const layout = this.places();
-		return (layout.groups.get(claimOf(id, v.p)) ?? []).filter((other) => layout.hidden.get(other) === id);
-	}
-
-	private async deleteFile(id: string, followers = this.hiddenCopies(id)): Promise<void> {
-		// All members of a deleted group restore at the path the user actually removed.
-		const group = followers.length ? { g: this.opts.newId(), p: this.effectivePath(id) ?? this.notes.get(id)!.p } : {};
-		const t = this.opts.now?.() ?? Date.now();
-		for (const member of [id, ...followers]) await this.tombstone(member, group, t);
-	}
-
-	private async versionIds(id: string): Promise<string[]> {
-		const doc = this.load(await this.state(id));
-		const ids = [...new Set(doc.getArray<Ref>("v").toArray().map((r) => r.u))].sort();
-		doc.destroy();
-		return ids;
-	}
-
-	private async tombstone(id: string, reason: Partial<Pick<IndexValue, "p" | "g" | "r">> = {}, t = this.opts.now?.() ?? Date.now()): Promise<void> {
+	private async tombstone(id: string): Promise<void> {
 		const v = this.notes.get(id);
 		if (!v || v.d !== undefined) return;
-		this.notes.set(id, { p: v.p, d: b64(await this.stateVector(id)), t, ...reason });
+		this.notes.set(id, { p: v.p, d: b64(await this.stateVector(id)), t: this.opts.now?.() ?? Date.now() });
 	}
 
 	/** A deleted note that this device holds edits for which the deleter never saw is not deleted. */
 	private async resurrect(id: string): Promise<void> {
 		const v = this.notes.get(id);
 		if (!v || v.d === undefined) return;
-		if (!isNote(v.p) && !this.heads.has(id)) await this.readHead(id);
 		if (await this.read(`up:${id}`)) return void this.notes.set(id, { p: v.p }); // a new version, still uploading
 		const seen = Y.decodeStateVector(unb64(v.d));
 		for (const [client, clock] of Y.decodeStateVector(await this.stateVector(id))) {
@@ -1610,11 +1471,7 @@ export class Engine {
 		// An earlier version still uploading never reached the vault: whatever of it the Worker holds is retired.
 		if (up?.ref.s === 1 && !this.holders.has(up.ref.u)) this.report(up.ref.u, "replaced");
 		// It replaces what the file showed before.
-		const seen = up?.seen ?? [];
-		if (!up && this.heads.get(id) === m.baseHash) for (const other of this.hiddenCopies(id)) {
-			seen.push({ id: other, u: await this.versionIds(other) });
-		}
-		this.put(`up:${id}`, { ref, base: up ? up.base : m.baseHash, seen } satisfies Upload);
+		this.put(`up:${id}`, { ref, base: up ? up.base : m.baseHash } satisfies Upload);
 		this.ups.add(id);
 		const was = this.uploading, tag = scoped ? await this.tagOf(u) : undefined;
 		// Saved again mid-upload: chunks it shares with the version before are stored, or on their way, already.
@@ -1632,7 +1489,7 @@ export class Engine {
 	}
 
 	/** Every chunk of this device's new version is stored: now the version may be referenced. */
-	private async publish(id: string, { ref, base, seen }: Upload): Promise<void> {
+	private async publish(id: string, { ref, base }: Upload): Promise<void> {
 		const doc = this.load(await this.state(id), this.clientId), v = doc.getArray<Ref>("v"), before = Y.encodeStateVector(doc);
 		// It replaces the version it was made from. One another device made meanwhile stays: a conflict, for split.
 		doc.transact(() => {
@@ -1643,18 +1500,6 @@ export class Engine {
 		doc.destroy();
 		await this.dropUpload(id, true);
 		await this.merge(id, update, true, true);
-		const shown = this.notes.get(id);
-		if (!shown || shown.d !== undefined) return;
-		const claim = claimOf(id, shown.p);
-		for (const copy of seen ?? []) {
-			const v = this.notes.get(copy.id);
-			if (!v || v.d !== undefined || claimOf(copy.id, v.p) !== claim || this.ups.has(copy.id)) continue;
-			const us = await this.versionIds(copy.id);
-			if (us.length !== copy.u.length || !us.every((u, i) => u === copy.u[i])) continue;
-			// A split child can owe its plain name to this twin. Keep that name after retiring the twin.
-			if (v.p === claim && this.notes.get(id)!.p !== claim) this.notes.set(id, { p: claim });
-			await this.tombstone(copy.id, { r: 1 });
-		}
 	}
 
 	/**
@@ -1679,7 +1524,6 @@ export class Engine {
 			if (this.notes.has(r.u)) continue; // made already, here or elsewhere
 			const copy = this.load(undefined, this.clientId);
 			copy.getArray<Ref>("v").push([r]);
-			this.cacheHead(r.u, copy);
 			const made = Y.encodeStateAsUpdate(copy);
 			copy.destroy();
 			this.put(`state:${r.u}`, made);
@@ -1695,49 +1539,36 @@ export class Engine {
 		await this.merge(id, update, true, true);
 	}
 
-	/** A crash can leave the shared file recorded under its former owner. Its absence is the shown file's move or deletion. */
-	private async missingHiddenFile(id: string, path: string): Promise<string | undefined> {
-		const { removingHidden, baseHash, mtime, size } = this.metaOf(id), owner = this.places().hidden.get(id);
-		const shared = !removingHidden && !this.ups.has(id) && owner && this.effectivePath(owner) === path &&
-			!this.metaOf(owner).diskPath && baseHash !== undefined && baseHash === this.heads.get(owner);
-		await this.forget(id);
-		if (!shared || mtime === undefined || size === undefined) return;
-		this.place(owner, path);
-		this.agree(owner, { path, mtime, size }, baseHash);
-		return owner;
-	}
-
-	/** A hidden or deleted holder can pass its file straight to the new owner. Undefined leaves an ordinary deletion. */
-	private async releaseAttachmentFile(id: string, file: DiskFile, hidden: boolean): Promise<boolean | "blocked" | undefined> {
-		if (this.ups.has(id)) return true;
-		const path = file.path, owner = this.ownerOf(path), m = this.metaOf(id);
-		if (!hidden && !owner) return;
-		const hash = await this.opts.chunkName(await this.disk.readBinary(path));
-		const now = await this.disk.stat(path);
-		if (this.dirty.has(path) || !now || now.mtime !== file.mtime || now.size !== file.size) return false;
-		if (owner && owner !== id && !this.metaOf(owner).diskPath && this.heads.get(owner) === hash) {
-			if (this.ups.has(owner)) return true;
-			await this.forget(id);
-			this.place(owner, path);
-			this.agree(owner, file, hash);
-			this.deferred.add(owner);
-			return true;
+	/**
+	 * Attachments claiming one path with exactly the same content are one file, not a conflict: the smallest ID keeps
+	 * it (on every device alike), so no "(conflict …)" copy is made of identical bytes. Each other one's versions move
+	 * into the one kept, beside its own, and the other is deleted. Identical versions side by side are one content
+	 * (split leaves them be), and a new version replaces them all at once (publish). But if a device that hasn't seen
+	 * this replaces the kept version meanwhile, the moved one is still there, and split makes it a copy: identical
+	 * now is no promise the kept one stays so, and its content must not go with the deleted one.
+	 */
+	private async dropDuplicates(id: string): Promise<void> {
+		const v = this.notes.get(id), group = v && v.d === undefined ? this.places().groups.get(v.p) : undefined;
+		if (!group || group.length < 2) return;
+		const kept = new Map<string, string>(); // content → the attachment keeping it
+		for (const other of [...group].sort()) {
+			if (await this.read(`up:${other}`)) continue; // its file is ahead of the vault here
+			const state = await this.state(other);
+			if (!state) continue;
+			const doc = this.load(state), refs = doc.getArray<Ref>("v").toArray(), hs = new Set(refs.map((r) => r.h));
+			doc.destroy();
+			if (hs.size !== 1) continue; // no content yet, or versions still to split
+			const h = [...hs][0]!, keeper = kept.get(h);
+			if (!keeper) { kept.set(h, other); continue; }
+			const into = this.load(await this.state(keeper), this.clientId), to = into.getArray<Ref>("v"), before = Y.encodeStateVector(into);
+			const have = new Set(to.toArray().map((r) => r.u));
+			into.transact(() => { for (const r of refs) if (!have.has(r.u)) to.push([r]); });
+			const update = Y.encodeStateAsUpdate(into, before);
+			into.destroy();
+			await this.merge(keeper, update, true, true);
+			await this.tombstone(other);
+			if (other !== id) this.deferred.add(other); // its file goes too
 		}
-		if (!hidden) return;
-		if (this.heads.get(id) !== hash) {
-			if (hash === m.baseHash) return this.settleAttachment(id, path, file); // first update the known stale file
-			await this.stage(id, file);
-			return true;
-		}
-		m.removingHidden = true;
-		this.put(`note:${id}`, m);
-		await this.flush();
-		const last = await this.disk.stat(path);
-		if (last && (this.dirty.has(path) || last.size !== file.size || last.mtime !== file.mtime)) return false;
-		if (last) await this.disk.remove(path);
-		await this.forget(id);
-		if (owner) this.deferred.add(owner);
-		return true;
 	}
 
 	/** Step 3 for an attachment: make the file the vault's version, once all of it is here. */
@@ -1889,7 +1720,7 @@ export class Engine {
 			const now = v && v.d === undefined && !isNote(v.p) ? await this.scopedVersions(id) : [];
 			if (now.length === was.length && now.every((u, i) => u === was[i])) continue;
 			for (const u of now) if (!was.includes(u)) this.hold(u, 1);
-			for (const u of was) if (!now.includes(u)) this.hold(u, -1, v?.d === undefined || v.r ? "replaced" : "deleted");
+			for (const u of was) if (!now.includes(u)) this.hold(u, -1, v?.d === undefined ? "replaced" : "deleted");
 			if (now.length) {
 				this.cur.set(id, now);
 				this.put(`cur:${id}`, now);
@@ -1996,11 +1827,8 @@ export class Engine {
 	private async nextRepair(): Promise<void> {
 		for (const u of this.repairs) {
 			this.repairs.delete(u);
-			const id = [...this.cur].find(([, us]) => us.includes(u))?.[0];
-			if (id === undefined || this.notesOnly) continue;
-			// The bytes may live at the representative; the scoped names still belong to the hidden version.
-			const shown = this.places().hidden.get(id) ?? id, m = this.metaOf(shown);
-			if (!m.diskPath || this.ups.has(shown) || this.dirty.has(m.diskPath) || !(await this.disk.stat(m.diskPath))) continue;
+			const id = [...this.cur].find(([, us]) => us.includes(u))?.[0], m = id === undefined ? undefined : this.metaOf(id);
+			if (id === undefined || !m?.diskPath || this.ups.has(id) || this.dirty.has(m.diskPath) || !(await this.disk.stat(m.diskPath))) continue;
 			const doc = this.load(await this.state(id)), ref = doc.getArray<Ref>("v").toArray().find((r) => r?.u === u && r.s === 1);
 			doc.destroy();
 			if (!ref || m.baseHash !== ref.h) continue;
