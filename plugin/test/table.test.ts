@@ -1,0 +1,355 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createHash, createHmac } from "node:crypto";
+import { decodeClient } from "../../server/src/wire";
+import { hex, unhex } from "../../protocol/ownsync";
+import type { Ref, Store } from "../src/core/ports";
+import { TableDevice, catchUp, conflictSuffix, packRequest, restore, type Answer, type Row, type RecordData } from "../src/core/table/device";
+import { planDisk, executeIntent, type DiskInputs, type Event, type DiskPort } from "../src/core/table/disk";
+
+const enc = new TextEncoder(), dec = new TextDecoder();
+const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+let next = 0;
+const id = () => (++next).toString(16).padStart(32, "0");
+const nameKey = new Uint8Array(32).fill(8);
+
+class Memory implements Store {
+	values = new Map<string, unknown>();
+	fail = false;
+	async get<T>(k: string) { return structuredClone(this.values.get(k)) as T | undefined; }
+	async list<T>(prefix: string) { return structuredClone([...this.values].filter(([k]) => k.startsWith(prefix))) as [string,T][]; }
+	async commit(puts: Map<string, unknown>, deletes: Iterable<string>) {
+		if (this.fail) throw new Error("crash at commit");
+		for (const [k,v] of puts) this.values.set(k, structuredClone(v));
+		for (const k of deletes) this.values.delete(k);
+	}
+}
+
+class Files implements DiskPort {
+	files = new Map<string, { bytes: Uint8Array; mtime: number }>();
+	clock = 0;
+	reads = 0;
+	temp?: Uint8Array;
+	crash?: "temp" | "effect";
+	put(path: string, bytes: Uint8Array) { this.files.set(path, { bytes: bytes.slice(), mtime: ++this.clock }); }
+	edit(path: string, value: string) { this.put(path, enc.encode(value)); }
+	text(path: string) { const f = this.files.get(path); return f && dec.decode(f.bytes); }
+	hash(path: string) { const f = this.files.get(path); return f ? hash(f.bytes) : null; }
+	async stat(path: string) { const f = this.files.get(path); return f && { path, mtime: f.mtime, size: f.bytes.length }; }
+	async list() { return Promise.all([...this.files.keys()].map(async p => (await this.stat(p))!)); }
+	async readBinary(path: string) { this.reads++; return this.files.get(path)!.bytes.slice(); }
+	fault(at: typeof this.crash) { if (this.crash === at) { this.crash = undefined; throw new Error("killed"); } }
+	async discardTemp() { this.temp = undefined; }
+	async writeTemp(bytes: Uint8Array) { this.temp = bytes.slice(); this.fault("temp"); }
+	async installTemp(path: string, expected: string | null) {
+		if (this.hash(path) !== expected) return false;
+		this.put(path, this.temp!); this.temp = undefined; this.fault("effect"); return true;
+	}
+	async moveIf(from: string, to: string, expected: string) {
+		if (this.hash(from) !== expected || this.files.has(to)) return false;
+		this.files.set(to, this.files.get(from)!); this.files.delete(from); this.fault("effect"); return true;
+	}
+	async removeIf(path: string, expected: string) {
+		if (this.hash(path) !== expected) return false;
+		this.files.delete(path); this.fault("effect"); return true;
+	}
+}
+
+class WorkerModel {
+	seq = 0;
+	rows = new Map<string, Row>();
+	answers = new Map<string, number>();
+	chunks = new Map<string, Uint8Array>();
+	request(packet: Uint8Array): Answer {
+		const r = decodeClient(packet);
+		if (r.t !== "set" && r.t !== "del" && r.t !== "restore") throw new Error("expected proposal");
+		const req = hex(r.req), file = hex(r.file), prior = this.answers.get(req);
+		if (prior !== undefined) return { req, ok: prior };
+		const row = this.rows.get(file);
+		const refuse = (holder = row, missing = false) => ({ req, row: holder ?? null, missing });
+		if ((row?.seq ?? null) !== r.base) return refuse();
+		const data: RecordData = r.t === "del" ? row! : JSON.parse(dec.decode(r.record));
+		if (r.t !== "del") {
+			const holder = [...this.rows.values()].find(x => x.file !== file && x.deleted === null && x.path === data.path);
+			if (holder) return refuse(holder);
+			if (!this.chunks.has(data.bytes.u)) return refuse(row, true);
+		}
+		if (r.t === "restore" && (!row || row.deleted === null || row.bytes.u !== data.bytes.u)) return refuse();
+		if (r.t === "del" && (!row || row.deleted !== null)) return refuse();
+		const seq = ++this.seq;
+		this.rows.set(file, { ...data, file, seq, deleted: r.t === "del" ? seq : null });
+		this.answers.set(req, seq);
+		return { req, ok: seq };
+	}
+	live() { return [...this.rows.values()].filter(r => r.deleted === null); }
+}
+
+async function client(w: WorkerModel) {
+	const store = new Memory(), disk = new Files(), staged = new Map<string, Uint8Array>();
+	let dev = await TableDevice.open(store);
+	const i: DiskInputs = { id, attachments: true, allowed: p => !p.startsWith("."), maxFileSize: 100000,
+		hash: async b => hash(b), suffix: (h,n) => conflictSuffix(nameKey,h,n),
+		async stage(f) { const b = await disk.readBinary(f.path), u = id(); staged.set(u,b);
+			return { h: hash(b), n: b.length, c: [hash(b)], u, s: 1 }; },
+		async fetch(ref) { const b = w.chunks.get(ref.u) ?? staged.get(ref.u); if (!b) throw new Error("missing bytes"); return b; },
+		pack: r => packRequest(r, { pathkey: async p => unhex(hash(enc.encode(p))), version: async ref => unhex(hash(enc.encode(ref.u))),
+			seal: async (_file, data) => enc.encode(JSON.stringify(data)) }),
+	};
+	const plan = (e: Event = {kind:"settle"}) => planDisk(dev,disk,i,e);
+	const pending = () => dev.change(s => [...s.pending.keys()]);
+	const packet = async () => {
+		const [file] = await pending(); assert.ok(file);
+		let result: Uint8Array | undefined;
+		await dev.send(file, async p => { result = p; }, async (ref: Ref) => {
+			const bytes = staged.get(ref.u) ?? w.chunks.get(ref.u);
+			if (bytes) w.chunks.set(ref.u,bytes);
+		});
+		assert.ok(result); return result;
+	};
+	const forget = async (bytes: Uint8Array) => {
+		const f = decodeClient(bytes); assert.equal(f.t,"forget");
+		if (f.t === "forget") { const req = hex(f.req); w.answers.delete(req); await dev.forgotten(req); }
+	};
+	const ack = (a: Answer) => dev.receive(a,i,forget);
+	const pull = () => dev.change(s => {
+		for (const row of [...w.rows.values()].filter(r => r.seq > s.cursor).sort((a,b) => a.seq-b.seq)) catchUp(s,row);
+		catchUp(s,{ cursor: w.seq });
+	});
+	const effect = () => executeIntent(dev,disk,i);
+	const deliver = async () => ack(w.request(await packet()));
+	const settle = async () => {
+		for (let lap = 0; lap < 30; lap++) {
+			await pull(); await plan();
+			if (await dev.change(s => !!s.intent)) { await effect(); continue; }
+			if ((await pending()).length) { await deliver(); continue; }
+			return;
+		}
+		assert.fail("device did not quiesce");
+	};
+	return { disk, store, i, plan, packet, ack, pull, effect, deliver, pending, settle, forget,
+		reopen: async () => { dev = await TableDevice.open(store); }, get dev() { return dev; } };
+}
+
+async function pair() {
+	const w = new WorkerModel(), a = await client(w), b = await client(w);
+	a.disk.edit("x.bin","A"); await a.settle(); await b.settle();
+	return { w,a,b,file:w.live()[0]!.file };
+}
+test("suffix uses the name key, labelled raw hash, and a big endian retry counter", async () => {
+	const h = hash(enc.encode("content"));
+	for (const n of [0,1,256]) {
+		const mac = createHmac("sha256",nameKey).update("ownsync/conflict-suffix\0").update(Buffer.from(h,"hex"));
+		if (n) { const bytes = Buffer.alloc(4); bytes.writeUInt32BE(n); mac.update(bytes); }
+		assert.equal(await conflictSuffix(nameKey,h,n),mac.digest("hex").slice(0,6));
+	}
+});
+
+test("pending edits survive restart, ack before catch-up, and a second save", async () => {
+	const {a,w,file} = await pair();
+	a.disk.edit("x.bin","B"); await a.plan();
+	const before = await a.packet(), ok = w.request(before);
+	a.disk.edit("x.bin","C"); await a.plan({kind:"changed",path:"x.bin"});
+	await a.reopen(); assert.deepEqual(await a.packet(), before);
+	assert.deepEqual(w.request(before),ok);
+	a.store.fail = true;
+	await assert.rejects(a.ack(ok),/commit/); assert.equal(w.answers.size,1);
+	a.store.fail = false; await a.reopen();
+	await a.dev.receive(ok,a.i,async () => {}); // forget lost
+	assert.equal(await a.dev.change(s => s.cursor),1);
+	await a.reopen(); await a.dev.sendForgets(a.forget);
+	assert.equal(w.answers.size,0); assert.equal(await a.dev.change(s => s.local.get(file)!.base.bytes!.h),hash(enc.encode("B")));
+	await a.settle(); assert.equal(w.live()[0]?.bytes.h, hash(enc.encode("C")));
+});
+
+test("rename and edit commute in either arrival order; competing renames keep the first", async () => {
+	for (const renameFirst of [false,true]) {
+		const {a,b,w} = await pair();
+		await a.disk.moveIf("x.bin","y.bin",a.disk.hash("x.bin")!);
+		await a.plan({kind:"renamed",from:"x.bin",to:"y.bin"});
+		b.disk.edit("x.bin","B"); await b.plan();
+		const first = renameFirst ? a : b, second = renameFirst ? b : a;
+		await first.deliver(); await second.deliver(); await second.settle(); await first.settle();
+		assert.equal(w.live().length,1);
+		for (const d of [a,b]) assert.deepEqual([...d.disk.files.keys()],["y.bin"]);
+		assert.equal(a.disk.text("y.bin"),"B"); assert.equal(b.disk.text("y.bin"),"B");
+	}
+	const {a,b,w} = await pair();
+	for (const [d,to] of [[a,"y.bin"],[b,"z.bin"]] as const) {
+		await d.disk.moveIf("x.bin",to,d.disk.hash("x.bin")!); await d.plan({kind:"renamed",from:"x.bin",to});
+	}
+	await a.deliver(); await b.deliver(); await b.settle();
+	assert.equal(w.live()[0]!.path,"y.bin"); assert.equal(b.disk.text("y.bin"),"A");
+});
+
+test("delete against an edit, a rename, or an unchanged row", async () => {
+	for (const op of ["edit","rename","unchanged"] as const) for (const deleteFirst of [true,false]) {
+		const {a,b,w} = await pair();
+		a.disk.files.delete("x.bin"); await a.plan({kind:"deleted",path:"x.bin"});
+		if (op === "edit") { b.disk.edit("x.bin","B"); await b.plan(); }
+		if (op === "rename") { await b.disk.moveIf("x.bin","y.bin",b.disk.hash("x.bin")!); await b.plan({kind:"renamed",from:"x.bin",to:"y.bin"}); }
+		if (deleteFirst) await a.deliver();
+		if (op !== "unchanged") await b.deliver();
+		if (!deleteFirst) await a.deliver();
+		await a.settle(); await b.settle(); await a.settle();
+		assert.equal(w.live().length, op === "edit" ? 1 : 0, op);
+		assert.equal(a.disk.text("x.bin"),op === "edit" ? "B" : undefined);
+	}
+});
+
+test("ordinary identical creates adopt the occupant; differing bytes select the conflict path", async () => {
+	for (const value of ["A","B"]) {
+		const w = new WorkerModel(), a = await client(w), b = await client(w);
+		a.disk.edit("x.bin","A"); b.disk.edit("x.bin",value); await a.plan(); await b.plan();
+		await a.deliver(); await b.deliver(); await b.settle(); await a.settle();
+		assert.equal(w.live().length,value === "A" ? 1 : 2);
+		assert.deepEqual([...a.disk.files.keys()].sort(),[...b.disk.files.keys()].sort());
+		assert.equal(b.disk.text("x.bin"),"A");
+	}
+});
+
+test("two losing edits with identical bytes choose one conflict copy, including an occupied suffix", async () => {
+	const {a,b,w} = await pair(), c = await client(w); await c.settle();
+	const suffix = await a.i.suffix(hash(enc.encode("B")),0);
+	a.disk.edit(`x (conflict ${suffix}).bin`,"occupied"); await a.settle();
+	for (const d of [b,c]) { d.disk.edit("x.bin","B"); await d.plan(); }
+	a.disk.edit("x.bin","winner"); await a.settle();
+	for (const d of [b,c]) { await d.deliver(); await d.pull(); await d.plan(); assert.equal(d.disk.text("x.bin"),"B"); }
+	await b.deliver(); await c.deliver();
+	for (const d of [b,c,a]) await d.settle();
+	assert.equal(w.live().length,3);
+	for (const d of [a,b,c]) {
+		assert.equal(d.disk.text("x.bin"),"winner");
+		assert.equal([...d.disk.files.values()].filter(f => dec.decode(f.bytes) === "B").length,1);
+	}
+});
+
+test("restore names the exact deletion and cannot supersede a racing edit", async () => {
+	const {a,b,w,file} = await pair();
+	b.disk.edit("x.bin","B"); await b.plan();
+	a.disk.files.delete("x.bin"); await a.plan({kind:"deleted",path:"x.bin"}); await a.deliver(); await a.pull();
+	await a.dev.change(s => restore(s,s.latest.get(file)!,a.i));
+	await b.deliver(); await b.settle(); await a.deliver(); await a.settle();
+	assert.equal(w.live().length,1); assert.equal(a.disk.text("x.bin"),"B");
+});
+
+test("every disk intent resumes after a crash at prepare, after the mutation, or after its agreement", async () => {
+	for (const kind of ["write","rename","remove"] as const) for (const fault of ["prepare","effect","agreement"] as const) {
+		const {a,b,w} = await pair();
+		if (kind === "write") a.disk.edit("x.bin","new");
+		if (kind === "rename") { await a.disk.moveIf("x.bin","y.bin",a.disk.hash("x.bin")!); await a.plan({kind:"renamed",from:"x.bin",to:"y.bin"}); }
+		if (kind === "remove") { a.disk.files.delete("x.bin"); await a.plan({kind:"deleted",path:"x.bin"}); }
+		await a.settle(); await b.pull(); await b.plan();
+		assert.equal(await b.dev.change(s => s.intent?.kind),kind);
+		if (fault === "effect") { b.disk.crash = "effect"; await assert.rejects(b.effect(),/killed/); }
+		if (fault === "agreement") await b.effect();
+		await b.reopen(); await b.plan({kind:"startup"}); await b.settle();
+		assert.deepEqual([...b.disk.files.keys()],[...a.disk.files.keys()],kind + "/" + fault);
+		assert.equal(b.disk.text("x.bin"),a.disk.text("x.bin"));
+		assert.equal(w.seq,2); // replaying an own disk event never publishes another mutation
+	}
+});
+
+test("temp writes are private, restart discards a partial write, and a user save wins the precondition", async () => {
+	const {a,b,w} = await pair();
+	a.disk.edit("x.bin","remote"); await a.settle(); await b.pull(); await b.plan();
+	b.disk.crash = "temp"; await assert.rejects(b.effect(),/killed/);
+	assert.equal(b.disk.text("x.bin"),"A"); assert.ok(b.disk.temp);
+	b.disk.edit("x.bin","user save");
+	await b.reopen(); await b.plan({kind:"startup"}); assert.equal(b.disk.temp,undefined);
+	await b.effect(); assert.equal(b.disk.text("x.bin"),"user save");
+	await b.settle(); assert.equal(w.live().length,2);
+	assert.deepEqual([...b.disk.files.values()].map(f => dec.decode(f.bytes)).sort(),["remote","user save"]);
+});
+
+test("D13 uses both sides of the original inventory; steady-state settles reuse verified stats", async () => {
+	for (const ambiguous of [true,false]) {
+		const w = new WorkerModel(), a = await client(w);
+		a.disk.edit("a.bin","same");
+		if (ambiguous) a.disk.edit("b.bin","same");
+		await a.settle();
+		const prior = w.live().map(r => r.file), reads = a.disk.reads;
+		await a.plan(); assert.equal(a.disk.reads,reads);
+		await a.disk.moveIf("a.bin","moved.bin",a.disk.hash("a.bin")!);
+		if (ambiguous) a.disk.files.delete("b.bin");
+		await a.reopen(); await a.plan({kind:"startup"}); await a.settle();
+		assert.equal(w.live().length,1); assert.equal(w.live()[0]!.path,"moved.bin");
+		assert.equal(prior.includes(w.live()[0]!.file),!ambiguous);
+	}
+});
+
+test("equal concurrent changes to the path and bytes adopt once, even when catch-up precedes the answer", async () => {
+	const {a,b,w} = await pair();
+	for (const d of [a,b]) {
+		await d.disk.moveIf("x.bin","y.bin",d.disk.hash("x.bin")!);
+		d.disk.edit("y.bin","B"); await d.plan({kind:"renamed",from:"x.bin",to:"y.bin"});
+	}
+	const ok = w.request(await a.packet());
+	await a.pull(); await a.ack(ok);
+	await b.deliver(); await b.settle(); await a.settle();
+	assert.equal(w.seq,2); assert.deepEqual([...b.disk.files.keys()],["y.bin"]); assert.equal(b.disk.text("y.bin"),"B");
+});
+
+test("restore uses restored names and reports a cleaned version without changing disk", async () => {
+	const {a,w,file} = await pair();
+	a.disk.files.delete("x.bin"); await a.plan({kind:"deleted",path:"x.bin"}); await a.settle();
+	a.disk.edit("x.bin","replacement"); a.disk.edit("x (restored).bin","occupied"); await a.settle();
+	const deleted = w.rows.get(file)!;
+	await a.dev.change(s => restore(s,deleted,a.i));
+	const bytes = w.chunks.get(deleted.bytes.u)!;
+	w.chunks.delete(deleted.bytes.u); assert.equal(await a.deliver(),"gone");
+	w.chunks.set(deleted.bytes.u,bytes);
+	await a.dev.change(s => restore(s,deleted,a.i)); await a.deliver(); await a.settle();
+	assert.equal(a.disk.text("x (restored 2).bin"),"A"); assert.equal(a.disk.text("x.bin"),"replacement");
+});
+
+test("missing chunks retry from durable staging after a second save", async () => {
+	const {b,w} = await pair();
+	b.disk.edit("x.bin","B"); await b.plan(); const first = await b.packet();
+	const frame = decodeClient(first); assert.equal(frame.t,"set"); if (frame.t !== "set") return;
+	const data = JSON.parse(dec.decode(frame.record)) as RecordData;
+	w.chunks.delete(data.bytes.u);
+	const missing = w.request(first); b.disk.edit("x.bin","C"); await b.ack(missing);
+	await b.reopen(); await b.deliver(); assert.equal(w.live()[0]!.bytes.h,hash(enc.encode("B")));
+	await b.settle(); assert.equal(w.live()[0]!.bytes.h,hash(enc.encode("C")));
+});
+
+test("a coalesced catch-up with a path swap preserves both files across a crash during the move", async () => {
+	const {a,b,w} = await pair();
+	a.disk.edit("y.bin","Y"); await a.settle(); await b.settle();
+	for (const [from,to] of [["x.bin","middle.bin"],["y.bin","x.bin"],["middle.bin","y.bin"]] as const) {
+		await a.disk.moveIf(from,to,a.disk.hash(from)!); await a.plan({kind:"renamed",from,to}); await a.settle();
+	}
+	const seq = w.seq;
+	await b.pull(); await b.plan();
+	assert.equal(await b.dev.change(s => s.intent?.kind),"park");
+	b.disk.crash = "effect"; await assert.rejects(b.effect(),/killed/);
+	await b.reopen(); await b.plan({kind:"startup"}); await b.settle();
+	assert.equal(b.disk.text("x.bin"),"Y"); assert.equal(b.disk.text("y.bin"),"A");
+	assert.equal(w.seq,seq);
+});
+
+test("a save after a remote rename but before its disk agreement is preserved on restart", async () => {
+	const {a,b} = await pair();
+	await a.disk.moveIf("x.bin","y.bin",a.disk.hash("x.bin")!); await a.plan({kind:"renamed",from:"x.bin",to:"y.bin"}); await a.settle();
+	await b.pull(); await b.plan(); b.disk.crash = "effect"; await assert.rejects(b.effect(),/killed/);
+	b.disk.edit("y.bin","saved"); await b.reopen(); await b.plan({kind:"startup"}); await b.settle();
+	assert.deepEqual([...b.disk.files.values()].map(f => dec.decode(f.bytes)).sort(),["A","saved"]);
+});
+
+test("an explicit folder rename keeps each child ID even with identical bytes", async () => {
+	const w = new WorkerModel(), a = await client(w);
+	for (const path of ["old/a.bin","old/sub/b.bin"]) a.disk.edit(path,"same");
+	await a.settle(); const before = w.live();
+	for (const r of before) await a.disk.moveIf(r.path,r.path.replace("old/","new/"),a.disk.hash(r.path)!);
+	await a.plan({kind:"renamed",from:"old",to:"new"}); await a.settle();
+	for (const r of before) assert.equal(w.rows.get(r.file)!.path,r.path.replace("old/","new/"));
+	assert.equal(w.rows.size,2);
+});
+
+test("a user rename while a remote delete is prepared follows the deletion", async () => {
+	const {a,b,w} = await pair();
+	a.disk.files.delete("x.bin"); await a.plan({kind:"deleted",path:"x.bin"}); await a.settle();
+	await b.pull(); await b.plan(); assert.equal(await b.dev.change(s => s.intent?.kind),"remove");
+	await b.disk.moveIf("x.bin","y.bin",b.disk.hash("x.bin")!); await b.plan({kind:"renamed",from:"x.bin",to:"y.bin"});
+	await b.settle(); assert.equal(b.disk.files.size,0); assert.equal(w.live().length,0);
+});

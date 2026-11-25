@@ -239,6 +239,7 @@ export class Transport {
 			return this.engine.receive(opened?.kind === KIND.chunk ? { t: "chunk", name, data: opened.plaintext } : { t: "missing", name });
 		}
 		if (f.t !== "entry" && f.t !== "live") {
+			if (f.t !== "more" && f.t !== "synced" && f.t !== "ack") return; // this connection uses the legacy handshake
 			// Who this is goes before anything the engine sends once caught up: the Worker files its list of current versions under it.
 			if (f.t === "synced") this.report(true);
 			await this.engine.receive(f);
