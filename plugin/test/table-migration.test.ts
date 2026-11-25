@@ -127,6 +127,28 @@ test("a notes-only device catches up across its excluded config path without tou
 	assert.equal((await store.get<Row>("table/latest/" + row.file))?.path, row.path);
 });
 
+test("the sync driver reports a repeated settlement state and retries on new input", async () => {
+	const { TableSync } = await import("../src/tableSync");
+	const { Files, Memory } = await import("./table-sim");
+	const disk = new Files(), problems: string[] = [];
+	const keys = { vmk: key, epoch: 0, vaultId: new Uint8Array(16), me: { id: new Uint8Array(16) },
+		keyFor: () => key, state: {} } as unknown as import("../src/keys").VaultKeys;
+	const table = new TableSync(new Memory(), keys, disk, () => true, true, 20 * 2**20,
+		(_, error) => problems.push(String(error)));
+	const install = disk.installTemp.bind(disk);
+	disk.installTemp = async () => false;
+	const bytes = { ...ref(1), n: 0, h: await table.hash(new Uint8Array()) };
+	await table.connect(async () => assert.fail("empty version requested chunks"));
+	await table.row(await table.wireRow({ file: "01".repeat(16), path: "a.bin", bytes, mtime: null, seq: 1, deleted: null }));
+	await table.ready(1); await table.idle();
+	assert.equal(problems.length, 1); assert.match(problems[0]!, /settlement repeated a state/);
+	assert.equal(disk.files.size, 0);
+	disk.installTemp = install;
+	await table.event({ kind: "settle" }); await table.idle();
+	assert.equal(disk.text("a.bin"), "");
+	assert.equal(problems.length, 1);
+});
+
 test("two unsent legacy renames carry the first source path through restart and handoff", async () => {
 	const { Device, Server, quiesce, rng } = await import("./sim");
 	const device = new Device("migrating", new Server(), rng(42));

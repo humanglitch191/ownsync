@@ -1,5 +1,5 @@
 // Transitions operate on a private draft. TableDevice commits the changed records together.
-import { concat, hex, unhex } from "../../../../protocol/ownsync";
+import { concat, hex, sha256, unhex } from "../../../../protocol/ownsync";
 import { encodeClient } from "../../../../server/src/wire";
 import type { Ref, Store } from "../ports";
 
@@ -269,6 +269,8 @@ const maps = ["latest", "local", "pending", "forget", "parked", "observed", "blo
 type Meta = Pick<State, "cursor" | "intent">;
 export class TableDevice {
 	private queue: Promise<unknown> = Promise.resolve();
+	private commits = 0;
+	get revision() { return this.commits; }
 	private constructor(readonly store: Store, private state: State) {}
 	static async open(store: Store) {
 		const meta = await store.get<Meta>("table/meta");
@@ -292,12 +294,29 @@ export class TableDevice {
 			if (puts.size || deletes.length) {
 				checkLocalPaths(draft.local.values());
 				await this.store.commit(puts, deletes);
+				this.commits++;
 			}
 			this.state = draft;
 			return result;
 		});
 		this.queue = work.catch(() => {});
 		return work;
+	}
+	// A pass can release a path without creating immediate work. Only an unchanged pass
+	// is quiet. Keep a compact history per drain so a cycle is reported even after many passes.
+	async needsAnotherPass(before: number, seen: Set<string>, deferred: Set<string>[] = []) {
+		if (before === this.revision) return false;
+		const s = this.state;
+		const records = maps.map(kind => [...s[kind].keys()].sort().map(id =>
+			[id, kind === "latest" ? s.latest.get(id)!.seq : s[kind].get(id)]));
+		// Row sequences identify immutable records, and version IDs identify their chunk lists.
+		// Repacking or retrying the same proposal gives it fresh wire bytes and a request ID.
+		const state = JSON.stringify([s.cursor, s.intent, records, deferred.map(ids => [...ids].sort())],
+			(key, value) => key === "packet" || key === "req" || key === "c" ? undefined : value);
+		const digest = hex(await sha256(new TextEncoder().encode(state)));
+		if (seen.has(digest)) throw new Error("Attachment settlement repeated a state without reaching agreement");
+		seen.add(digest);
+		return true;
 	}
 	// A disconnect after the commit or after forget is harmless. Retry until the Worker confirms deletion.
 	async receive(a: Answer, inputs: Inputs, send: (packet: Uint8Array) => Promise<void>) {

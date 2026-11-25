@@ -183,13 +183,21 @@ export async function client(w: WorkerModel, disk = new Files(), store = new Mem
 	const effect = () => executeIntent(dev,disk,i);
 	const deliver = async () => ack(submit(await packet()));
 	const settle = async () => {
-		for (let lap = 0; lap < 100; lap++) {
-			await pull(); await plan();
-			if (await dev.change(s => !!s.intent)) { await effect(); continue; }
-			if ((await pending()).length) { await deliver(); continue; }
-			return;
-		}
-		assert.fail("device did not quiesce");
+		const seen = new Set<string>(), failedDownloads = new Set<string>(), failedSends = new Set<string>();
+		let before: number;
+		do {
+			before = dev.revision;
+			await pull(); await planDisk(dev, disk, i, {kind:"settle"}, failedDownloads);
+			if (await dev.change(s => !!s.intent)) await executeIntent(dev,disk,i,failedDownloads);
+			else {
+				const file = (await pending()).find(f => !failedSends.has(f));
+				if (file) {
+					const answer = submit(await packet(file));
+					await ack(answer);
+					if ("missing" in answer && answer.missing) failedSends.add(file);
+				}
+			}
+		} while (await dev.needsAnotherPass(before, seen, [failedDownloads, failedSends]));
 	};
 	return { disk, store, i, plan, packet, submit, ack, pull, effect, deliver, pending, settle, forget,
 		reopen: async () => { dev = await TableDevice.open(store); }, get dev() { return dev; } };

@@ -101,7 +101,10 @@ export class TableSync {
 		this.queue = result.catch(err => this.problem("attachment sync", err));
 		return result;
 	}
-	idle() { return this.queue; }
+	async idle() {
+		let tail;
+		do { tail = this.queue; await tail; } while (tail !== this.queue);
+	}
 	async open() {
 		if (!this.device) {
 			this.device = await TableDevice.open(this.store);
@@ -140,9 +143,16 @@ export class TableSync {
 	}
 	// Scoped to one drain. A missing chunk must not starve other downloads or spin the socket.
 	private failedDownloads = new Set<string>();
+	private failedSends = new Set<string>();
+	private passes = new Set<string>();
+	private newDrain() {
+		this.failedDownloads.clear();
+		this.failedSends.clear();
+		this.passes.clear();
+	}
 	private scheduled = false;
 	private schedule(newInput = true) {
-		if (newInput) this.failedDownloads.clear();
+		if (newInput) this.newDrain();
 		if (this.scheduled) return;
 		this.scheduled = true;
 		void this.run(async () => { this.scheduled = false; if (this.synced) await this.drive({ kind: "settle" }); });
@@ -150,7 +160,7 @@ export class TableSync {
 	event(e: Event) {
 		return this.run(async () => {
 			if (!this.device) return;
-			this.failedDownloads.clear();
+			this.newDrain();
 			if (this.startup && !this.synced) {
 				// A returning device knows its old file IDs. Keep explicit offline moves; D13
 				// cannot infer them later when several files had identical bytes.
@@ -194,6 +204,7 @@ export class TableSync {
 	private async drive(event: Event) {
 		const d = this.device!;
 		if (!this.inputs.attachments || this.keys.state.pending?.tokenHash) return;
+		const before = d.revision;
 		if (!this.startup && await this.store.get("table/fs")) await this.disk.discardTemp();
 		if (this.startup) { await planDisk(d, this.disk, this.inputs, { kind: "startup" }, this.failedDownloads); this.startup = false; }
 		await planDisk(d, this.disk, this.inputs, event, this.failedDownloads);
@@ -201,15 +212,16 @@ export class TableSync {
 		await d.sendForgets(p => this.forget(p));
 		// An accepted delete waits for its ordered row. Let incoming rows run between passes.
 		const files = await d.change(s => [...s.pending].filter(([, p]) => p.acceptedDelete === undefined).map(([file]) => file));
-		let again = false;
 		for (const file of files) {
 			if (!this.ask) break;
-			try { if (!(await this.send(file)).missing) again = true; }
-			catch (e) { this.problem("sending an attachment", e); }
+			if (this.failedSends.has(file)) continue;
+			try { if ((await this.send(file)).missing) this.failedSends.add(file); }
+			catch (e) { this.failedSends.add(file); this.problem("sending an attachment", e); }
 		}
-		if (await d.change(s => !!s.intent)) { await executeIntent(d, this.disk, this.inputs, this.failedDownloads); again = true; }
+		if (await d.change(s => !!s.intent)) await executeIntent(d, this.disk, this.inputs, this.failedDownloads);
 		await this.collectStages();
-		if (again) this.schedule(false);
+		if (await d.needsAnotherPass(before, this.passes, [this.failedDownloads, this.failedSends])) this.schedule(false);
+		else this.passes.clear();
 	}
 	private async collectStages() {
 		const held = await this.device!.change(s => {

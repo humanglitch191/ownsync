@@ -293,8 +293,8 @@ test("the oracle rejects orphan-only bytes, a divergent disk and byte-identical 
 });
 
 const seed = process.env.FUZZ_SEED;
-const regressions = [2728545, 2747157, 2781512, 2808104, 2833507, 2845892, 2860885];
-test("table fuzz: saved intents and restore after cleaned chunks return", { skip: !!seed || !!process.env.FUZZ_FIRST }, async () => {
+const regressions = [2728545, 2747157, 2781512, 2808104, 2833507, 2845892, 2860885, 3145936];
+test("table fuzz: regression seeds", { skip: !!seed || !!process.env.FUZZ_FIRST }, async () => {
 	for (const n of regressions) await run(n,250);
 });
 const count = seed === undefined ? Number(process.env.FUZZ_RUNS ?? 20) : 1;

@@ -130,6 +130,16 @@ export async function planDisk(device: TableDevice, disk: DiskPort, inputs: Disk
 		await device.change(async () => disk.discardTemp());
 		await executeIntent(device, disk, inputs, failedDownloads);
 	}
+	const seen = new Set<string>();
+	let before: number;
+	do {
+		before = device.revision;
+		await planPass(device, disk, inputs, event, failedDownloads);
+		event = { kind: "settle" }; // consume the user's event once
+	} while (await device.needsAnotherPass(before, seen));
+}
+
+async function planPass(device: TableDevice, disk: DiskPort, inputs: DiskInputs, event: Event, failedDownloads?: Set<string>) {
 	await device.change(async s => {
 		const view = await inventory(s, disk, inputs, event);
 		const defer = bindEvent(s, view, event, inputs);

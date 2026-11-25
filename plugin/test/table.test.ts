@@ -334,6 +334,25 @@ test("a restarted download respects a new owner's pending change at its destinat
 	}
 });
 
+test("one settle plans a waiting rename when a later file releases its path (seed 3145936)", async () => {
+	const { a, b, w } = await pair();
+	a.disk.edit("q.bin", "old"); await a.settle(); await b.settle();
+	for (const d of [a, b]) {
+		d.disk.files.delete("q.bin"); await d.plan({ kind: "deleted", path: "q.bin" });
+	}
+	await a.settle();
+	await a.disk.moveIf("x.bin", "q.bin", a.disk.hash("x.bin")!);
+	await a.plan({ kind: "renamed", from: "x.bin", to: "q.bin" }); await a.settle();
+	await b.pull(); await b.deliver(); // stale deletion refused; its local binding still owns q.bin
+	const head = w.seq;
+	await b.plan();
+	assert.equal(await b.dev.change(s => s.intent?.kind), "rename");
+	await b.effect();
+	assert.deepEqual([...b.disk.files.keys()], ["q.bin"]);
+	assert.equal(b.disk.text("q.bin"), "A");
+	assert.equal(w.seq, head);
+});
+
 test("a saved rename cannot move another file that now owns its source", async () => {
 	const { a, b } = await pair();
 	a.disk.edit("other.bin", "A"); await a.settle(); await b.settle();
