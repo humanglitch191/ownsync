@@ -414,6 +414,37 @@ test("an interrupted first write retains the note ID for an extension and preser
 	}
 });
 
+test("a first write cannot claim another note's agreed bytes as an extension", async () => {
+	for (const moved of [true, false]) {
+		const { devs } = world(), [author, reader] = devs as [Device, Device];
+		const original = "a longer note";
+		author.write("Source.md", original);
+		await quiesce(devs);
+		const source = reader.engine!.noteAt("Source.md")!;
+		reader.trace = line => {
+			if (line.includes("commits ") && line.includes("@Destination.md")) reader.crash(1);
+		};
+		author.write("Destination.md", "a");
+		await quiesce(devs);
+		const intended = author.engine!.noteAt("Destination.md")!;
+		assert.equal(reader.alive, false);
+		assert.equal(reader.files.has("Destination.md"), false);
+		if (moved) reader.rename("Source.md", "Destination.md");
+		else reader.write("Destination.md", original);
+		reader.trace = null;
+		reader.boot(); reader.connect(); await quiesce(devs);
+		for (const d of devs) {
+			assert.equal(disk(d)[d.engine!.pathOf(intended)!], "a");
+			const sourcePath = d.engine!.pathOf(source)!;
+			assert.equal(disk(d)[sourcePath], original);
+			if (moved) assert.equal(d.storedIndex().get(source)?.p, "Destination.md");
+			else assert.equal(sourcePath, "Source.md");
+			assert.deepEqual(Object.values(disk(d)).sort(), moved ? ["a", original] : ["a", original, original]);
+		}
+		noProblems(devs);
+	}
+});
+
 test("a crash between recording a remote edit and writing the file is finished at the next start", async () => {
 	const { devs: [a, b] } = world();
 	a!.write("Note.md", "one");

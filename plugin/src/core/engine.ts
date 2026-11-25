@@ -142,8 +142,8 @@ function grewFrom(older: string, text: string): boolean {
 	}
 	return true;
 }
-function matchesFirstWrite(intended: string | undefined, disk: string): boolean {
-	return intended === disk || (!!intended?.trim() && grewFrom(intended, disk));
+function matchesFirstWrite(intended: string | undefined, disk: string, otherAgreements: string[]): boolean {
+	return intended === disk || (!otherAgreements.length && !!intended?.trim() && grewFrom(intended, disk));
 }
 /**
  * How much of the smaller text is in the larger one: a note that grew or shrank a lot is still the same note.
@@ -940,6 +940,14 @@ export class Engine {
 		this.del(`base:${id}`);
 	}
 
+	private otherNoteAgreements(id: string, hash: string): string[] {
+		const matches: string[] = [];
+		for (const [other, m] of this.metas) {
+			if (other !== id && m.baseHash === hash && !this.isAttachment(other)) matches.push(other);
+		}
+		return matches;
+	}
+
 	/**
 	 * Startup: find what changed on disk while the engine wasn't running, and finish interrupted writes.
 	 *
@@ -959,6 +967,7 @@ export class Engine {
 		const adrift = new Map<string, Set<string>[]>(); // note → the words of those texts
 		const like = (mine: Set<string>[], theirs: Set<string>) => Math.max(...mine.map((m) => alike(m, theirs)));
 		const loose = new Map<string, Set<string>>(); // path → the words of the file's text
+		const contested = new Map<string, string | undefined>(); // first-write path → exact missing owner, if unique
 		const home = new Map<string, string>(); // note → its path, when a file is still there
 		const changed = new Map<string, string>(); // attachment → its path, where its file now has other content
 		for (const [path, id] of [...this.byPath]) {
@@ -978,11 +987,18 @@ export class Engine {
 			if (intended !== undefined) mine.push(units(intended));
 			if (f) {
 				const disk = await this.disk.read(path), theirs = units(disk);
-				if (m.writing && m.baseHash === undefined && matchesFirstWrite(intended ?? current, disk)) {
-					todo.add(id);
-					continue;
+				if (m.writing && m.baseHash === undefined) {
+					const others = this.otherNoteAgreements(id, await this.opts.hash(disk));
+					if (matchesFirstWrite(intended ?? current, disk, others)) { todo.add(id); continue; }
+					if (others.length) {
+						const missing = others.filter(other => {
+							const from = this.metaOf(other).diskPath;
+							return from !== undefined && !onDisk.has(from);
+						});
+						contested.set(path, missing.length === 1 ? missing[0] : undefined);
+					}
 				}
-				if (like(mine, theirs) >= ALIKE) { todo.add(id); continue; } // an ordinary edit, or an editor's save
+				if (!contested.has(path) && like(mine, theirs) >= ALIKE) { todo.add(id); continue; } // an ordinary edit, or an editor's save
 				loose.set(path, theirs); // perhaps a different file now sits at the note's path
 				// Only a note whose file was here can claim it however much it changed. One that was only about to be
 				// written here (the engine stopped first) has no file yet: a different text here is someone else's.
@@ -1012,8 +1028,11 @@ export class Engine {
 		for (const [id, mine] of adrift) for (const [path, theirs] of loose) {
 			// The note's own recovered copy, written just before the engine stopped and not yet on record, is never the note.
 			if (path.includes(` (recovered ${id.slice(0, 6)}`)) continue;
+			// A rejected first write has no agreement here. Word overlap cannot reclaim the file.
+			const m = this.metaOf(id);
+			if (m.diskPath === path && contested.has(path)) continue;
 			// A recovery copy holds its note's text too: when both match a file, the file is the note's.
-			const score = like(mine, theirs) - (this.metaOf(id).copyOf ? 0.01 : 0);
+			const score = contested.get(path) === id ? Infinity : like(mine, theirs) - (m.copyOf ? 0.01 : 0);
 			if (score >= ALIKE) pairs.push([score, id, path]);
 		}
 		pairs.sort((x, y) => y[0] - x[0] || (x[1] + x[2] < y[1] + y[2] ? -1 : 1));
@@ -1164,7 +1183,7 @@ export class Engine {
 		// Exactly where an unplaced note belongs, and mostly its text: the engine wrote this file and stopped
 		// before recording it, and the user has edited it since. Not on a device just joining the vault: there
 		// a near-match may be a stale copy, and both versions are kept.
-		if (owner && mine !== undefined && !this.joining && alike(units(mine), units(text)) >= ALIKE) {
+		if (owner && mine !== undefined && !this.joining && alike(units(mine), units(text)) >= ALIKE && !this.otherNoteAgreements(owner, hash).length) {
 			this.place(owner, path);
 			await this.takeFile(owner, path, file, "merge");
 			return owner;
@@ -1391,7 +1410,7 @@ export class Engine {
 			// text we meant to write. An unrelated file at the old path belongs to the user.
 			base = await this.read<Uint8Array>(`base:${id}`) ?? await this.state(id);
 			const intended = this.textFrom(base);
-			if (!matchesFirstWrite(intended, text)) {
+			if (!matchesFirstWrite(intended, text, this.otherNoteAgreements(id, hash))) {
 				await this.forget(id);
 				if (path !== this.effectivePath(id) && await this.disk.stat(path)) {
 					const other = await this.takeUnknown(path);
