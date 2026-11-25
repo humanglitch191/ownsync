@@ -177,12 +177,14 @@ test("closed-file edit: single-sided diff merges onto unchanged base; concurrent
 	// 3) Second clash while first conflict copy is unresolved -> held, NO second fork, disk never overwritten, live typing syncs
 	const remote2 = env.crdt.applyToUnchangedBase(s.docs.get(id)!, "alpha gamma beta remote 2", 2).agreement;
 	s = runStep(s, { t: "yjsUpdate", id, docState: remote2 }, env).state;
-	s = runStep(s, {
+	res = runStep(s, {
 		t: "intentDone",
 		intent: s.intent!,
 		outcome: "preconditionFailed",
 		after: obsFile("n.md", "outside edit 2", 7),
-	}, env).state;
+	}, env);
+	s = res.state;
+	assert.ok(res.actions.some(a => a.t === "problem" && /unresolved conflict copy/.test(a.message)));
 	res = runStep(s, {
 		t: "diskObs",
 		event: "changed",
@@ -197,7 +199,7 @@ test("closed-file edit: single-sided diff merges onto unchanged base; concurrent
 	assert.equal([...s.notes.values()].filter(n => n.copyOf === id).length, 1, "one-copy cap stops conflict storm");
 	assert.equal(s.notes.get(id)?.held, true);
 	assert.equal(s.intent, undefined, "held note disk file is never overwritten");
-	assert.ok(res.actions.some(a => a.t === "problem" && /unresolved conflict copy/.test(a.message)));
+	assert.equal(res.actions.some(a => a.t === "problem"), false, "held notice is deduplicated");
 
 	// Live typing (YjsUpdate) still accepted while held
 	const remote3 = env.crdt.applyToUnchangedBase(s.docs.get(id)!, "alpha gamma beta remote 3", 2).agreement;
@@ -561,7 +563,7 @@ test("brakeApproved persists across multiple deletions until pending count reach
 	s = res.state;
 	const reqs = res.actions.filter(a => a.t === "workerReq");
 	assert.equal(reqs.length, 2);
-	assert.equal(s.brakePaused?.approved, true);
+	assert.equal(s.brakePaused?.approvedIds?.length, 2);
 	// Next step with pending count at zero clears approval
 	s = runStep(s, { t: "answer", req: (reqs[0] as Extract<NoteAction, { t: "workerReq" }>).request.req, ok: 2 }, env).state;
 	assert.equal(s.brakePaused, undefined, "once pending deletes reach 0, approval clears");

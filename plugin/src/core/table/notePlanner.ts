@@ -117,6 +117,8 @@ export interface NoteEntry {
 	firstTextPending?: boolean;
 	needsInitialPublish?: boolean;
 	needsSnapshotPublish?: boolean;
+	/** Durable unqueued/unacked merge payload so crash between NoteDevice commit and outbox commit never loses a publish. */
+	unpublished?: { update: Uint8Array; isSnapshot?: boolean };
 }
 
 export interface DiskObsFile {
@@ -139,8 +141,9 @@ export interface NoteBlocked {
 
 export interface BrakeState {
 	count: number;
-	approved?: boolean;
+	approvedIds?: string[]; // exact note IDs covered by the owner's approval
 	declined?: boolean;
+	declinedIds?: string[]; // incoming deletion note IDs held by decline (stop counting toward new prompts)
 }
 
 export interface VaultNoteState {
@@ -160,6 +163,9 @@ export interface VaultNoteState {
 	noteAuthority: boolean;
 	lastOpenResult?: { id: string; allowed: boolean };
 	pendingProblems: [string, string][];
+	emittedNotices: Set<string>;
+	touched: Set<string>; // note IDs touched since last next(), or null/all via fullScan
+	fullScan: boolean;
 }
 
 export interface LegacyNoteSeed {
@@ -183,7 +189,7 @@ export type NoteInput =
 		listingComplete: boolean;
 		files: Map<string, DiskObsFile>;
 	}
-	| { t: "yjsUpdate"; id: string; docState: Uint8Array; isFirstTextAck?: boolean }
+	| { t: "yjsUpdate"; id: string; docState: Uint8Array; isFirstTextAck?: boolean; textQueued?: boolean }
 	| { t: "editorOpen"; id: string }
 	| { t: "editorClose"; id: string }
 	| { t: "row"; row: NoteRow }
@@ -200,7 +206,6 @@ export type NoteInput =
 	| { t: "pathDirty"; path: string; delta: 1 | -1 };
 
 export type NoteAction =
-	| { t: "discardTemp" }
 	| { t: "forget"; req: string }
 	| { t: "yjsMerge"; id: string; update: Uint8Array; agreement: Uint8Array; isInitial?: boolean; isSnapshot?: boolean }
 	| { t: "workerReq"; id: string; request: NoteRequest }
@@ -222,6 +227,30 @@ export interface StepEnv {
 
 const DEFAULT_BRAKE = { minCount: 20, minFraction: 0.25 };
 
+const textCache = new WeakMap<TextCrdt, WeakMap<Uint8Array, string | undefined>>();
+const snapCache = new WeakMap<TextCrdt, WeakMap<Uint8Array, string>>();
+
+function cachedText(crdt: TextCrdt, state: Uint8Array | undefined): string | undefined {
+	if (!state) return undefined;
+	let perCrdt = textCache.get(crdt);
+	if (!perCrdt) textCache.set(crdt, perCrdt = new WeakMap());
+	if (perCrdt.has(state)) return perCrdt.get(state);
+	const t = crdt.completeText(state);
+	perCrdt.set(state, t);
+	return t;
+}
+
+function cachedSnap(crdt: TextCrdt, state: Uint8Array): string {
+	let perCrdt = snapCache.get(crdt);
+	if (!perCrdt) snapCache.set(crdt, perCrdt = new WeakMap());
+	let snap = perCrdt.get(state);
+	if (snap === undefined) {
+		snap = crdt.snapshot(state);
+		perCrdt.set(state, snap);
+	}
+	return snap;
+}
+
 export function emptyVaultNoteState(firstSync = false): VaultNoteState {
 	return {
 		notes: new Map(),
@@ -237,6 +266,9 @@ export function emptyVaultNoteState(firstSync = false): VaultNoteState {
 		firstSync,
 		noteAuthority: true,
 		pendingProblems: [],
+		emittedNotices: new Set(),
+		touched: new Set(),
+		fullScan: false,
 	};
 }
 
@@ -268,8 +300,14 @@ function cloneState(s: VaultNoteState): VaultNoteState {
 		dirtyPaths: new Map(s.dirtyPaths),
 		blocked: new Map(s.blocked),
 		forget: new Map(s.forget),
-		brakePaused: s.brakePaused ? { ...s.brakePaused } : undefined,
+		brakePaused: s.brakePaused ? {
+			...s.brakePaused,
+			approvedIds: s.brakePaused.approvedIds ? [...s.brakePaused.approvedIds] : undefined,
+			declinedIds: s.brakePaused.declinedIds ? [...s.brakePaused.declinedIds] : undefined,
+		} : undefined,
 		pendingProblems: [...s.pendingProblems],
+		emittedNotices: new Set(s.emittedNotices),
+		touched: new Set(s.touched),
 	};
 }
 
@@ -283,6 +321,9 @@ function setEntry(s: VaultNoteState, next: NoteEntry): void {
 	if (knownDoc && knownDoc !== next.id) throw new Error("A note's file and document IDs must stay together");
 	s.filesToDocs.set(next.file, next.id);
 	s.notes.set(next.id, next);
+	s.touched.add(next.id);
+	if (next.copyOf) s.touched.add(next.copyOf);
+	if (old?.copyOf) s.touched.add(old.copyOf);
 
 	// Rebuild affected row path index using highest-seq winner (catch-up can deliver swap seqs out of path order).
 	const touched = new Set<string>();
@@ -300,19 +341,17 @@ function setEntry(s: VaultNoteState, next: NoteEntry): void {
 	}
 }
 
-function rowClaimPath(n: NoteEntry): string | undefined {
-	return n.diskPath ?? n.row?.path ?? (n.change?.t === "set" || n.change?.t === "restore" ? n.change.path : undefined);
-}
-
 /**
  * True when `id` currently has an unresolved local conflict/recovered copy (`copyOf === id`)
  * that the user has not deleted or renamed away. Per-device because `copyOf` is local state.
+ * Note: conflictOriginPath is only cleared on deletion or user rename after placement, so
+ * Worker row path negotiation before placement never lifts the cap prematurely.
  */
 export function hasUnresolvedConflict(state: VaultNoteState, id: string): boolean {
 	for (const c of state.notes.values()) {
 		if (c.copyOf !== id || c.conflictOriginPath === undefined) continue;
 		if (c.row?.deleted != null || c.change?.t === "del") continue;
-		if (rowClaimPath(c) === c.conflictOriginPath) return true;
+		if (!c.diskPath || c.diskPath === c.conflictOriginPath) return true;
 	}
 	return false;
 }
@@ -375,16 +414,16 @@ function desiredPath(n: NoteEntry): string | undefined {
 function captureSnapshot(state: VaultNoteState, n: NoteEntry, env: StepEnv): string | undefined {
 	if (n.missing && n.missing.path === n.diskPath) return n.missing.snapshot;
 	const src = (n.editor !== "open" ? n.baseState : undefined) ?? state.docs.get(n.id);
-	if (!src || env.crdt.completeText(src) === undefined) return undefined;
-	return env.crdt.snapshot(src);
+	if (!src || cachedText(env.crdt, src) === undefined) return undefined;
+	return cachedSnap(env.crdt, src);
 }
 
 function markMissingNote(state: VaultNoteState, n: NoteEntry, path: string, env: StepEnv): void {
 	if (n.editor === "open") {
 		if (n.missing?.path === path) return;
 		const doc = state.docs.get(n.id);
-		if (!doc || env.crdt.completeText(doc) === undefined) return;
-		setEntry(state, { ...n, missing: { path, snapshot: env.crdt.snapshot(doc) } });
+		if (!doc || cachedText(env.crdt, doc) === undefined) return;
+		setEntry(state, { ...n, missing: { path, snapshot: cachedSnap(env.crdt, doc) } });
 		return;
 	}
 	const snap = captureSnapshot(state, n, env);
@@ -438,7 +477,7 @@ function isDirty(state: VaultNoteState, path: string | undefined): boolean {
  * while incoming deletions from peers remain held until `BrakeApproved`.
  */
 function declineBrake(state: VaultNoteState): void {
-	let incomingHeld = 0;
+	const declinedIds: string[] = [];
 	for (const n of state.notes.values()) {
 		if (n.change?.t === "del" && n.row?.deleted == null && !n.inFlight) {
 			setEntry(state, {
@@ -449,13 +488,81 @@ function declineBrake(state: VaultNoteState): void {
 				forkedHash: undefined,
 			});
 		} else if (n.row?.deleted != null && n.diskPath) {
-			incomingHeld++;
+			declinedIds.push(n.id);
 		}
 	}
-	if (incomingHeld > 0) {
-		state.brakePaused = { count: incomingHeld, declined: true, approved: false };
+	if (declinedIds.length > 0) {
+		state.brakePaused = { count: declinedIds.length, declined: true, declinedIds };
 	} else {
 		state.brakePaused = undefined;
+	}
+	state.fullScan = true;
+}
+
+function settleStartupIntent(s: VaultNoteState, env: StepEnv): void {
+	const op = s.intent;
+	if (!op) return;
+	s.intent = undefined;
+	const n = s.notes.get(op.id);
+	if (!n) return;
+	if (op.kind === "write") {
+		const obs = s.observed.get(op.path);
+		if (obs && !obs.unreadable && obs.text !== undefined) {
+			const obsHash = obs.hash ?? env.hash(obs.text);
+			if (obsHash === n.intendedHash || obs.text === op.text) {
+				setEntry(s, {
+					...n,
+					diskPath: op.path,
+					missing: undefined,
+					forkedHash: undefined,
+					held: false,
+					baseState: n.intended ?? s.docs.get(op.id),
+					baseStat: { ...obs.stat, hash: obsHash },
+					intended: undefined,
+					intendedHash: undefined,
+					editor: n.editor === "owed-doc" || n.editor === "owed-recover" ? "closed" : n.editor,
+				});
+				return;
+			}
+		}
+		setEntry(s, { ...n, intended: undefined, intendedHash: undefined });
+		return;
+	}
+	if (op.kind === "move") {
+		const src = s.observed.get(op.from);
+		const dest = s.observed.get(op.path);
+		const srcHash = src && !src.unreadable && src.text !== undefined ? (src.hash ?? env.hash(src.text)) : undefined;
+		const destHash = dest && !dest.unreadable && dest.text !== undefined ? (dest.hash ?? env.hash(dest.text)) : undefined;
+		if (destHash === op.expectedHash && srcHash !== op.expectedHash) {
+			let change = n.change;
+			let conflictOriginPath = n.conflictOriginPath;
+			if (op.park && !n.row && change?.t === "set") change = { ...change, path: op.path };
+			if (conflictOriginPath && op.path !== conflictOriginPath) conflictOriginPath = undefined;
+			setEntry(s, { ...n, diskPath: op.path, missing: undefined, change, conflictOriginPath });
+		} else {
+			s.touched.add(op.id);
+		}
+		return;
+	}
+	// remove
+	const obs = s.observed.get(op.path);
+	const obsHash = obs && !obs.unreadable && obs.text !== undefined ? (obs.hash ?? env.hash(obs.text)) : undefined;
+	if (!obs || (obsHash !== undefined && obsHash !== op.expectedHash)) {
+		setEntry(s, {
+			...n,
+			diskPath: undefined,
+			missing: undefined,
+			conflictOriginPath: undefined,
+			forkedHash: undefined,
+			held: false,
+			baseState: undefined,
+			baseStat: undefined,
+			intended: undefined,
+			intendedHash: undefined,
+			change: n.change?.t === "del" ? undefined : n.change,
+		});
+	} else {
+		s.touched.add(op.id);
 	}
 }
 
@@ -469,12 +576,18 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 			s.dirtyPaths.clear();
 			s.observed.clear();
 			s.listingComplete = false;
-			s.intent = undefined;
-			s.brakePaused = undefined;
+			// Keep durable s.intent across restart so the first complete startup listing settles it cleanly.
+			s.brakePaused = s.brakePaused?.declined ? { ...s.brakePaused } : undefined;
+			s.emittedNotices.clear();
+			s.fullScan = true;
 			for (const n of s.notes.values()) {
 				const next: NoteEntry = { ...n };
 				if (next.editor === "open") next.editor = "owed-recover";
 				if (!s.firstSync) next.join = undefined;
+				if (next.unpublished) {
+					if (next.unpublished.isSnapshot) next.needsSnapshotPublish = true;
+					else next.needsInitialPublish = true;
+				}
 				setEntry(s, next);
 			}
 			return s;
@@ -482,6 +595,7 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 
 		case "finishFirstSync": {
 			s.firstSync = false;
+			s.fullScan = true;
 			return s;
 		}
 
@@ -489,6 +603,7 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 			const { seed } = input;
 			s.firstSync = seed.firstSync;
 			s.noteAuthority = true;
+			s.fullScan = true;
 			for (const [id, doc] of seed.docs) s.docs.set(id, doc);
 			for (const n of seed.notes) setEntry(s, { ...n });
 			if (seed.forget) for (const [req] of seed.forget) s.forget.set(req, true);
@@ -498,12 +613,29 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 		case "pathDirty": {
 			const count = (s.dirtyPaths.get(input.path) ?? 0) + input.delta;
 			if (count > 0) s.dirtyPaths.set(input.path, count);
-			else s.dirtyPaths.delete(input.path);
+			else {
+				s.dirtyPaths.delete(input.path);
+				const ownerId = s.byPath.get(input.path) ?? s.rowsByPath.get(input.path);
+				if (ownerId) s.touched.add(ownerId);
+				for (const n of s.notes.values()) {
+					if (desiredPath(n) === input.path || n.change?.path === input.path) s.touched.add(n.id);
+				}
+			}
 			return s;
 		}
 
 		case "brakeApproved": {
-			s.brakePaused = { count: s.brakePaused?.count ?? 0, approved: true, declined: false };
+			const approvedIds: string[] = [];
+			for (const n of s.notes.values()) {
+				if (n.change?.t === "del" && !n.inFlight) approvedIds.push(n.id);
+				else if (n.row?.deleted != null && n.diskPath && !s.blocked.has(n.id)) {
+					const docState = s.docs.get(n.id);
+					if (!docState || !env.crdt.outsideDeletion(n.row, docState)) approvedIds.push(n.id);
+				}
+			}
+			s.brakePaused = { count: approvedIds.length, approvedIds, declined: false };
+			s.emittedNotices.clear();
+			s.fullScan = true;
 			return s;
 		}
 
@@ -536,11 +668,15 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 
 		case "yjsUpdate": {
 			s.docs.set(input.id, input.docState);
+			s.touched.add(input.id);
 			const n = s.notes.get(input.id);
 			if (!n) return s;
 			let next: NoteEntry = n;
+			if (input.textQueued && n.unpublished) {
+				next = { ...next, unpublished: undefined, needsInitialPublish: false, needsSnapshotPublish: false };
+			}
 			if (input.isFirstTextAck && n.firstTextPending) {
-				next = { ...next, firstTextPending: false, needsInitialPublish: false };
+				next = { ...next, firstTextPending: false, needsInitialPublish: false, unpublished: undefined };
 			}
 			if (next.row?.deleted != null && env.crdt.outsideDeletion(next.row, input.docState)) {
 				if (next.change?.t !== "restore" || next.change.base !== next.row.seq) {
@@ -603,13 +739,14 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 			const docState = s.docs.get(input.id);
 			if (!n?.row || n.row.deleted === null) return s;
 			if (input.deletionSeq !== undefined && n.row.seq !== input.deletionSeq) return s;
-			if (!docState || env.crdt.completeText(docState) === undefined) return s;
+			if (!docState || cachedText(env.crdt, docState) === undefined) return s;
 			const target = input.path ?? n.row.path;
 			const resolved = pickLiveRowPath(s, target, n.id, true);
 			setEntry(s, {
 				...n,
 				change: { t: "restore", path: resolved, base: n.row.seq },
 				needsSnapshotPublish: true,
+				unpublished: { update: docState, isSnapshot: true },
 			});
 			return s;
 		}
@@ -620,7 +757,20 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 			const p = owner.inFlight;
 			s.forget.set(p.req, true);
 			if (input.ok !== undefined) {
-				setEntry(s, { ...owner, inFlight: { ...p, accepted: input.ok } });
+				// If the ordered Row stream already delivered seq >= ok, finish immediately instead of wedging inFlight.
+				if (owner.row && owner.row.seq >= input.ok) {
+					const next: NoteEntry = { ...owner, inFlight: undefined };
+					if (p.action !== "del") next.basePath = p.path;
+					if (next.change && JSON.stringify(next.change) === JSON.stringify(p.change)
+						&& !(p.change.t === "del" && p.action === "set")) {
+						next.change = undefined;
+					} else if (next.change?.t === "set" && p.action === "set") {
+						next.change = { ...next.change, basePath: p.path };
+					}
+					setEntry(s, next);
+				} else {
+					setEntry(s, { ...owner, inFlight: { ...p, accepted: input.ok } });
+				}
 				return s;
 			}
 			const refusedRow = input.refused?.row ?? null;
@@ -681,11 +831,37 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				} else {
 					if (input.after) s.observed.set(op.path, input.after);
 					else if (input.outcome === "preconditionFailed") s.observed.delete(op.path);
-					if (input.outcome === "unreadable" || input.outcome === "caseClash" || input.outcome === "preconditionFailed") {
+					if (input.outcome === "unreadable" || input.outcome === "caseClash") {
 						blockNote(s, op.id, op.id, op.seq, [op.path]);
 						if (input.outcome === "caseClash") s.pendingProblems.push([op.path, "Another note differs only by case on this device"]);
 					}
 					setEntry(s, { ...n, intended: undefined, intendedHash: undefined });
+					if (
+						input.outcome === "preconditionFailed" &&
+						op.expectedHash === null &&
+						input.after &&
+						!input.after.unreadable &&
+						input.after.text !== undefined &&
+						!s.byPath.has(op.path)
+					) {
+						const obsHash = input.after.hash ?? env.hash(input.after.text);
+						const newId = env.newId();
+						const newFile = env.newId();
+						const docState = env.crdt.create(input.after.text, env.clientId);
+						s.docs.set(newId, docState);
+						setEntry(s, {
+							id: newId,
+							file: newFile,
+							diskPath: op.path,
+							baseState: docState,
+							baseStat: { ...input.after.stat, hash: obsHash },
+							editor: "closed",
+							firstTextPending: true,
+							needsInitialPublish: true,
+							unpublished: { update: docState },
+							change: { t: "set", path: op.path },
+						});
+					}
 				}
 				return s;
 			}
@@ -703,8 +879,12 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 					}
 					setEntry(s, { ...n, diskPath: op.path, missing: undefined, change, conflictOriginPath });
 				} else {
-					blockNote(s, op.id, op.id, op.seq, [op.from, op.path]);
-					if (input.outcome === "caseClash") s.pendingProblems.push([op.path, "Another note differs only by case on this device"]);
+					if (input.outcome === "unreadable" || input.outcome === "caseClash") {
+						blockNote(s, op.id, op.id, op.seq, [op.from, op.path]);
+						if (input.outcome === "caseClash") s.pendingProblems.push([op.path, "Another note differs only by case on this device"]);
+					} else {
+						s.touched.add(op.id);
+					}
 				}
 				return s;
 			}
@@ -726,20 +906,41 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				});
 			} else {
 				if (input.after) s.observed.set(op.path, input.after);
-				blockNote(s, op.id, op.id, op.seq, [op.path]);
+				if (input.outcome === "unreadable" || input.outcome === "caseClash") {
+					blockNote(s, op.id, op.id, op.seq, [op.path]);
+				} else {
+					s.touched.add(op.id);
+				}
 			}
 			return s;
 		}
 
 		case "diskObs": {
-			s.listingComplete = input.listingComplete;
-			if (input.event === "startup" || input.event === "settle") {
+			const isFullScan = input.event === "startup" || input.event === "settle";
+			if (isFullScan) {
+				s.listingComplete = input.listingComplete;
+				s.fullScan = true;
 				if (input.listingComplete) s.observed = new Map(input.files);
 				else for (const [p, f] of input.files) s.observed.set(p, f);
+				if (input.event === "startup" && input.listingComplete && s.intent) {
+					settleStartupIntent(s, env);
+				}
 			} else {
 				for (const [p, f] of input.files) s.observed.set(p, f);
 				if (input.path && !input.files.has(input.path) && input.listingComplete) s.observed.delete(input.path);
 				if (input.from && !input.files.has(input.from) && input.listingComplete) s.observed.delete(input.from);
+				if (input.path) {
+					const owner = s.byPath.get(input.path) ?? s.rowsByPath.get(input.path);
+					if (owner) s.touched.add(owner);
+				}
+				if (input.from) {
+					const owner = s.byPath.get(input.from) ?? s.rowsByPath.get(input.from);
+					if (owner) s.touched.add(owner);
+				}
+				if (input.to) {
+					const owner = s.byPath.get(input.to) ?? s.rowsByPath.get(input.to);
+					if (owner) s.touched.add(owner);
+				}
 			}
 			clearResolvedBlockers(s);
 
@@ -777,6 +978,7 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 				const obsHash = obs.hash ?? (obs.text !== undefined ? env.hash(obs.text) : undefined);
 				if (obs.text !== undefined && obsHash !== undefined && n.intendedHash && obsHash === n.intendedHash) {
 					// Causal fingerprint match of our own disk write (no TTL windows).
+					if (s.intent?.id === id && s.intent.kind === "write") s.intent = undefined;
 					setEntry(s, {
 						...n,
 						missing: undefined,
@@ -808,16 +1010,12 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 						continue;
 					}
 				}
-				if (!s.firstSync) {
-					// Clean stale join if path is handled later
-				}
 				// Try join if firstSync candidate matches complete doc text.
 				const rowId = s.rowsByPath.get(path);
 				const rowNote = rowId ? s.notes.get(rowId) : undefined;
 				if (s.firstSync && rowNote && !rowNote.diskPath) {
-					const docText = env.crdt.completeText(s.docs.get(rowNote.id));
+					const docText = cachedText(env.crdt, s.docs.get(rowNote.id));
 					if (docText === undefined) {
-						// Doc text hasn't arrived yet; remember candidate if firstSync.
 						setEntry(s, { ...rowNote, join: { path, hash: obsHash } });
 						continue;
 					}
@@ -851,6 +1049,7 @@ export function apply(prev: VaultNoteState, input: NoteInput, env: StepEnv): Vau
 					editor: "closed",
 					firstTextPending: true,
 					needsInitialPublish: true,
+					unpublished: { update: docState },
 					change: { t: "set", path },
 				});
 			}
@@ -889,15 +1088,19 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 
 	for (const req of s.forget.keys()) actions.push({ t: "forget", req });
 
-	// Pass 1: Complete any first-sync join candidates whose doc text arrived after DiskObs,
-	// process editor-closed deletions, tombstones, and closed-file content reconciliation.
-	for (const n0 of [...s.notes.values()]) {
-		let n = n0;
+	// Pass 1: Only inspect touched notes (or all notes on fullScan) and use cached text decoding.
+	const visitIds = s.fullScan ? [...s.notes.keys()] : [...s.touched];
+	s.touched.clear();
+	s.fullScan = false;
+
+	for (const id of visitIds) {
+		let n = s.notes.get(id);
+		if (!n) continue;
 
 		if (n.join && !n.diskPath) {
 			const obs = s.observed.get(n.join.path);
 			const docState = s.docs.get(n.id);
-			const docText = env.crdt.completeText(docState);
+			const docText = cachedText(env.crdt, docState);
 			if (obs && !obs.unreadable && obs.text !== undefined && docText !== undefined) {
 				if (docText === obs.text && !s.byPath.has(n.join.path)) {
 					n = {
@@ -928,6 +1131,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 							baseStat: { ...obs.stat, hash: n.join?.hash ?? env.hash(obs.text) },
 							editor: "closed",
 							firstTextPending: true,
+							unpublished: { update: createdDoc },
 							change: { t: "set", path: joinPath },
 						});
 						actions.push({ t: "yjsMerge", id: newId, update: createdDoc, agreement: createdDoc, isInitial: true });
@@ -969,7 +1173,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 		}
 
 		const docState = s.docs.get(n.id);
-		const docText = env.crdt.completeText(docState);
+		const docText = cachedText(env.crdt, docState);
 
 		if (n.row?.deleted != null) {
 			if (docState && env.crdt.outsideDeletion(n.row, docState)) {
@@ -984,6 +1188,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 
 		if (n.held && !hasUnresolvedConflict(s, n.id)) {
 			n = { ...n, held: false };
+			s.emittedNotices.delete("held:" + n.id);
 			setEntry(s, n);
 		}
 
@@ -997,6 +1202,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 				} else if (diskText === docText) {
 					const changedBase = !env.crdt.sameDocState(n.baseState, docState) || n.intended !== undefined || n.held || n.forkedHash !== undefined;
 					if (changedBase || n.editor !== "closed") {
+						s.emittedNotices.delete("held:" + n.id);
 						n = {
 							...n,
 							baseState: docState,
@@ -1010,8 +1216,8 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 						setEntry(s, n);
 					}
 				} else {
-					const intendedText = env.crdt.completeText(n.intended);
-					const baseText = env.crdt.completeText(n.baseState);
+					const intendedText = cachedText(env.crdt, n.intended);
+					const baseText = cachedText(env.crdt, n.baseState);
 					if (n.intended !== undefined) {
 						if (intendedText !== undefined && diskText === intendedText) {
 							n = {
@@ -1023,6 +1229,8 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 								forkedHash: undefined,
 							};
 							setEntry(s, n);
+						} else if ((n.editor === "owed-doc" || n.editor === "owed-recover") && env.crdt.onlyInserts(diskText, docText)) {
+							// Stale editor flush already contained in docText: let P4 write overwrite without forking.
 						} else if (baseText === undefined || diskText !== baseText) {
 							n = handleConflictOrHold(s, n, n.diskPath, diskText, diskHash, obs.stat, env, actions);
 						}
@@ -1043,6 +1251,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 							...n,
 							baseState: agreement,
 							baseStat: { ...obs.stat, hash: diskHash },
+							unpublished: { update },
 						};
 						setEntry(s, n);
 						actions.push({ t: "yjsMerge", id: n.id, update, agreement });
@@ -1054,48 +1263,75 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 			}
 		}
 	}
+	s.touched.clear();
 
-	// Pass 2: Collect pending WorkerReq candidates and local removals, and evaluate deletion brake.
-	const reqCandidates: { note: NoteEntry; request: NoteRequest }[] = [];
-	let outgoingDeletes = env.attachmentPendingDeletes ?? 0;
-	let incomingRemoves = 0;
+	// Pass 2: Evaluate deletion brake against exact pending deletion IDs.
+	// Known limit: deletions made one by one while the app runs don't trip the brake (catching that would need a time window).
+	const pendingDeleteIds: string[] = [];
+	const incomingRemoveIds: string[] = [];
 	let totalLiveFiles = env.attachmentTotalLive ?? 0;
 
 	for (const n of s.notes.values()) {
 		if (n.row?.deleted == null || n.diskPath !== undefined) totalLiveFiles++;
-		if (n.change?.t === "del" && !n.inFlight) outgoingDeletes++;
+		if (n.change?.t === "del" && !n.inFlight) pendingDeleteIds.push(n.id);
 		if (n.row?.deleted != null && n.diskPath && !s.blocked.has(n.id)) {
 			const docState = s.docs.get(n.id);
-			if (!docState || !env.crdt.outsideDeletion(n.row, docState)) incomingRemoves++;
+			if (!docState || !env.crdt.outsideDeletion(n.row, docState)) incomingRemoveIds.push(n.id);
 		}
 	}
 
-	const totalDeletes = outgoingDeletes + incomingRemoves;
+	const allDeleteIds = [...pendingDeleteIds, ...incomingRemoveIds];
+	const approvedSet = new Set(s.brakePaused?.approvedIds ?? []);
+	const declinedSet = new Set(s.brakePaused?.declinedIds ?? []);
+	// Stickily ignore incoming removals that were already declined by the owner.
+	const activeDeclinedIds = incomingRemoveIds.filter(id => declinedSet.has(id));
+	const unapprovedDeleteIds = allDeleteIds.filter(id => !approvedSet.has(id) && !(s.brakePaused?.declined && declinedSet.has(id)));
+	const unapprovedCount = unapprovedDeleteIds.length + (env.attachmentPendingDeletes ?? 0);
 	const brakeCfg = env.brake ?? DEFAULT_BRAKE;
+	const exceeds = unapprovedCount > brakeCfg.minCount && unapprovedCount > brakeCfg.minFraction * Math.max(1, totalLiveFiles);
 
-	if (totalDeletes === 0) {
-		s.brakePaused = undefined;
-	} else {
-		const exceeds = totalDeletes > brakeCfg.minCount && totalDeletes > brakeCfg.minFraction * Math.max(1, totalLiveFiles);
-		if (s.brakePaused?.declined && outgoingDeletes === 0) {
-			if (incomingRemoves > 0) {
-				s.brakePaused.count = incomingRemoves;
-				actions.push({
-					t: "problem",
-					path: "",
-					message: `${incomingRemoves} deleted files held on this device; approve to remove them`,
-				});
-			} else {
-				s.brakePaused = undefined;
-			}
-		} else if (exceeds && !s.brakePaused?.approved) {
-			s.brakePaused = { count: totalDeletes };
+	if (exceeds) {
+		s.brakePaused = {
+			count: unapprovedCount,
+			approvedIds: s.brakePaused?.approvedIds?.filter(id => allDeleteIds.includes(id)),
+			declined: s.brakePaused?.declined,
+			declinedIds: activeDeclinedIds.length ? activeDeclinedIds : undefined,
+		};
+		const brakeNoticeKey = `brake:${unapprovedCount}`;
+		if (!s.emittedNotices.has(brakeNoticeKey)) {
+			s.emittedNotices.add(brakeNoticeKey);
 			actions.push({
 				t: "massChangeBrake",
-				count: totalDeletes,
-				message: `This would delete ${totalDeletes} files. Continue?`,
+				count: unapprovedCount,
+				message: `This would delete ${unapprovedCount} files. Continue?`,
 			});
-			return { state: s, actions };
+		}
+		return { state: s, actions };
+	}
+
+	// Prune completed approvals & declined IDs; emit deduped notice when incoming removals remain held.
+	if (s.brakePaused?.declined && activeDeclinedIds.length > 0) {
+		s.brakePaused = {
+			count: activeDeclinedIds.length,
+			declined: true,
+			declinedIds: activeDeclinedIds,
+			approvedIds: s.brakePaused.approvedIds?.filter(id => allDeleteIds.includes(id)),
+		};
+		const heldKey = `declined:${activeDeclinedIds.length}`;
+		if (!s.emittedNotices.has(heldKey)) {
+			s.emittedNotices.add(heldKey);
+			actions.push({
+				t: "problem",
+				path: "",
+				message: `${activeDeclinedIds.length} deleted files held on this device; approve to remove them`,
+			});
+		}
+	} else {
+		const remainingApproved = s.brakePaused?.approvedIds?.filter(id => allDeleteIds.includes(id)) ?? [];
+		if (remainingApproved.length > 0) {
+			s.brakePaused = { count: remainingApproved.length, approvedIds: remainingApproved };
+		} else {
+			s.brakePaused = undefined;
 		}
 	}
 
@@ -1129,9 +1365,7 @@ export function next(prev: VaultNoteState, env: StepEnv): { state: VaultNoteStat
 		};
 		setEntry(s, { ...n, change: resolvedChange, inFlight: request });
 		actions.push({ t: "workerReq", id: n.id, request });
-		reqCandidates.push({ note: n, request });
 	}
-	void reqCandidates;
 
 	// Pass 3: Select at most one vault DiskIntent (only once disk listing is known after startup/scan).
 	if (!s.intent && s.listingComplete) {
@@ -1161,14 +1395,19 @@ function handleConflictOrHold(
 	actions: NoteAction[],
 ): NoteEntry {
 	if (hasUnresolvedConflict(s, n.id)) {
+		if (s.intent?.id === n.id && s.intent.kind === "write") s.intent = undefined;
 		if (!n.held) {
-			const heldEntry: NoteEntry = { ...n, held: true, forkedHash: undefined };
+			const heldEntry: NoteEntry = { ...n, held: true, forkedHash: undefined, intended: undefined, intendedHash: undefined };
 			setEntry(s, heldEntry);
-			actions.push({
-				t: "problem",
-				path: diskPath,
-				message: `${diskPath} has an unresolved conflict copy; resolve it to keep syncing this note's outside edits`,
-			});
+			const heldKey = "held:" + n.id;
+			if (!s.emittedNotices.has(heldKey)) {
+				s.emittedNotices.add(heldKey);
+				actions.push({
+					t: "problem",
+					path: diskPath,
+					message: `${diskPath} has an unresolved conflict copy; resolve it to keep syncing this note's outside edits`,
+				});
+			}
 			return heldEntry;
 		}
 		return n;
@@ -1188,7 +1427,7 @@ function handleConflictOrHold(
 		copyOf: n.id,
 		conflictOriginPath: copyPath,
 		firstTextPending: true,
-		needsInitialPublish: true,
+		unpublished: { update: copyDoc },
 		change: { t: "set", path: copyPath },
 	};
 	setEntry(s, copyEntry);
@@ -1208,22 +1447,23 @@ function handleConflictOrHold(
 function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undefined {
 	const sorted = [...s.notes.values()].sort((a, b) => a.id.localeCompare(b.id));
 
+	const declinedIncoming = new Set(s.brakePaused?.declined ? (s.brakePaused.declinedIds ?? []) : []);
+
 	// P1: Remove live disk files for confirmed tombstones (held when brake declined).
-	if (!s.brakePaused?.declined) {
-		for (const n of sorted) {
-			if (!n.diskPath || n.editor === "open" || s.blocked.has(n.id) || isDirty(s, n.diskPath)) continue;
-			if (n.row?.deleted == null) continue;
-			const docState = s.docs.get(n.id);
-			if (docState && env.crdt.outsideDeletion(n.row, docState)) continue;
-			const obs = s.observed.get(n.diskPath);
-			if (!obs || obs.unreadable || obs.text === undefined) continue;
-			const expectedHash = obs.hash ?? env.hash(obs.text);
-			// Destruction choke point: remove only if exact text is stored in baseState, docState, or preserved forkedHash.
-			const storedBase = env.crdt.completeText(n.baseState);
-			const storedDoc = env.crdt.completeText(docState);
-			if (obs.text !== storedBase && obs.text !== storedDoc && !(n.forkedHash !== undefined && expectedHash === n.forkedHash)) continue;
-			return { kind: "remove", id: n.id, path: n.diskPath, expectedHash, seq: n.row.seq };
-		}
+	for (const n of sorted) {
+		if (declinedIncoming.has(n.id)) continue;
+		if (!n.diskPath || n.editor === "open" || s.blocked.has(n.id) || isDirty(s, n.diskPath)) continue;
+		if (n.row?.deleted == null) continue;
+		const docState = s.docs.get(n.id);
+		if (docState && env.crdt.outsideDeletion(n.row, docState)) continue;
+		const obs = s.observed.get(n.diskPath);
+		if (!obs || obs.unreadable || obs.text === undefined) continue;
+		const expectedHash = obs.hash ?? env.hash(obs.text);
+		// Destruction choke point: remove only if exact text is stored in baseState, docState, or preserved forkedHash.
+		const storedBase = cachedText(env.crdt, n.baseState);
+		const storedDoc = cachedText(env.crdt, docState);
+		if (obs.text !== storedBase && obs.text !== storedDoc && !(n.forkedHash !== undefined && expectedHash === n.forkedHash)) continue;
+		return { kind: "remove", id: n.id, path: n.diskPath, expectedHash, seq: n.row.seq };
 	}
 
 	// P2: Move placed files whose desired path moved to a free path (run before vacating occupants).
@@ -1291,22 +1531,27 @@ function pickNextDiskIntent(s: VaultNoteState, env: StepEnv): NoteIntent | undef
 		if (!n.diskPath && (s.byPath.has(want) || s.observed.has(want) || caseClashPath(s, want))) continue;
 		if (n.diskPath && n.diskPath !== want) continue;
 		const docState = s.docs.get(n.id);
-		const docText = env.crdt.completeText(docState);
+		const docText = cachedText(env.crdt, docState);
 		if (docText === undefined) continue;
 		const obs = s.observed.get(want);
 		if (obs?.unreadable) continue;
 		if (obs?.text === docText) continue;
-		// Destruction choke point: overwrite only when disk text is already stored (baseState, intended, docState, or preserved forkedHash).
+		// Destruction choke point: overwrite only when disk text is already stored (baseState, intended, docState,
+		// preserved forkedHash, or a stale editor flush strictly contained in docText).
 		let expectedHash: string | null = null;
 		if (obs) {
 			if (obs.text === undefined) continue;
 			const obsHash = obs.hash ?? env.hash(obs.text);
-			const baseText = env.crdt.completeText(n.baseState);
-			const intendedText = env.crdt.completeText(n.intended);
+			const baseText = cachedText(env.crdt, n.baseState);
+			const intendedText = cachedText(env.crdt, n.intended);
+			const staleEditorFlush =
+				(n.editor === "owed-doc" || n.editor === "owed-recover") &&
+				env.crdt.onlyInserts(obs.text, docText);
 			const safeToOverwrite =
 				(baseText !== undefined && obs.text === baseText) ||
 				(intendedText !== undefined && obs.text === intendedText) ||
-				(n.forkedHash !== undefined && obsHash === n.forkedHash);
+				(n.forkedHash !== undefined && obsHash === n.forkedHash) ||
+				staleEditorFlush;
 			if (!safeToOverwrite) continue;
 			expectedHash = obsHash;
 		}
@@ -1378,13 +1623,18 @@ export class NoteDevice {
 			const doc = await store.get<Uint8Array>("state:" + id);
 			if (doc) state.docs.set(id, doc);
 		}
+		state.fullScan = true;
 		checkNoteInvariants(state);
 		return new NoteDevice(store, state);
 	}
 
 	snapshot(): VaultNoteState { return this.state; }
 
-	dispatch(input: NoteInput, env: StepEnv): Promise<{ state: VaultNoteState; actions: NoteAction[] }> {
+	dispatch(
+		input: NoteInput,
+		env: StepEnv,
+		onOutbox?: (puts: Map<string, unknown>, id: string, update: Uint8Array, isSnapshot: boolean) => void,
+	): Promise<{ state: VaultNoteState; actions: NoteAction[] }> {
 		const work = this.queue.then(async () => {
 			const before = this.state;
 			const result = step(before, input, env);
@@ -1393,16 +1643,21 @@ export class NoteDevice {
 
 			const puts = new Map<string, unknown>();
 			const deletes: string[] = [];
+			for (const act of result.actions) {
+				if (act.t === "yjsMerge") {
+					puts.set("state:" + act.id, after.docs.get(act.id) ?? act.agreement);
+					if (onOutbox) {
+						onOutbox(puts, act.id, act.update, !!act.isSnapshot);
+						const n = after.notes.get(act.id);
+						if (n?.unpublished) setEntry(after, { ...n, unpublished: undefined });
+					}
+				}
+			}
 			for (const [id, entry] of after.notes) {
 				if (before.notes.get(id) !== entry) puts.set(NOTE_STATE_PREFIX + id, entry);
 			}
 			for (const id of before.notes.keys()) {
 				if (!after.notes.has(id)) deletes.push(NOTE_STATE_PREFIX + id);
-			}
-			for (const act of result.actions) {
-				if (act.t === "yjsMerge") {
-					puts.set("state:" + act.id, after.docs.get(act.id) ?? act.agreement);
-				}
 			}
 			const metaChanged =
 				before.firstSync !== after.firstSync ||
