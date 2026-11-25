@@ -11,7 +11,7 @@ export class TableDisk implements DiskPort {
 	private get displaced() { return this.scratch + "/displaced"; }
 	constructor(private fs: AttachmentFs, private store: Store, private scratch: string,
 		readonly allowed: (path: string) => boolean, private hash: (bytes: Uint8Array) => Promise<string>,
-		private suffix: (h: string, n: number) => Promise<string>) { }
+		private suffix: (h: string, n: number) => Promise<string>, private journal = "table/fs") { }
 	private check(p: string) { if (!this.allowed(p)) throw new Error("Invalid attachment path"); }
 	async stat(path: string) {
 		this.check(path);
@@ -22,7 +22,7 @@ export class TableDisk implements DiskPort {
 		const files = [], folders = [""];
 		while (folders.length) {
 			const found = await this.fs.list(folders.pop()!);
-			for (const folder of found.folders) if (this.allowed(folder + "/file")) folders.push(folder);
+			for (const folder of found.folders) if (this.allowed(folder + "/file") || this.allowed(folder + "/file.md")) folders.push(folder);
 			for (const p of found.files) if (this.allowed(p)) {
 				const f = await this.stat(p);
 				if (f) files.push(f);
@@ -82,21 +82,21 @@ export class TableDisk implements DiskPort {
 			if (!applied && held && op.kind === "move") await this.putBack(op.from, actual!);
 		}
 		// Forget the journal first. A crash here leaves only disposable private bytes.
-		await this.store.commit(new Map(), ["table/fs"]);
+		await this.store.commit(new Map(), [this.journal]);
 		await this.remove(this.displaced);
 		return applied;
 	}
 	async discardTemp() {
-		const op = await this.store.get<Mutation>("table/fs");
+		const op = await this.store.get<Mutation>(this.journal);
 		if (op) await this.finish(op);
 		await this.remove(this.displaced); await this.remove(this.temp);
 	}
 	private async mutate(op: Mutation) {
 		this.check(op.from); if (op.to) this.check(op.to);
 		await this.folder(this.displaced);
-		if (await this.store.get("table/fs")) throw new Error("Interrupted attachment mutation");
+		if (await this.store.get(this.journal)) throw new Error("Interrupted attachment mutation");
 		await this.remove(this.displaced);
-		await this.store.commit(new Map([["table/fs", op]]), []);
+		await this.store.commit(new Map([[this.journal, op]]), []);
 		if (op.expected !== null && await this.fs.exists(op.from)) await this.fs.rename(op.from, this.displaced);
 		return this.finish(op);
 	}

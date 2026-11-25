@@ -131,6 +131,10 @@ export interface Upload {
 
 /** What this device knows about one note's (or attachment's) file. */
 export interface NoteMeta {
+	/** A table note created on this device can precede its confirmed row. */
+	tableNote?: boolean;
+	/** Last agreed row path, independent of the text agreement. */
+	basePath?: string;
 	/** Where the note is on this device's disk, if it is. */
 	diskPath?: string;
 	/** Hash of the text (of an attachment: its `h`) that disk and document last agreed on, and the file's stat then. */

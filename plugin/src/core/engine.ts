@@ -49,6 +49,8 @@
 
 import * as Y from "yjs";
 import { conflictName, places, type IndexValue } from "./places";
+import { completeText, noteInventory, planNoteContent, type NoteStructure } from "./table/noteDisk";
+import type { DiskPort } from "./table/disk";
 import type { NoteRows } from "./table/notes";
 import { legacyBases } from "./table/migration";
 import { applyText, onlyInserts } from "./text";
@@ -67,6 +69,7 @@ const MAX_MARK = 1024;
 
 export interface EngineOptions {
 	tableNotes?: NoteRows;
+	noteDisk?: DiskPort;
 	onNoteReady?(): void;
 	tableHistory?: {
 		deleted(): Promise<DeletedNote[]>;
@@ -241,6 +244,7 @@ export class Engine {
 	// One Yjs client ID per run, so a crash or a copied profile can never reuse an ID with different edits.
 	private clientId: number;
 	private table = false;
+	private noteAuthority = false;
 	get tableActive() { return this.table; }
 
 	constructor(private readonly store: Store, private readonly disk: Disk, private readonly opts: EngineOptions) {
@@ -283,7 +287,11 @@ export class Engine {
 	start(): Promise<void> {
 		return this.run("start", async () => {
 			this.table = !!await this.store.get("table/migrated");
-			if (this.table) await this.opts.tableNotes?.load();
+			if (this.table) {
+				await this.opts.tableNotes?.load();
+				this.noteAuthority = !!await this.store.get("table/note-authority");
+				await this.opts.noteDisk?.discardTemp();
+			}
 			this.meta = (await this.store.get<Meta>("meta")) ?? this.meta;
 			this.committedCursor = this.meta.cursor;
 			const index = await this.store.get<Uint8Array>("index");
@@ -338,6 +346,17 @@ export class Engine {
 		this.later(() => void this.run(`disk ${path}`, async () => {
 			this.mark(path, -1);
 			if (this.table && !isNote(path)) return;
+			if (this.noteAuthority && isNote(path)) {
+				if (this.dirty.has(path)) return;
+				const id = this.byPath.get(path);
+				if (id) await this.settleTableNote(id, true);
+				else if (await this.opts.noteDisk!.stat(path)) {
+					await this.takeTableFile(path);
+					const placed = this.byPath.get(path);
+					if (placed) await this.settleTableNote(placed);
+				} else this.del("table/note-join/" + path);
+				return;
+			}
 			if (this.tableNotePath(path) || !this.meta.synced || this.dirty.has(path)) return; // a later event covers this path
 			const id = this.byPath.get(path);
 			if (id) await this.settle(id);
@@ -359,6 +378,18 @@ export class Engine {
 		this.later(() => void this.run(`rename ${from}`, async () => {
 			this.mark(from, -1);
 			this.mark(to, -1);
+			if (this.noteAuthority && isNote(from) && isNote(to)) {
+				this.del("table/note-join/" + from);
+				const id = this.byPath.get(from), prior = this.byPath.get(to);
+				if (id) {
+					if (prior && prior !== id) await this.missingTableFile(prior);
+					const m = this.metaOf(id);
+					this.place(id, to);
+					this.structure(id, { t: "set", path: to, basePath: m.basePath });
+					await this.settleTableNote(id);
+				} else if (!prior && await this.opts.noteDisk!.stat(to)) await this.takeTableFile(to);
+				return;
+			}
 			if (this.tableNotePath(from) || this.tableNotePath(to) || (this.table && !isNote(from) && !isNote(to))) return;
 			if (!this.meta.synced) return;
 			const id = this.byPath.get(from), occupant = this.byPath.get(to);
@@ -372,6 +403,13 @@ export class Engine {
 			}
 			if (occupant && occupant !== id) await this.settle(occupant);
 		}));
+	}
+
+	/** Folder events carry the same identity evidence as observed file renames. */
+	tableFolderRenamed(from: string, to: string) {
+		if (!this.noteAuthority) return;
+		for (const path of [...this.byPath.keys()]) if (path.startsWith(from + "/"))
+			this.diskRenamed(path, to + path.slice(from.length));
 	}
 
 	/** Load a note for an editor. Edits to the returned document are synced; remote edits appear in it. */
@@ -395,8 +433,13 @@ export class Engine {
 		return this.run(`open ${id}`, async () => {
 			if (requestedPath !== undefined && this.noteAt(requestedPath) !== id) return;
 			const row = this.opts.tableNotes?.get(id);
-			if (row) {
-				if (row.deleted === null && this.noteAt(row.path) === id) doc = await this.bindDocument(id, true);
+			if (this.noteAuthority && this.isTableNote(id) && !this.opened.has(id)) {
+				await this.settleTableNote(id);
+				if (await this.read("table/note-write/" + id) || await this.read("base:" + id)) return;
+			}
+			if (row || (this.noteAuthority && this.isTableNote(id))) {
+				const path = this.pathOf(id);
+				if (path && this.noteAt(path) === id) doc = await this.bindDocument(id, true);
 				return;
 			}
 			if (this.opened.has(id)) return void (doc = this.opened.get(id));
@@ -633,7 +676,10 @@ export class Engine {
 				else if (!this.table || !this.isAttachment(msg.entry.doc)) {
 					await this.merge(msg.entry.doc, msg.entry.data, false);
 					if (this.isTableNote(msg.entry.doc)) {
-						if (!this.opened.has(msg.entry.doc)) this.opts.onNoteReady?.();
+						if (!this.opened.has(msg.entry.doc)) {
+							if (this.noteAuthority) await this.settleTableNote(msg.entry.doc);
+							this.opts.onNoteReady?.();
+						}
 					} else if (this.meta.synced) await this.settle(msg.entry.doc);
 				}
 			} else if (msg.t === "more") {
@@ -691,6 +737,7 @@ export class Engine {
 
 	noteAt(path: string): string | undefined {
 		const local = this.byPath.get(path), rows = this.opts.tableNotes;
+		if (this.noteAuthority && local && !rows?.at(path) && this.pathOf(local) === path) return local;
 		if (rows && (rows.at(path) || (local && rows.get(local)))) {
 			// A row alone cannot bind an editor to an arbitrary disk file at its path.
 			// The device must already have placed that very document there.
@@ -701,10 +748,16 @@ export class Engine {
 
 	pathOf(id: string): string | undefined {
 		const row = this.opts.tableNotes?.get(id);
-		return row ? (row.deleted === null ? row.path : undefined) : this.effectivePath(id);
+		const placement = this.metas.get(id);
+		if (row) {
+			if (row.deleted !== null) return;
+			if (this.noteAuthority && placement?.basePath === row.path && placement.diskPath) return placement.diskPath;
+			return row.path;
+		}
+		return this.noteAuthority ? placement?.diskPath : this.effectivePath(id);
 	}
 
-	isTableNote(id: string) { return !!this.opts.tableNotes?.get(id); }
+	isTableNote(id: string) { return !!this.opts.tableNotes?.get(id) || !!this.metas.get(id)?.tableNote; }
 
 	private tableNotePath(path: string) {
 		const local = this.byPath.get(path);
@@ -1007,6 +1060,341 @@ export class Engine {
 		this.del(`base:${id}`);
 	}
 
+	/** All-files genesis calls this after both cursors have caught up and migrated
+	 * placements are installed. An attachment-only handoff cannot enable this scan. */
+	startTableNoteFiles(firstSync: boolean): Promise<void> {
+		return this.run("placing table notes", async () => {
+			if (!this.table || !this.opts.tableNotes || !this.opts.noteDisk) throw new Error("Missing note table or disk");
+			await this.scanTableNotes(firstSync && !this.noteAuthority);
+			this.scanned = true;
+			this.finishStartup(true);
+			this.opts.onNoteReady?.();
+		});
+	}
+
+	tableNoteChanged(id: string): Promise<void> {
+		return this.run("placing a changed note", async () => {
+			if (this.noteAuthority) await this.settleTableNote(id);
+			this.opts.onNoteReady?.();
+		});
+	}
+
+	// Keep the desired row change alongside the placement. A content edit queues
+	// only a Yjs update, in the same commit as its disk agreement.
+	private structure(id: string, change: NoteStructure) {
+		this.put("table/note-change/" + id, change);
+	}
+
+	private async scanTableNotes(firstSync: boolean) {
+		const rows = this.opts.tableNotes!, disk = this.opts.noteDisk!;
+		// Finish moves before enumerating unknown paths: a crash after the copy must
+		// never turn our destination into a newly created document.
+		for (const [key] of await this.store.list("table/note-remove/")) await this.finishTableRemove(key.slice("table/note-remove/".length));
+		for (const [key] of await this.store.list("table/note-move/")) await this.finishTableMove(key.slice("table/note-move/".length));
+		const view = noteInventory((await disk.list()).map(f => f.path), this.byPath);
+		const attempt = async (path: string, handle: () => Promise<void>) => {
+			try { await handle(); }
+			catch (error) {
+				if (this.replayFrom !== undefined) throw error; // a failed database commit affects every file
+				this.opts.onProblem?.("placing note " + path, error);
+			}
+		};
+		if (firstSync) {
+			for (const path of view.unknown) await attempt(path, async () => {
+				const row = rows.at(path);
+				if (row && !this.metaOf(row.id).diskPath) {
+					const observed = await this.readTableFile(path);
+					if (observed) this.put("table/note-join/" + path, { id: row.id, hash: await this.opts.hash(observed.text) });
+				}
+			});
+		}
+		if (!firstSync) {
+			const unknown = new Set(view.unknown);
+			for (const [key] of await this.store.list("table/note-join/"))
+				if (!unknown.has(key.slice("table/note-join/".length))) this.del(key);
+		}
+		if (!this.noteAuthority) {
+			this.put("table/note-authority", true);
+			await this.flush();
+			this.noteAuthority = true;
+		}
+		for (const [path, id] of view.missing) {
+			if (this.metaOf(id).diskPath === path && !await this.read("table/note-write/" + id)) await this.missingTableFile(id);
+		}
+		for (const path of view.unknown) await attempt(path, () => this.takeTableFile(path));
+		for (const id of new Set([...this.byPath.values(), ...rows.ids()]))
+			await attempt(this.metaOf(id).diskPath ?? rows.get(id)?.path ?? id, () => this.settleTableNote(id));
+	}
+
+	private async readTableFile(path: string) {
+		const disk = this.opts.noteDisk!, stat = await disk.stat(path);
+		if (!stat) return;
+		// Preserve a literal BOM. Invalid UTF-8 is not an empty or replaceable note.
+		const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await disk.readBinary(path));
+		return { stat, text };
+	}
+
+	private async tableCopyPath(path: string, id: string, recovered: boolean) {
+		let name = conflictName(path, id);
+		for (let n = 1; ; n++) {
+			if (recovered) name = path.replace(/\.md$/, ` (recovered ${id.slice(0, 6)}${n === 1 ? "" : " " + n}).md`);
+			if (!this.byPath.has(name) && !this.opts.tableNotes!.at(name) && !await this.opts.noteDisk!.stat(name)) return name;
+			name = conflictName(name, id);
+		}
+	}
+
+	private async takeTableFile(path: string) {
+		if (this.byPath.has(path)) return;
+		const seen = await this.readTableFile(path);
+		if (!seen) return;
+		const rows = this.opts.tableNotes!, row = rows.at(path), key = "table/note-join/" + path;
+		const candidate = await this.read<{ id: string; hash: string }>(key);
+		const hash = await this.opts.hash(seen.text);
+		if (candidate && row?.id === candidate.id && !this.metaOf(row.id).diskPath && hash === candidate.hash) {
+			const text = completeText(await this.state(row.id));
+			if (text === undefined) return; // row before text
+			if (text === seen.text) {
+				this.del(key);
+				this.metaOf(row.id).basePath = path;
+				this.place(row.id, path);
+				this.agree(row.id, seen.stat, hash);
+				return;
+			}
+		}
+		this.del(key);
+		await this.createTableFile(path, seen, !!row);
+	}
+
+	private async createTableFile(path: string, seen: { stat: DiskFile; text: string }, conflict: boolean, recoveredFrom?: string) {
+		const id = this.opts.newId();
+		const want = conflict ? await this.tableCopyPath(path, recoveredFrom ?? id, !!recoveredFrom) : path;
+		const hash = await this.opts.hash(seen.text);
+		const doc = this.load();
+		doc.getText("t").insert(0, seen.text);
+		const state = Y.encodeStateAsUpdate(doc);
+		doc.destroy();
+		this.put("state:" + id, state);
+		this.send(id, state);
+		this.metaOf(id).tableNote = true;
+		this.structure(id, { t: "set", path: want });
+		this.place(id, path);
+		this.agree(id, seen.stat, hash);
+		return id;
+	}
+
+	private async missingTableFile(id: string) {
+		const m = this.metaOf(id), row = this.opts.tableNotes!.get(id);
+		if (!m.diskPath) return;
+		const base = await this.read<Uint8Array>("base:" + id) ?? await this.state(id);
+		if (completeText(base) === undefined) return;
+		this.structure(id, { t: "del", path: m.diskPath, vector: b64(Y.encodeStateVectorFromUpdate(base!)) });
+		this.place(id, undefined);
+		if (row?.deleted != null) this.del("table/note-change/" + id);
+	}
+
+	private async finishTableMove(id: string) {
+		const key = "table/note-move/" + id, disk = this.opts.noteDisk!;
+		const move = await this.read<{ from: string; to: string; hash: string }>(key);
+		if (!move) return;
+		const { from, to, hash } = move;
+		if (this.byPath.get(from) !== id || this.byPath.has(to)) { this.del(key); return; }
+		const source = await disk.stat(from), destination = await disk.stat(to);
+		let completed = false;
+		if (source && !destination) completed = await disk.moveIf(from, to, hash);
+		else if (destination) {
+			const landed = await this.readTableFile(to);
+			const left = source && await this.readTableFile(from);
+			// The write can land and the user can reuse the source before our commit.
+			// When the source is still the expected file, an occupied destination
+			// cannot prove that we moved it, even if it has identical text.
+			completed = !!landed && await this.opts.hash(landed.text) === hash &&
+				(!left || await this.opts.hash(left.text) !== hash);
+		}
+		if (completed) {
+			this.place(id, to);
+			if (source) await this.takeTableFile(from);
+			const waiting = this.opts.tableNotes!.at(from);
+			if (waiting && waiting.id !== id) this.deferred.add(waiting.id);
+		} else if (!source) this.place(id, undefined);
+		this.del(key);
+		await this.flush();
+	}
+
+	private async finishTableRemove(id: string) {
+		const key = "table/note-remove/" + id, disk = this.opts.noteDisk!;
+		const intent = await this.read<{ path: string; hash: string; seq: number }>(key);
+		if (!intent) return;
+		const { path, hash, seq } = intent;
+		if (this.byPath.get(path) === id && this.opts.tableNotes!.get(id)?.seq === seq) {
+			const current = await this.readTableFile(path);
+			if (!current || await disk.removeIf(path, hash)) this.place(id, undefined);
+			else {
+				// A new save can have landed after the original file was removed.
+				// Keep those bytes under a fresh ID before dropping the old placement.
+				const saved = await this.readTableFile(path);
+				if (saved) await this.createTableFile(path, saved, !!this.opts.tableNotes!.at(path));
+				else this.place(id, undefined);
+			}
+		}
+		this.del(key);
+		await this.flush();
+	}
+
+	/** A confirmed row owns this name. First preserve any other local document
+	 * occupying it. Parking a placed note also breaks a cycle of remote renames. */
+	private async freeTablePath(path: string, id: string): Promise<boolean> {
+		const disk = this.opts.noteDisk!, rows = this.opts.tableNotes!;
+		if (!await disk.stat(path)) return !this.byPath.has(path);
+		if (rows.at(path)?.id !== id) return false;
+		if (!this.byPath.has(path)) {
+			// An insensitive filesystem may have found a differently spelled name.
+			if (!(await disk.list()).some(f => f.path === path)) {
+				this.opts.onProblem?.(path, new Error("Another note differs only by case on this device"));
+				return false;
+			}
+			await this.takeTableFile(path);
+		}
+		const owner = this.byPath.get(path);
+		if (!owner || owner === id || this.opened.has(owner) || this.dirty.has(path)) return false;
+		const local = await this.read<NoteStructure>("table/note-change/" + owner);
+		const other = rows.get(owner);
+		if (other?.deleted === null && other.path === path) return false; // its newer row is still in flight
+		const parked = await this.tableCopyPath(path, owner, false);
+		const bytes = await this.readTableFile(path);
+		if (!bytes) return false;
+		if (!other && local?.t === "set") this.structure(owner, { ...local, path: local.path === path ? parked : local.path });
+		this.put("table/note-move/" + owner, { from: path, to: parked, hash: await this.opts.hash(bytes.text) });
+		await this.flush();
+		await this.finishTableMove(owner);
+		this.deferred.add(owner);
+		return !this.byPath.has(path) && !await disk.stat(path);
+	}
+
+	private async settleTableNote(id: string, changed = false): Promise<void> {
+		const disk = this.opts.noteDisk!, rows = this.opts.tableNotes!, row = rows.get(id), m = this.metaOf(id);
+		if (this.opened.has(id) || (m.diskPath && this.dirty.has(m.diskPath))) return;
+		const key = "table/note-write/" + id;
+		const intended = await this.read<Uint8Array>(key);
+		const change = await this.read<NoteStructure>("table/note-change/" + id);
+		if (!row && !m.tableNote) return;
+		if (change?.t === "del" && !m.diskPath && row?.deleted == null) return;
+		if (await this.read("table/note-remove/" + id)) {
+			await this.finishTableRemove(id);
+			if (await this.read("table/note-remove/" + id)) return;
+		}
+		if (await this.read("table/note-move/" + id)) {
+			await this.finishTableMove(id);
+			if (await this.read("table/note-move/" + id)) return;
+		}
+		let want = row?.path ?? m.diskPath;
+		if (change?.t === "set" && (!row || row.path === change.basePath)) want = change.path;
+		if (!want || this.dirty.has(want)) return;
+		const at = m.diskPath ?? want;
+		const holder = this.byPath.get(at);
+		if (holder && holder !== id && row?.deleted == null && !await this.freeTablePath(at, id)) return;
+		const savedBase = await this.read<Uint8Array>("base:" + id);
+		if (!changed && !savedBase && !intended && !m.open && !m.owed && m.baseHash !== undefined &&
+			at === m.diskPath && at === want && row?.deleted == null && (!row || row.path === m.basePath)) {
+			const stat = await disk.stat(at);
+			if (stat && stat.size === m.size && stat.mtime === m.mtime) return;
+		}
+		const state = await this.state(id), latest = completeText(state);
+		if (!state || latest === undefined) return;
+		const seen = row?.deleted != null && !m.diskPath ? undefined : await this.readTableFile(at);
+		if (!m.diskPath && seen) {
+			if ([...this.byPath.keys()].some(p => p !== at && p.toLowerCase() === at.toLowerCase()) &&
+				!(await disk.list()).some(f => f.path === at)) {
+				this.opts.onProblem?.(at, new Error("Another note differs only by case on this device"));
+				return;
+			}
+			await this.takeTableFile(at);
+			if (this.byPath.get(at) !== id) {
+				const owner = this.byPath.get(at);
+				if (owner) await this.settleTableNote(owner);
+				if (await disk.stat(at)) return;
+				return this.settleTableNote(id);
+			}
+		}
+		if (m.diskPath && !seen && !intended) {
+			await this.missingTableFile(id);
+			return;
+		}
+		const agreed = m.baseHash === undefined ? undefined : savedBase ?? state;
+		const editor = m.owed ?? (m.open ? "recover" : undefined);
+		if (m.open) this.owe(id, "recover");
+		const plan = planNoteContent(seen?.text, latest, agreed, intended);
+		if (plan.kind === "wait") return;
+		const separate = seen && (editor ? await this.unrecorded(id, editor, seen.text, latest) : plan.kind === "separate");
+		if (seen && separate) {
+			// Transfer the observed file and its new ID in the same commit. Replaying
+			// cannot allocate a second copy before the old note is materialized.
+			const kept = await this.createTableFile(at, seen, true, editor ? id : undefined);
+			this.del(key);
+			this.owe(id, "doc");
+			await this.flush();
+			await this.settleTableNote(kept);
+			if (!await disk.stat(at)) await this.settleTableNote(id);
+			return;
+		}
+		if (seen && plan.kind === "write" && plan.landed) {
+			// The previous write landed. If the next write also crashes, this exact
+			// state is the agreement, even when a third revision has already arrived.
+			this.agree(id, seen.stat, await this.opts.hash(seen.text));
+			this.put("base:" + id, plan.landed);
+			this.del(key);
+		}
+		if (seen && !editor && plan.kind === "merge") {
+			const hash = await this.opts.hash(seen.text);
+			await this.merge(id, plan.update, true, true);
+			this.agree(id, seen.stat, hash);
+			this.put("base:" + id, plan.agreement);
+			this.del(key);
+			await this.flush();
+			return this.settleTableNote(id);
+		}
+		if (row && row.deleted !== null) {
+			const covered = Y.decodeStateVector(unb64(row.vector!));
+			for (const [client, clock] of Y.decodeStateVector(Y.encodeStateVectorFromUpdate(state))) {
+				if (clock > (covered.get(client) ?? 0)) {
+					this.structure(id, { t: "restore", path: want, base: row.seq });
+					return;
+				}
+			}
+			if (seen) {
+				this.put("table/note-remove/" + id, { path: at, hash: await this.opts.hash(seen.text), seq: row.seq });
+				await this.flush();
+				await this.finishTableRemove(id);
+			}
+			this.del(key);
+			this.del("table/note-change/" + id);
+			return;
+		}
+		if (seen && at !== want) {
+			if ((this.byPath.has(want) || await disk.stat(want)) && !await this.freeTablePath(want, id)) return;
+			this.put("table/note-move/" + id, { from: at, to: want, hash: await this.opts.hash(seen.text) });
+			await this.flush();
+			await this.finishTableMove(id);
+			if (m.diskPath === want) await this.settleTableNote(id);
+			return;
+		}
+		if (row?.path === want) m.basePath = want;
+		if (seen?.text === latest) {
+			this.agree(id, seen.stat, await this.opts.hash(latest));
+			this.del(key);
+			return;
+		}
+		this.place(id, want);
+		this.put(key, state);
+		await this.flush();
+		await disk.writeTemp(new TextEncoder().encode(latest));
+		if (!await disk.installTemp(want, seen ? await this.opts.hash(seen.text) : null)) return;
+		const after = await this.readTableFile(want);
+		if (after?.text === latest) {
+			this.agree(id, after.stat, await this.opts.hash(latest));
+			this.del(key);
+		}
+	}
+
 	private otherNoteAgreements(id: string, hash: string): string[] {
 		const matches: string[] = [];
 		for (const [other, m] of this.metas) {
@@ -1024,6 +1412,11 @@ export class Engine {
 	 * unrelated new note, and an edit made to it on another device meanwhile would bring back a second copy.
 	 */
 	private async scan(): Promise<void> {
+		if (this.noteAuthority) {
+			await this.scanTableNotes(false);
+			this.scanned = true; this.finishStartup(true);
+			return;
+		}
 		const files = (await this.disk.list()).filter((f) => !this.tableNotePath(f.path) && (!this.notesOnly || isNote(f.path)));
 		const onDisk = new Map(files.map((f) => [f.path, f]));
 		const todo = new Set<string>();
@@ -1307,7 +1700,11 @@ export class Engine {
 	 * Bring one note's file and document into agreement, and put the file where the index says.
 	 */
 	private async settle(id: string): Promise<void> {
-		if (this.isTableNote(id) || this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
+		if (this.isTableNote(id)) {
+			if (this.noteAuthority) await this.settleTableNote(id);
+			return;
+		}
+		if (this.noteAuthority || this.settling.has(id) || (this.notesOnly && this.isAttachment(id))) return;
 		this.settling.add(id);
 		this.deferred.delete(id);
 		try {

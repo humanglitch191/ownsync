@@ -24,7 +24,7 @@ export class TableSync {
 	private inputs: DiskInputs;
 	private key?: Promise<Uint8Array>;
 	constructor(private store: Store, private keys: VaultKeys, private disk: DiskPort, allowed: (p: string) => boolean,
-		attachments: boolean, maxFileSize: number, private problem: (what: string, err: unknown) => void, private noteChanged?: () => void) {
+		attachments: boolean, maxFileSize: number, private problem: (what: string, err: unknown) => void, private noteChanged?: (id: string) => void) {
 		this.notes = new NoteRows(store);
 		this.inputs = {
 			id, attachments, maxFileSize, allowed, hash: b => this.hash(b), suffix: (h, n) => this.suffix(h, n),
@@ -148,9 +148,10 @@ export class TableSync {
 			if (!session || this.ask !== session) return;
 			try {
 				if (frame.version === null) {
-					await this.notes.receive(await this.openNote(frame));
+					const note = await this.openNote(frame);
+					await this.notes.receive(note);
 					await this.device!.change(s => catchUp(s, { cursor: frame.seq }));
-					this.noteChanged?.();
+					this.noteChanged?.(note.id);
 					return;
 				}
 				const row = await this.openRow(frame);

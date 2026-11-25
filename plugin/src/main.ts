@@ -331,14 +331,18 @@ export default class OwnsyncPlugin extends Plugin {
 			throw err;
 		});
 		const disk = new VaultDisk(this.app);
-		const allowed = (p: string) => !!p && normalizePath(p) === p && !p.endsWith(".md")
+		const visible = (p: string) => !!p && normalizePath(p) === p
 			&& !p.includes("\\") && !p.split("/").some(part => !part || part.startsWith("."))
 			&& p !== vault.configDir && !p.startsWith(vault.configDir+"/");
+		const allowed = (p: string) => visible(p) && !p.endsWith(".md");
 		const scratch = (this.manifest.dir ?? vault.configDir+"/plugins/"+this.manifest.id)+"/attachments/"+vaultId;
 		const tableDisk: TableDisk = new TableDisk(vault.adapter,store,scratch,allowed,
 			b => table.hash(b),(h,n) => table.suffix(h,n));
-		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem,() => refresh());
+		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem, id => { void engine.tableNoteChanged(id); });
+		const noteDisk = new TableDisk(vault.adapter, store, scratch + "/notes", p => visible(p) && p.endsWith(".md"),
+			b => sha256(b).then(hex), (h, n) => table.suffix(h, n), "table/note-fs");
 		const engine = new Engine(store, disk, {
+			noteDisk,
 			tableHistory: table,
 			tableNotes: table.notes,
 			onNoteReady: () => refresh(),
@@ -429,6 +433,7 @@ export default class OwnsyncPlugin extends Plugin {
 			[vault, vault.on("delete", (f) => { if (disk.synced(f)) { changed(f.path,true); refresh(); } })],
 			[vault, vault.on("rename", (f, from) => {
 				if (engine.tableActive && (f instanceof TFile || f instanceof TFolder)) {
+					if (f instanceof TFolder && visible(from) && visible(f.path)) engine.tableFolderRenamed(from, f.path);
 					if (f instanceof TFolder || allowed(from) || allowed(f.path))
 						void table.event({kind:"renamed",from,to:f.path});
 				}
