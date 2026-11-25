@@ -138,8 +138,11 @@ export class TableSync {
 			this.schedule();
 		});
 	}
+	// Scoped to one drain. A missing chunk must not starve other downloads or spin the socket.
+	private failedDownloads = new Set<string>();
 	private scheduled = false;
-	private schedule() {
+	private schedule(newInput = true) {
+		if (newInput) this.failedDownloads.clear();
 		if (this.scheduled) return;
 		this.scheduled = true;
 		void this.run(async () => { this.scheduled = false; if (this.synced) await this.drive({ kind: "settle" }); });
@@ -147,6 +150,7 @@ export class TableSync {
 	event(e: Event) {
 		return this.run(async () => {
 			if (!this.device) return;
+			this.failedDownloads.clear();
 			if (this.startup && !this.synced) {
 				// A returning device knows its old file IDs. Keep explicit offline moves; D13
 				// cannot infer them later when several files had identical bytes.
@@ -191,8 +195,8 @@ export class TableSync {
 		const d = this.device!;
 		if (!this.inputs.attachments || this.keys.state.pending?.tokenHash) return;
 		if (!this.startup && await this.store.get("table/fs")) await this.disk.discardTemp();
-		if (this.startup) { await planDisk(d, this.disk, this.inputs, { kind: "startup" }); this.startup = false; }
-		await planDisk(d, this.disk, this.inputs, event);
+		if (this.startup) { await planDisk(d, this.disk, this.inputs, { kind: "startup" }, this.failedDownloads); this.startup = false; }
+		await planDisk(d, this.disk, this.inputs, event, this.failedDownloads);
 		if (!this.synced || !this.ask) return;
 		await d.sendForgets(p => this.forget(p));
 		// An accepted delete waits for its ordered row. Let incoming rows run between passes.
@@ -203,9 +207,9 @@ export class TableSync {
 			try { if (!(await this.send(file)).missing) again = true; }
 			catch (e) { this.problem("sending an attachment", e); }
 		}
-		if (await d.change(s => !!s.intent)) { await executeIntent(d, this.disk, this.inputs); again = true; }
+		if (await d.change(s => !!s.intent)) { await executeIntent(d, this.disk, this.inputs, this.failedDownloads); again = true; }
 		await this.collectStages();
-		if (again) this.schedule();
+		if (again) this.schedule(false);
 	}
 	private async collectStages() {
 		const held = await this.device!.change(s => {

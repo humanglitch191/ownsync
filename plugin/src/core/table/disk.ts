@@ -121,14 +121,14 @@ async function parkCycle(s: State, view: Map<string, Observation>, inputs: DiskI
 	}
 }
 
-export async function planDisk(device: TableDevice, disk: DiskPort, inputs: DiskInputs, event: Event) {
+export async function planDisk(device: TableDevice, disk: DiskPort, inputs: DiskInputs, event: Event, failedDownloads?: Set<string>) {
 	if (!inputs.attachments) {
 		await device.change(s => { s.intent = undefined; });
 		return;
 	}
 	if (event.kind === "startup") {
 		await device.change(async () => disk.discardTemp());
-		await executeIntent(device, disk, inputs);
+		await executeIntent(device, disk, inputs, failedDownloads);
 	}
 	await device.change(async s => {
 		const view = await inventory(s, disk, inputs, event);
@@ -143,7 +143,7 @@ export async function planDisk(device: TableDevice, disk: DiskPort, inputs: Disk
 		const ids = [...new Set([...s.local.keys(), ...s.latest.keys()])];
 		for (const id of ids) {
 			const local = s.local.get(id), path = local?.path ?? s.latest.get(id)?.path;
-			if (!path || !included(inputs, path) || defer.has(id) || s.blocked.has(id)) continue;
+			if (!path || !included(inputs, path) || defer.has(id) || s.blocked.has(id) || failedDownloads?.has(id)) continue;
 			const row = s.latest.get(id);
 			if (row && (!included(inputs, row.path) || row.bytes.n > inputs.maxFileSize)) continue;
 			const deleted = event.kind === "startup" || (event.kind === "deleted" && under(path, event.path))
@@ -162,7 +162,7 @@ function sameObservation(a: Observation | null, b: Observation | undefined) {
 
 // Execute one already-durable intent. Re-reading an endpoint also distinguishes a completed
 // operation from a prepared one after a crash. Scratch bytes never enter disk discovery.
-export async function executeIntent(device: TableDevice, disk: DiskPort, i: DiskInputs) {
+export async function executeIntent(device: TableDevice, disk: DiskPort, i: DiskInputs, failedDownloads?: Set<string>) {
 	return device.change(async s => {
 		const op = s.intent;
 		if (!op) return false;
@@ -213,7 +213,12 @@ export async function executeIntent(device: TableDevice, disk: DiskPort, i: Disk
 						if (bytes && (bytes.length !== ref.n || await i.hash(bytes) !== ref.h)) bytes = undefined;
 					}
 					if (!bytes) {
-						try { bytes = await i.fetch(ref); } catch { return block(); }
+						try { bytes = await i.fetch(ref); } catch {
+							// A reconnect changes neither the row nor the disk precondition.
+							failedDownloads?.add(op.file);
+							s.intent = undefined;
+							return false;
+						}
 						if (bytes.length !== ref.n || await i.hash(bytes) !== ref.h) return block();
 					}
 					await disk.writeTemp(bytes);

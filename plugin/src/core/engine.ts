@@ -184,6 +184,7 @@ export class Engine {
 	private lastPublish = 0;
 	private paceTimer: number | null = null;
 	private indexOut: Uint8Array[] = []; // this input's index changes, sent as one entry
+	private renameSources = new Map<string, string>(); // pre-rename disk paths for a handoff before the index ack
 	private indexDirty = false;
 	/** Where every live note's file belongs, worked out from the index alone, so every device agrees. */
 	private layout: { paths: Map<string, string>; owners: Map<string, string>; groups: Map<string, string[]> } | null = null;
@@ -724,7 +725,10 @@ export class Engine {
 		this.outbox.push(item);
 		this.liveOut.push(item.entry);
 		this.put("meta", this.meta);
-		this.put(`out:${item.id}`, item.entry);
+		if (doc === INDEX && this.renameSources.size) {
+			this.put(`out:${item.id}`, { ...item.entry, renameSources: [...this.renameSources] });
+			this.renameSources.clear();
+		} else this.put(`out:${item.id}`, item.entry);
 	}
 
 	/**
@@ -897,9 +901,13 @@ export class Engine {
 	 * `path` is simply where the index already puts the note (its own conflict-suffixed name included).
 	 */
 	private movedTo(id: string, path: string, file?: DiskFile): void {
+		const from = this.metaOf(id).diskPath;
 		this.metaOf(id).writing = undefined; // a file of this note's was there to move: its write landed
 		this.place(id, path, file);
-		if (this.effectivePath(id) !== path) this.notes.set(id, { p: path });
+		if (this.effectivePath(id) !== path) {
+			if (from && !isNote(path) && !this.renameSources.has(id)) this.renameSources.set(id, from);
+			this.notes.set(id, { p: path });
+		}
 	}
 
 	/**

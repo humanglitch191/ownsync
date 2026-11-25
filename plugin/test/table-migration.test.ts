@@ -126,3 +126,67 @@ test("a notes-only device catches up across its excluded config path without tou
 	assert.equal((await store.get<{ cursor: number }>("table/meta"))?.cursor, 1);
 	assert.equal((await store.get<Row>("table/latest/" + row.file))?.path, row.path);
 });
+
+test("two unsent legacy renames carry the first source path through restart and handoff", async () => {
+	const { Device, Server, quiesce, rng } = await import("./sim");
+	const device = new Device("migrating", new Server(), rng(42));
+	device.boot(); device.connect(); await quiesce([device]);
+	device.write("original.bin", new Uint8Array([1])); await quiesce([device]);
+	device.disconnect();
+	device.rename("original.bin", "middle.bin"); await quiesce([device]);
+	device.rename("middle.bin", "final.bin"); await quiesce([device]);
+	device.crash(); device.boot(); await quiesce([device]);
+	await device.engine!.useTable(key);
+	const [local] = [...device.data].filter(([k]) => k.startsWith("table/local/")).map(([,v]) => v as Local);
+	assert.equal(local?.path, "final.bin");
+	assert.equal(local.base.path, "original.bin");
+	assert.deepEqual(device.problems, []);
+	device.crash();
+});
+
+test("genesis rejects a version without its identity, even when the bytes repeat", async () => {
+	const projection = new LegacyProjection(), index = new Y.Doc();
+	index.getMap("notes").set(id(1), { p: "broken.bin" });
+	const { u, ...invalid } = ref(2);
+	const doc = versionDoc(ref(2), invalid as Ref);
+	try {
+		projection.applyIndex(entry("index", Y.encodeStateAsUpdate(index)));
+		projection.applyAttachment(entry(id(1), Y.encodeStateAsUpdate(doc)));
+		await assert.rejects(async () => { for await (const _ of projection.rows(key)) { /* drain */ } },
+			/Missing or invalid legacy version identity at broken.bin/);
+	} finally { index.destroy(); doc.destroy(); projection.close(); }
+});
+
+test("a failed download retries with unchanged disk and row, including after restart", async () => {
+	const { TableDevice, catchUp } = await import("../src/core/table/device");
+	const { planDisk, executeIntent } = await import("../src/core/table/disk");
+	const { TableDisk } = await import("../src/tableDisk");
+	const { attachmentFs } = await import("./table-fs");
+	for (const restart of [false, true]) {
+		const { fs, store, bytes } = attachmentFs();
+		const hash = async (b: Uint8Array) => hex(b);
+		const disk = new TableDisk(fs, store, ".private/scratch", p => !p.startsWith("."), hash, async () => "abcdef");
+		const data = new Uint8Array([42]);
+		const row = { file: id(1), path: "a.png", bytes: { ...ref(1), h: await hash(data) }, mtime: null, seq: 1, deleted: null };
+		let attempts = 0, device = await TableDevice.open(store);
+		const inputs = { attachments: true, allowed: () => true, maxFileSize: data.length, hash,
+			readStage: async () => undefined, fetch: async () => {
+				if (++attempts === 1) throw new Error("disconnected");
+				return data;
+			}, id: () => assert.fail(), stage: async () => assert.fail(), pack: async () => assert.fail(), suffix: async () => assert.fail() };
+		await device.change(s => catchUp(s, row));
+		await planDisk(device, disk, inputs, { kind: "settle" });
+		const failed = new Set<string>();
+		assert.equal(await executeIntent(device, disk, inputs, failed), false);
+		const second = { ...row, file: id(2), path: "b.png", seq: 2 };
+		await device.change(s => catchUp(s, second));
+		await planDisk(device, disk, inputs, { kind: "settle" }, failed);
+		assert.equal(await device.change(s => s.intent?.file), second.file);
+		assert.equal(await executeIntent(device, disk, inputs, failed), true);
+		if (restart) device = await TableDevice.open(store);
+		await planDisk(device, disk, inputs, { kind: restart ? "startup" : "settle" });
+		assert.equal(await executeIntent(device, disk, inputs), true);
+		assert.deepEqual(bytes(row.path), data);
+		assert.equal(attempts, 3);
+	}
+});

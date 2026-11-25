@@ -40,6 +40,8 @@ export class LegacyProjection {
 			const versions = this.docs.get(id)?.getArray<Ref>("v").toArray() ?? [];
 			const seen = new Set<string>();
 			for (const ref of versions) {
+				if (typeof ref.u !== "string" || !ref.u)
+					throw new Error("Missing or invalid legacy version identity at " + v.p);
 				if (seen.has(ref.h)) continue;
 				const first = !seen.size;
 				seen.add(ref.h);
@@ -72,18 +74,26 @@ export class LegacyProjection {
 	close() { this.index.destroy(); for (const d of this.docs.values()) d.destroy(); }
 }
 
+type StoredEntry = Entry & { renameSources?: [string, string][] };
+
 // A local Y.Map.set writes a new item for that key. Look it up in the persisted document:
 // the wire update for a replacement may inherit its key from the previous item.
-function unsentPaths(index: Y.Doc, out: Entry[]) {
-	const notes = index.getMap<IndexValue>("notes"), paths = new Set<string>();
+// Older 0.2.x outboxes only have the replacement item; its collected predecessor has no path.
+function unsentPaths(index: Y.Doc, out: StoredEntry[]) {
+	const notes = index.getMap<IndexValue>("notes"), paths = new Map<string, string | undefined>(), current = new Set<string>();
 	for (const e of out) if (e.doc === "index") {
+		const from = new Map(e.renameSources);
 		for (const struct of Y.decodeUpdate(e.data).structs) {
 			if (!(struct instanceof Y.Item)) continue;
 			const item = Y.getItem(index.store, struct.id);
-			if (item instanceof Y.Item && !item.deleted && item.parent === notes && item.parentSub !== null)
-				paths.add(item.parentSub);
+			if (item instanceof Y.Item && item.parent === notes && item.parentSub !== null) {
+				const key = item.parentSub;
+				if (!paths.has(key)) paths.set(key, from.get(key));
+				if (!item.deleted) current.add(key);
+			}
 		}
 	}
+	for (const key of paths.keys()) if (!current.has(key)) paths.delete(key);
 	return paths;
 }
 
@@ -104,7 +114,10 @@ async function deletedBase(store: Store, id: string, seen: string) {
 
 // Capture these bases together with the handoff marker, before starting either disk planner.
 export async function legacyBases(store: Store, key: Uint8Array) {
-	const puts = new Map<string, unknown>(), out = (await store.list<Entry>("out:")).map(([, e]) => e);
+	const puts = new Map<string, unknown>();
+	const out = (await store.list<StoredEntry>("out:"))
+		.sort(([a], [b]) => Number(a.slice(4)) - Number(b.slice(4)))
+		.map(([, e]) => e);
 	const pending = new Set(out.map(e => e.doc));
 	const index = new Y.Doc();
 	try {
@@ -126,7 +139,7 @@ export async function legacyBases(store: Store, key: Uint8Array) {
 					if (h) bytes = { h }; // never substitute a staged hash for its agreement
 				}
 			}
-			puts.set("table/local/" + file, { path, base: { path: changed.has(id) ? undefined : path, bytes }, removed } satisfies Local);
+			puts.set("table/local/" + file, { path, base: { path: changed.has(id) ? changed.get(id) : path, bytes }, removed } satisfies Local);
 		}
 	} finally { index.destroy(); }
 	puts.set("table/migrated", true);

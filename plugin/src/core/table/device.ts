@@ -250,7 +250,10 @@ export async function reconcile(s: State, file: string, view: ReadonlyMap<string
 	const next = { ...local, base: { path: path === "equal" ? row.path : local.base.path, bytes: bytes === "equal" ? row.bytes : local.base.bytes } };
 	if (local.base.path !== next.base.path || local.base.bytes?.u !== next.base.bytes?.u || local.base.bytes?.h !== next.base.bytes?.h) s.local.set(file, next);
 	if (disk.path !== row.path) {
-		if (!view.has(row.path)) schedule({ seq: row.seq, kind: "rename", file, from: disk.path, path: row.path, hash });
+		// A pending deletion still owns its absent endpoint. Moving into it would
+		// let that file's next pass read and publish the incoming file as its own.
+		if (!view.has(row.path) && ![...s.local.values()].some(f => f.path === row.path))
+			schedule({ seq: row.seq, kind: "rename", file, from: disk.path, path: row.path, hash });
 		else if (bytes === "theirs") schedule({ seq: row.seq, kind: "write", file, path: disk.path, before: hash, data: record(row) });
 	} else if (hash !== row.bytes.h) schedule({ seq: row.seq, kind: "write", file, path: disk.path, before: hash, data: record(row) });
 }

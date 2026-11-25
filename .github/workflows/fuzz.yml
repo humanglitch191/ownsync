@@ -1,7 +1,7 @@
 name: Fuzz
 
-# Large batches of the engine fuzz test, split by seed range. Every run covers new seeds.
-# A failure prints its seed; replay it locally with FUZZ_SEED=<seed> (see plugin/test/engine.fuzz.test.ts).
+# Engine and attachment-table fuzz tests, split by seed range. Every run covers new seeds.
+# A failure prints its seed; replay it locally with FUZZ_SEED=<seed> using the same test file.
 
 on:
   schedule:
@@ -25,10 +25,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        suite: [engine, table]
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
       FUZZ_RUNS: ${{ inputs.runs || '20000' }}
       FUZZ_STEPS: ${{ inputs.steps || '250' }}
+      SUITE: ${{ matrix.suite }}
       SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v7
@@ -45,4 +47,4 @@ jobs:
         run: |
           export FUZZ_FIRST=$(( (GITHUB_RUN_NUMBER * 8 + SHARD) * FUZZ_RUNS + 1 ))
           echo "seeds $FUZZ_FIRST to $(( FUZZ_FIRST + FUZZ_RUNS - 1 )), $FUZZ_STEPS steps each"
-          node --import jiti/register --test test/engine.fuzz.test.ts
+          node --import jiti/register --test "test/${SUITE}.fuzz.test.ts"

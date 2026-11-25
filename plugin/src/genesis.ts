@@ -1,5 +1,5 @@
-// This short-lived reader starts at zero. Neither the device's legacy replica nor an unstored
-// live update can contribute to genesis. The Worker compares the whole-vault head at commit.
+// shortcut: A stale compare restarts both passes from zero (index first, then attachment docs).
+// Neither the device's legacy replica nor an unstored live update can contribute to genesis. The Worker compares the whole-vault head at commit.
 import { KIND, docTag, hex, openEnvelope, unpackEntry } from "../../protocol/ownsync";
 import { decodeServer, encodeClient, type ClientFrame } from "../../server/src/wire";
 import { LegacyProjection, type GenesisRow } from "./core/table/migration";
