@@ -142,6 +142,9 @@ function grewFrom(older: string, text: string): boolean {
 	}
 	return true;
 }
+function matchesFirstWrite(intended: string | undefined, disk: string): boolean {
+	return intended === disk || (!!intended?.trim() && grewFrom(intended, disk));
+}
 /**
  * How much of the smaller text is in the larger one: a note that grew or shrank a lot is still the same note.
  * (A small note matching a big unrelated file is harmless: it would otherwise have counted as deleted.)
@@ -970,14 +973,15 @@ export class Engine {
 				continue;
 			}
 			const base = await this.read<Uint8Array>(`base:${id}`);
-			const mine = [units((await this.text(id)) ?? "")];
-			if (base) {
-				const doc = this.load(base);
-				mine.push(units(doc.getText("t").toString()));
-				doc.destroy();
-			}
+			const current = await this.text(id), intended = this.textFrom(base);
+			const mine = [units(current ?? "")];
+			if (intended !== undefined) mine.push(units(intended));
 			if (f) {
-				const theirs = units(await this.disk.read(path));
+				const disk = await this.disk.read(path), theirs = units(disk);
+				if (m.writing && m.baseHash === undefined && matchesFirstWrite(intended ?? current, disk)) {
+					todo.add(id);
+					continue;
+				}
 				if (like(mine, theirs) >= ALIKE) { todo.add(id); continue; } // an ordinary edit, or an editor's save
 				loose.set(path, theirs); // perhaps a different file now sits at the note's path
 				// Only a note whose file was here can claim it however much it changed. One that was only about to be
@@ -991,9 +995,11 @@ export class Engine {
 		// An attachment's file with other content is a new version of it, unless that content is exactly another
 		// attachment's whose file isn't where it was: then that one moved here (two swapped places, say), and this
 		// one's own file is looked for like any that is gone.
+		const reused = new Set<string>();
 		const swapped = new Map<string, string>(); // attachment → the path its file moved to
 		for (const [id, path] of changed) {
 			const h = await this.disk.readBinary(path).then((b) => this.opts.chunkName(b), () => undefined);
+			if (h !== undefined && h !== this.metaOf(id).baseHash) reused.add(id);
 			const other = [...adrift.keys(), ...changed.keys()].find((o) => o !== id && !swapped.has(o) && this.metaOf(o).baseHash === h && !isNote(this.metaOf(o).diskPath ?? ""));
 			if (other === undefined) { todo.add(id); continue; }
 			swapped.set(other, path);
@@ -1023,6 +1029,28 @@ export class Engine {
 				if (isNote(f.path) || this.byPath.has(f.path) || f.size !== m.size || [...moved.values()].includes(f.path)) continue;
 				const h = await this.disk.readBinary(f.path).then((b) => this.opts.chunkName(b), () => undefined);
 				if (h === m.baseHash) { moved.set(id, f.path); break; }
+			}
+		}
+		// A move followed by a new file at the old name leaves no missing path. Only
+		// transfer the ID when one displaced source and one free destination match.
+		if (reused.size) {
+			const sources = new Map<string, string | null>(), sizes = new Set<number>();
+			for (const id of new Set([...changed.keys(), ...adrift.keys()])) {
+				const m = this.metaOf(id);
+				if (!m.baseHash || m.size === undefined || !this.isAttachment(id)) continue;
+				sources.set(m.baseHash, sources.has(m.baseHash) ? null : id);
+				if (reused.has(id) && !moved.has(id)) sizes.add(m.size);
+			}
+			const free = new Map<string, string | null>(), unreadable = new Set<number>();
+			for (const f of files) {
+				if (!sizes.has(f.size) || isNote(f.path) || this.byPath.has(f.path) || this.ownerOf(f.path)) continue;
+				const hash = await this.disk.readBinary(f.path).then(b => this.opts.chunkName(b), () => undefined);
+				if (hash === undefined) unreadable.add(f.size);
+				else free.set(hash, free.has(hash) ? null : f.path);
+			}
+			for (const [hash, path] of free) {
+				const id = sources.get(hash);
+				if (id && path && reused.has(id) && !moved.has(id) && !unreadable.has(onDisk.get(path)!.size)) moved.set(id, path);
 			}
 		}
 		for (const id of adrift.keys()) this.place(id, undefined); // everyone out, then into their new places
@@ -1273,8 +1301,8 @@ export class Engine {
 		if (!isNote(want)) return this.settleAttachment(id, want, seen);
 
 		// 3. Make the file's text the document's.
-		const text = await this.text(id);
-		if (text === undefined) return true; // the note's text hasn't arrived yet
+		const state = await this.state(id), text = this.textFrom(state);
+		if (!state || text === undefined) return true; // the note's text hasn't arrived yet
 		const fresh = m.diskPath !== want || !seen; // no file of this note's is there yet
 		if (!fresh) {
 			if (seen!.mtime !== m.mtime || seen!.size !== m.size) return false; // changed since step 1 looked: take that in first
@@ -1300,6 +1328,7 @@ export class Engine {
 			if (!(await this.vacate(want, id))) return this.deferred.has(id) || "blocked"; // waiting, or places shifted: look again
 			if (m.diskPath === want) return true; // the file there turned out to be this note
 		}
+		if (m.baseHash === undefined) this.put(`base:${id}`, state); // exact text and Yjs IDs this first write will put on disk
 		return this.writeFile(id, want, seen, fresh, () => this.disk.write(want, text), await this.opts.hash(text));
 	}
 
@@ -1355,10 +1384,14 @@ export class Engine {
 		const text = await this.disk.read(path);
 		const hash = await this.opts.hash(text);
 		if ((await this.text(id)) === text) return this.agree(id, file, hash);
-		if (m.writing && m.baseHash === undefined) {
+		const firstWrite = m.writing && m.baseHash === undefined;
+		let base: Uint8Array | undefined;
+		if (firstWrite) {
 			// A remote edit may have arrived after the first write landed. Its base is the
 			// text we meant to write. An unrelated file at the old path belongs to the user.
-			if (this.textFrom(await this.read<Uint8Array>(`base:${id}`)) !== text) {
+			base = await this.read<Uint8Array>(`base:${id}`) ?? await this.state(id);
+			const intended = this.textFrom(base);
+			if (!matchesFirstWrite(intended, text)) {
 				await this.forget(id);
 				if (path !== this.effectivePath(id) && await this.disk.stat(path)) {
 					const other = await this.takeUnknown(path);
@@ -1366,7 +1399,7 @@ export class Engine {
 				}
 				return;
 			}
-			m.baseHash = hash;
+			if (text === intended) m.baseHash = hash;
 			m.writing = undefined;
 		}
 		if (hash === m.baseHash || mode !== "merge") {
@@ -1377,8 +1410,8 @@ export class Engine {
 		}
 		// The user edited the file. Their edit was made on top of the agreed version, so apply it there and
 		// merge the result: a remote edit made meanwhile survives alongside it.
-		let base = await this.read<Uint8Array>(`base:${id}`);
-		if (base) {
+		if (!firstWrite) base = await this.read<Uint8Array>(`base:${id}`);
+		if (base && !firstWrite) {
 			// The engine may have crashed after writing the document to the file but before recording that
 			// they agree. Then the file already shows the document, and the user's edit sits on top of that,
 			// not of the older agreed version. Whichever the file is closer to is what they edited.

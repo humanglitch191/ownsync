@@ -382,6 +382,38 @@ test("a device that joins with its own copy of the vault adopts identical notes 
 	noProblems([a!, c]);
 });
 
+test("an interrupted first write retains the note ID for an extension and preserves an unrelated file separately", async () => {
+	for (const local of ["local shared sentence", "private checklist"]) {
+		const { devs: [author, reader] } = world();
+		await quiesce([author!, reader!]);
+		reader!.trace = line => {
+			if (line.includes("engine writes Note.md")) reader!.crash(1); // stop at the first call after writing
+		};
+		author!.write("Note.md", "shared sentence");
+		await quiesce([author!, reader!]);
+		assert.equal(reader!.alive, false);
+		assert.equal(disk(reader!)["Note.md"], "shared sentence");
+		const id = author!.engine!.noteAt("Note.md")!;
+		assert.deepEqual(reader!.data.get("base:" + id), reader!.data.get("state:" + id));
+		reader!.trace = null;
+		reader!.write("Note.md", local);
+		author!.write("Note.md", "shared sentence remote");
+		await quiesce([author!]);
+		reader!.boot(); reader!.connect();
+		await quiesce([author!, reader!]);
+		assert.deepEqual(disk(author!), disk(reader!));
+		if (local === "private checklist") {
+			const files = disk(reader!);
+			assert.equal(files[reader!.engine!.pathOf(id)!], "shared sentence remote");
+			assert.deepEqual(Object.values(files).sort(), [local, "shared sentence remote"]);
+		} else {
+			assert.equal(reader!.engine!.noteAt("Note.md"), id);
+			assert.deepEqual(disk(reader!), { "Note.md": "local shared sentence remote" });
+		}
+		noProblems([author!, reader!]);
+	}
+});
+
 test("a crash between recording a remote edit and writing the file is finished at the next start", async () => {
 	const { devs: [a, b] } = world();
 	a!.write("Note.md", "one");
@@ -537,6 +569,27 @@ test("an attachment renamed while the app was closed is found by its content, no
 	assert.deepEqual(disk(b!), { "moved/p.png": PIC });
 	assert.equal(server.chunks.size, stored);
 	noProblems([a!, b!]);
+});
+
+test("an offline attachment move with a reused source keeps its ID only for a unique destination", async () => {
+	for (const ambiguous of [false, true]) {
+		const { devs: [a, b] } = world();
+		a!.write("q.bin", bytes(PIC));
+		await quiesce([a!, b!]);
+		const id = a!.engine!.noteAt("q.bin")!;
+		a!.crash();
+		a!.rename("q.bin", "x/r.png");
+		if (ambiguous) a!.write("another.png", bytes(PIC));
+		a!.write("q.bin", bytes("replacement"));
+		a!.boot(); a!.connect();
+		await quiesce([a!, b!]);
+		for (const d of [a!, b!]) {
+			assert.equal(d.engine!.pathOf(id), ambiguous ? "q.bin" : "x/r.png");
+			assert.equal(disk(d)["q.bin"], "replacement");
+			assert.equal(disk(d)["x/r.png"], PIC);
+		}
+		noProblems([a!, b!]);
+	}
 });
 
 test("a crash at any point of an upload is recovered: the other device gets the whole file", async () => {
