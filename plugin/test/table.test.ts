@@ -91,7 +91,8 @@ async function client(w: WorkerModel) {
 		hash: async b => hash(b), suffix: (h,n) => conflictSuffix(nameKey,h,n),
 		async stage(f) { const b = await disk.readBinary(f.path), u = id(); staged.set(u,b);
 			return { h: hash(b), n: b.length, c: [hash(b)], u, s: 1 }; },
-		async fetch(ref) { const b = w.chunks.get(ref.u) ?? staged.get(ref.u); if (!b) throw new Error("missing bytes"); return b; },
+		async readStage(ref) { return staged.get(ref.u); },
+		async fetch(ref) { const b = w.chunks.get(ref.u); if (!b) throw new Error("missing bytes"); return b; },
 		pack: r => packRequest(r, { pathkey: async p => unhex(hash(enc.encode(p))), version: async ref => unhex(hash(enc.encode(ref.u))),
 			seal: async (_file, data) => enc.encode(JSON.stringify(data)) }),
 	};
@@ -314,18 +315,25 @@ test("missing chunks retry from durable staging after a second save", async () =
 });
 
 test("a coalesced catch-up with a path swap preserves both files across a crash during the move", async () => {
-	const {a,b,w} = await pair();
-	a.disk.edit("y.bin","Y"); await a.settle(); await b.settle();
-	for (const [from,to] of [["x.bin","middle.bin"],["y.bin","x.bin"],["middle.bin","y.bin"]] as const) {
-		await a.disk.moveIf(from,to,a.disk.hash(from)!); await a.plan({kind:"renamed",from,to}); await a.settle();
+	for (const available of [true,false]) {
+		const {a,b,w} = await pair();
+		a.disk.edit("y.bin","Y"); await a.settle(); await b.settle();
+		for (const [from,to] of [["x.bin","middle.bin"],["y.bin","x.bin"],["middle.bin","y.bin"]] as const) {
+			await a.disk.moveIf(from,to,a.disk.hash(from)!); await a.plan({kind:"renamed",from,to}); await a.settle();
+		}
+		const seq = w.seq;
+		let stageReads = 0, downloads = 0;
+		const read = b.i.readStage, fetch = b.i.fetch;
+		b.i.readStage = ref => { stageReads++; return available ? read(ref) : Promise.resolve(undefined); };
+		b.i.fetch = ref => { downloads++; return fetch(ref); };
+		await b.pull(); await b.plan();
+		assert.equal(await b.dev.change(s => s.intent?.kind),"park");
+		b.disk.crash = "effect"; await assert.rejects(b.effect(),/killed/);
+		await b.reopen(); await b.plan({kind:"startup"}); await b.settle();
+		assert.equal(b.disk.text("x.bin"),"Y"); assert.equal(b.disk.text("y.bin"),"A");
+		assert.equal(w.seq,seq);
+		assert.equal(stageReads,1); assert.equal(downloads,available ? 0 : 1);
 	}
-	const seq = w.seq;
-	await b.pull(); await b.plan();
-	assert.equal(await b.dev.change(s => s.intent?.kind),"park");
-	b.disk.crash = "effect"; await assert.rejects(b.effect(),/killed/);
-	await b.reopen(); await b.plan({kind:"startup"}); await b.settle();
-	assert.equal(b.disk.text("x.bin"),"Y"); assert.equal(b.disk.text("y.bin"),"A");
-	assert.equal(w.seq,seq);
 });
 
 test("a save after a remote rename but before its disk agreement is preserved on restart", async () => {
@@ -352,4 +360,61 @@ test("a user rename while a remote delete is prepared follows the deletion", asy
 	await b.pull(); await b.plan(); assert.equal(await b.dev.change(s => s.intent?.kind),"remove");
 	await b.disk.moveIf("x.bin","y.bin",b.disk.hash("x.bin")!); await b.plan({kind:"renamed",from:"x.bin",to:"y.bin"});
 	await b.settle(); assert.equal(b.disk.files.size,0); assert.equal(w.live().length,0);
+});
+
+test("an unusable disk intent releases other uploads and downloads until its inputs change", async () => {
+	for (const failure of ["oversized", "unreadable", "fetch", "excluded"] as const) {
+		const w = new WorkerModel(), a = await client(w), b = await client(w);
+		a.disk.edit("a.bin", "one"); a.disk.edit("b.bin", "two"); await a.settle();
+		await b.pull(); await b.plan();
+		assert.equal(await b.dev.change(s => s.intent?.path), "a.bin");
+		const read = b.disk.readBinary.bind(b.disk), fetch = b.i.fetch;
+		let attempts = 0;
+		if (failure === "oversized") b.disk.put("a.bin", new Uint8Array(b.i.maxFileSize + 1));
+		if (failure === "unreadable") {
+			b.disk.edit("a.bin", "one");
+			b.disk.readBinary = path => path === "a.bin" ? Promise.reject(new Error("unreadable")) : read(path);
+		}
+		if (failure === "fetch") b.i.fetch = ref => {
+			if (ref.h === hash(enc.encode("one"))) { attempts++; throw new Error("missing"); }
+			return fetch(ref);
+		};
+		if (failure === "excluded") b.i.allowed = path => path !== "a.bin";
+		b.disk.edit("upload.bin", "local");
+		await b.plan({kind:"changed",path:"upload.bin"});
+		assert.equal((await b.pending()).length, 1);
+		await b.effect(); await b.reopen(); await b.settle();
+		assert.equal(b.disk.text("b.bin"), "two");
+		assert.ok(w.live().some(row => row.path === "upload.bin"));
+		assert.equal(attempts, failure === "fetch" ? 1 : 0);
+		if (failure === "fetch") {
+			a.disk.edit("a.bin", "three"); await a.settle();
+		} else if (failure === "excluded") b.i.allowed = () => true;
+		else { b.disk.readBinary = read; b.disk.files.delete("a.bin"); }
+		await b.settle();
+		assert.equal(b.disk.text("a.bin"), failure === "fetch" ? "three" : "one");
+	}
+});
+
+test("offline adds and a second save cache observed bytes without advancing agreement", async () => {
+	const w = new WorkerModel(), a = await client(w);
+	for (let n = 0; n < 20; n++) a.disk.edit(n + ".bin", "new " + n);
+	await a.plan();
+	assert.equal((await a.pending()).length, 20);
+	const reads = a.disk.reads;
+	await a.reopen(); await a.plan();
+	assert.equal(a.disk.reads, reads);
+	a.disk.edit("5.bin", "saved"); await a.plan({kind:"changed",path:"5.bin"}); await a.plan();
+	assert.equal(a.disk.reads, reads + 1);
+	assert.ok(await a.dev.change(s => [...s.local.values()].every(f => !f.base.bytes)));
+});
+
+test("identical cached holder moved before a new file was proposed", async () => {
+	const w = new WorkerModel(), a = await client(w), b = await client(w);
+	a.disk.edit("x.bin", "same"); await a.settle(); await b.pull();
+	await a.disk.moveIf("x.bin","y.bin",a.disk.hash("x.bin")!);
+	await a.plan({kind:"renamed",from:"x.bin",to:"y.bin"}); await a.settle();
+	b.disk.edit("x.bin","same"); await b.plan(); await b.deliver(); await b.settle();
+	assert.deepEqual([...b.disk.files.keys()].sort(), ["x.bin","y.bin"]);
+	assert.equal(w.live().length, 2);
 });

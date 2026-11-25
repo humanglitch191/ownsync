@@ -3,14 +3,13 @@ import { concat, hex, unhex } from "../../../../protocol/ownsync";
 import { encodeClient } from "../../../../server/src/wire";
 import type { Ref, Store } from "../ports";
 
-export interface RecordData { path: string; bytes: Ref; mtime: number }
+export interface RecordData { path: string; bytes: Ref; mtime: number | null }
 export interface Row extends RecordData { file: string; seq: number; deleted: number | null }
 export interface Local {
 	path: string;
-	base: { path?: string; bytes?: Ref };
+	base: { path?: string; bytes?: Pick<Ref, "h"> & Partial<Ref> };
 	removed?: boolean; // explicit delete or authoritative startup absence, retained across an in-flight proposal
 	redundant?: { target: string; hash: string };
-	stat?: { size: number; mtime: number; hash: string };
 }
 export interface Observation { path: string; size: number; mtime: number; hash?: string }
 export type Request = { req: string; file: string } & (
@@ -33,7 +32,14 @@ export type Intent = { file: string; path: string; seq: number; authority?: stri
 	| { kind: "park"; hash: string; saved: Ref }
 	| { kind: "remove"; hash: string }
 );
+export interface Blocked {
+	authority: string;
+	seq: number;
+	endpoints: [string, Observation | null][];
+}
 export interface State {
+	observed: Map<string, Observation>;
+	blocked: Map<string, Blocked>;
 	latest: Map<string, Row>;
 	local: Map<string, Local>;
 	pending: Map<string, Pending>;
@@ -174,12 +180,13 @@ function field(mine: string, theirs: string, base?: string) {
 }
 
 export async function reconcile(s: State, file: string, view: ReadonlyMap<string, Observation>, missingIsDelete: boolean, inputs: Inputs): Promise<void> {
-	if (s.intent || reserved(s, file)) return;
+	if (s.intent?.file === file || reserved(s, file)) return;
+	const schedule = (op: Intent) => { if (!s.intent) s.intent = op; };
 	const row = s.latest.get(file);
 	let local = s.local.get(file);
 	if (!local) {
 		if (row && row.deleted === null && !view.has(row.path) && ![...s.local.values()].some(f => f.path === row.path))
-			s.intent = { seq: row.seq, kind: "write", file, path: row.path, before: null, data: record(row) };
+			schedule({ seq: row.seq, kind: "write", file, path: row.path, before: null, data: record(row) });
 		if (row?.deleted != null) s.parked.delete(file);
 		return;
 	}
@@ -203,14 +210,14 @@ export async function reconcile(s: State, file: string, view: ReadonlyMap<string
 	if (local.redundant) {
 		const target = s.latest.get(local.redundant.target);
 		if (hash === local.redundant.hash && target?.deleted === null && target.bytes.h === hash) {
-			s.intent = { kind: "remove", file, path: local.path, hash, seq: target.seq, authority: target.file };
+			schedule({ kind: "remove", file, path: local.path, hash, seq: target.seq, authority: target.file });
 			return;
 		}
 		local = { ...local, redundant: undefined };
 		s.local.set(file, local);
 	}
 	if (row && row.deleted !== null && local.base.bytes?.h === hash) {
-		s.intent = { seq: row.seq, kind: "remove", file, path: local.path, hash }; return;
+		schedule({ seq: row.seq, kind: "remove", file, path: local.path, hash }); return;
 	}
 	const bytes = row && row.deleted === null ? field(hash, row.bytes.h, local.base.bytes?.h) : "mine";
 	const path = row && row.deleted === null ? field(disk.path, row.path, local.base.path) : "mine";
@@ -221,15 +228,14 @@ export async function reconcile(s: State, file: string, view: ReadonlyMap<string
 	const create = !row || copy;
 	if (ownPath || ownBytes || copy) {
 		const other = occupant(s, dest, file);
-		if (!row && other?.bytes.h === hash) { handover(s, file, other, disk.path); return; }
+		// A cached holder can have moved. Only its Worker refusal proves who owns identical bytes.
 		const value = takeMine ? hash : row!.bytes.h;
-		if (copy || other) {
+		if (copy || (other && (row || other.bytes.h !== hash))) {
 			const original = dest;
 			for (let counter = 0; ; counter++) {
 				dest = withSuffix(original, `conflict ${await inputs.suffix(value, counter)}`);
 				const holder = occupant(s, dest, file);
-				if (!holder) break;
-				if (create && holder.bytes.h === hash) { handover(s, file, holder, disk.path); return; }
+				if (!holder || (create && holder.bytes.h === value)) break;
 			}
 		}
 		const ref = takeMine ? await inputs.stage(disk) : row!.bytes;
@@ -242,16 +248,14 @@ export async function reconcile(s: State, file: string, view: ReadonlyMap<string
 	}
 	if (!row || row.deleted !== null) return;
 	const next = { ...local, base: { path: path === "equal" ? row.path : local.base.path, bytes: bytes === "equal" ? row.bytes : local.base.bytes } };
-	if (bytes === "equal") next.stat = { size: disk.size, mtime: disk.mtime, hash };
-	if (local.base.path !== next.base.path || local.base.bytes?.u !== next.base.bytes?.u || local.base.bytes?.h !== next.base.bytes?.h
-		|| local.stat?.mtime !== next.stat?.mtime || local.stat?.size !== next.stat?.size || local.stat?.hash !== next.stat?.hash) s.local.set(file, next);
+	if (local.base.path !== next.base.path || local.base.bytes?.u !== next.base.bytes?.u || local.base.bytes?.h !== next.base.bytes?.h) s.local.set(file, next);
 	if (disk.path !== row.path) {
-		if (!view.has(row.path)) s.intent = { seq: row.seq, kind: "rename", file, from: disk.path, path: row.path, hash };
-		else if (bytes === "theirs") s.intent = { seq: row.seq, kind: "write", file, path: disk.path, before: hash, data: record(row) };
-	} else if (hash !== row.bytes.h) s.intent = { seq: row.seq, kind: "write", file, path: disk.path, before: hash, data: record(row) };
+		if (!view.has(row.path)) schedule({ seq: row.seq, kind: "rename", file, from: disk.path, path: row.path, hash });
+		else if (bytes === "theirs") schedule({ seq: row.seq, kind: "write", file, path: disk.path, before: hash, data: record(row) });
+	} else if (hash !== row.bytes.h) schedule({ seq: row.seq, kind: "write", file, path: disk.path, before: hash, data: record(row) });
 }
 
-const maps = ["latest", "local", "pending", "forget", "parked"] as const;
+const maps = ["latest", "local", "pending", "forget", "parked", "observed", "blocked"] as const;
 type Meta = Pick<State, "cursor" | "intent">;
 export class TableDevice {
 	private queue: Promise<unknown> = Promise.resolve();
@@ -262,12 +266,12 @@ export class TableDevice {
 			const prefix = "table/" + kind + "/";
 			return new Map((await store.list<T>(prefix)).map(([k,v]) => [k.slice(prefix.length), v]));
 		};
-		return new TableDevice(store, { cursor: 0, ...meta, latest: await load<Row>("latest"), local: await load<Local>("local"), pending: await load<Pending>("pending"), forget: await load<true>("forget"), parked: await load<Ref>("parked") });
+		return new TableDevice(store, { cursor: 0, ...meta, latest: await load<Row>("latest"), local: await load<Local>("local"), pending: await load<Pending>("pending"), forget: await load<true>("forget"), parked: await load<Ref>("parked"), observed: await load<Observation>("observed"), blocked: await load<Blocked>("blocked") });
 	}
 	// Publish the new in-memory state only after the atomic write succeeds.
 	change<T>(fn: (draft: State) => T | Promise<T>): Promise<T> {
 		const work = this.queue.then(async () => {
-			const before = this.state, draft = { ...before, latest: new Map(before.latest), local: new Map(before.local), pending: new Map(before.pending), forget: new Map(before.forget), parked: new Map(before.parked) };
+			const before = this.state, draft = { ...before, latest: new Map(before.latest), local: new Map(before.local), pending: new Map(before.pending), forget: new Map(before.forget), parked: new Map(before.parked), observed: new Map(before.observed), blocked: new Map(before.blocked) };
 			const result = await fn(draft);
 			const puts = new Map<string, unknown>(), deletes: string[] = [];
 			for (const kind of maps) {

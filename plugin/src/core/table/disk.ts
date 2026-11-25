@@ -1,7 +1,7 @@
 // A plan is committed before executing any filesystem intent. The injected adapter owns the
 // private plugin-folder temp file and the conditional mutations at the visible endpoints.
 import type { Disk, DiskFile, Ref } from "../ports";
-import { reconcile, reserved, type Inputs, type Local, type Observation, type State, type TableDevice } from "./device";
+import { reconcile, reserved, type Blocked, type Inputs, type Observation, type State, type TableDevice } from "./device";
 
 export type Event = { kind: "startup" | "settle" } | { kind: "changed" | "deleted"; path: string }
 	| { kind: "renamed"; from: string; to: string };
@@ -10,6 +10,7 @@ export interface DiskInputs extends Inputs {
 	allowed(path: string): boolean;
 	maxFileSize: number;
 	hash(bytes: Uint8Array): Promise<string>;
+	readStage(ref: Ref): Promise<Uint8Array | undefined>;
 	fetch(ref: Ref): Promise<Uint8Array>;
 }
 export interface DiskPort extends Pick<Disk, "stat" | "list" | "readBinary"> {
@@ -24,9 +25,9 @@ const included = (i: DiskInputs, p: string) => i.attachments && !p.endsWith(".md
 
 const under = (path: string, root: string) => path === root || path.startsWith(root + "/");
 
-async function observe(disk: DiskPort, i: DiskInputs, stat: DiskFile, cached?: Local["stat"]): Promise<Observation> {
+async function observe(disk: DiskPort, i: DiskInputs, stat: DiskFile, cached?: Observation): Promise<Observation> {
 	if (stat.size > i.maxFileSize) return stat;
-	if (cached && cached.mtime === stat.mtime && cached.size === stat.size) return { ...stat, hash: cached.hash };
+	if (cached?.hash !== undefined && cached.mtime === stat.mtime && cached.size === stat.size) return cached;
 	try {
 		const bytes = await disk.readBinary(stat.path), after = await disk.stat(stat.path);
 		if (after?.size === stat.size && after.mtime === stat.mtime && bytes.length === stat.size)
@@ -36,12 +37,15 @@ async function observe(disk: DiskPort, i: DiskInputs, stat: DiskFile, cached?: L
 }
 
 async function inventory(s: State, disk: DiskPort, i: DiskInputs, event: Event) {
-	const cache = new Map([...s.local.values()].map(f => [f.path, f.stat]));
+	const cache = s.observed;
 	if ("path" in event) cache.delete(event.path);
 	if (event.kind === "renamed") for (const path of cache.keys()) if (under(path, event.from) || under(path, event.to)) cache.delete(path);
 	const view = new Map<string, Observation>();
 	for (const stat of await disk.list()) if (included(i, stat.path))
 		view.set(stat.path, await observe(disk, i, stat, cache.get(stat.path)));
+	// The stat belongs to these observed bytes, even when no row or agreement exists yet.
+	for (const path of cache.keys()) if (!view.get(path)?.hash) cache.delete(path);
+	for (const [path, obs] of view) if (obs.hash !== undefined) cache.set(path, obs);
 	return view;
 }
 
@@ -52,11 +56,11 @@ function bindEvent(s: State, view: Map<string, Observation>, event: Event, input
 		if (prior && prior !== file) s.local.delete(prior);
 		const local = s.local.get(file)!;
 		owners.delete(local.path); owners.set(to, file);
-		s.local.set(file, { ...local, path: to, stat: undefined, removed: false });
+		s.local.set(file, { ...local, path: to, removed: false });
 	};
 	if ("path" in event) {
 		const id = owners.get(event.path);
-		if (id) s.local.set(id, { ...s.local.get(id)!, stat: undefined, removed: event.kind === "deleted" && !view.has(event.path) });
+		if (id) s.local.set(id, { ...s.local.get(id)!, removed: event.kind === "deleted" && !view.has(event.path) });
 	}
 	if (event.kind === "renamed") {
 		for (const [path, file] of [...owners]) if (under(path, event.from)) {
@@ -71,9 +75,10 @@ function bindEvent(s: State, view: Map<string, Observation>, event: Event, input
 		// D13 counts both sides in the original inventory. An unreadable candidate cannot establish uniqueness.
 		for (const [file, local] of missing) {
 			const base = local.base.bytes;
+			// At migration an offline rename with no confirmed hash cannot identify its old file.
 			if (!base) continue;
 			const matches = unknown.filter(f => f.hash === base.h);
-			if (unknown.some(f => f.hash === undefined && f.size === base.n)) {
+			if (unknown.some(f => f.hash === undefined && (base.n === undefined || f.size === base.n))) {
 				defer.add(file);
 				for (const m of matches) defer.add(m.path);
 			} else if (matches.length === 1 && missing.filter(([, f]) => f.base.bytes?.h === base.h).length === 1) move(file, matches[0]!.path);
@@ -97,7 +102,7 @@ async function parkCycle(s: State, view: Map<string, Observation>, inputs: DiskI
 	const moving = new Map<string, string>();
 	for (const [id, local] of s.local) {
 		const row = s.latest.get(id);
-		if (row?.deleted === null && local.path !== row.path && !reserved(s, id) && included(inputs,row.path)
+		if (!s.blocked.has(id) && row?.deleted === null && local.path !== row.path && !reserved(s, id) && included(inputs,row.path)
 			&& view.get(local.path)?.hash === row.bytes.h && local.base.bytes?.h === row.bytes.h) moving.set(local.path,id);
 	}
 	const visited = new Set<string>();
@@ -117,7 +122,10 @@ async function parkCycle(s: State, view: Map<string, Observation>, inputs: DiskI
 }
 
 export async function planDisk(device: TableDevice, disk: DiskPort, inputs: DiskInputs, event: Event) {
-	if (!inputs.attachments) return;
+	if (!inputs.attachments) {
+		await device.change(s => { s.intent = undefined; });
+		return;
+	}
 	if (event.kind === "startup") {
 		await device.change(async () => disk.discardTemp());
 		await executeIntent(device, disk, inputs);
@@ -125,12 +133,17 @@ export async function planDisk(device: TableDevice, disk: DiskPort, inputs: Disk
 	await device.change(async s => {
 		const view = await inventory(s, disk, inputs, event);
 		const defer = bindEvent(s, view, event, inputs);
+		for (const [id, block] of s.blocked) {
+			const at = s.local.get(id)?.path;
+			if ((at && !block.endpoints.some(([p]) => p === at)) || s.latest.get(block.authority)?.seq !== block.seq
+				|| block.endpoints.some(([p, seen]) => !sameObservation(seen, view.get(p)))) s.blocked.delete(id);
+		}
 		// Ingest local changes before creating remote files. Process authoritative missing events even
 		// when another file needs disk work; an event can contain the only evidence of a user rename.
 		const ids = [...new Set([...s.local.keys(), ...s.latest.keys()])];
 		for (const id of ids) {
 			const local = s.local.get(id), path = local?.path ?? s.latest.get(id)?.path;
-			if (!path || !included(inputs, path) || defer.has(id)) continue;
+			if (!path || !included(inputs, path) || defer.has(id) || s.blocked.has(id)) continue;
 			const row = s.latest.get(id);
 			if (row && (!included(inputs, row.path) || row.bytes.n > inputs.maxFileSize)) continue;
 			const deleted = event.kind === "startup" || (event.kind === "deleted" && under(path, event.path))
@@ -143,24 +156,49 @@ export async function planDisk(device: TableDevice, disk: DiskPort, inputs: Disk
 	});
 }
 
+function sameObservation(a: Observation | null, b: Observation | undefined) {
+	return a?.hash === b?.hash && a?.size === b?.size && a?.mtime === b?.mtime;
+}
+
 // Execute one already-durable intent. Re-reading an endpoint also distinguishes a completed
 // operation from a prepared one after a crash. Scratch bytes never enter disk discovery.
 export async function executeIntent(device: TableDevice, disk: DiskPort, i: DiskInputs) {
 	return device.change(async s => {
 		const op = s.intent;
-		if (!op || !included(i, op.path) || (op.kind === "rename" && !included(i, op.from))) return false;
+		if (!op) return false;
+		if (!included(i, op.path) || (op.kind === "rename" && !included(i, op.from))) {
+			s.intent = undefined;
+			return false;
+		}
 		const bound = s.local.get(op.file)?.path;
 		if (bound && bound !== op.path && !(op.kind === "rename" && bound === op.from)) {
 			s.intent = undefined; // a later user rename already identified the new endpoint
 			return false;
 		}
+		let unreadable = false;
 		const read = async (path: string) => {
-			const stat = await disk.stat(path);
-			return stat && observe(disk, i, stat);
+			try {
+				const stat = await disk.stat(path);
+				return stat && await observe(disk, i, stat);
+			} catch {
+				unreadable = true;
+				return (await disk.list()).find(f => f.path === path) as Observation | undefined;
+			}
 		};
 		let dest = await read(op.path);
 		const source = op.kind === "rename" ? await read(op.from) : undefined;
-		if ((dest && dest.hash === undefined) || (source && source.hash === undefined)) return false;
+		const block = () => {
+			const endpoints: Blocked["endpoints"] = [[op.path, dest ?? null]];
+			if (op.kind === "rename") endpoints.push([op.from, source ?? null]);
+			for (const [path, seen] of endpoints) {
+				if (seen?.hash === undefined) s.observed.delete(path);
+				else s.observed.set(path, seen);
+			}
+			s.blocked.set(op.file, { seq: op.seq, authority: op.authority ?? op.file, endpoints });
+			s.intent = undefined;
+			return false;
+		};
+		if (unreadable || (dest && dest.hash === undefined) || (source && source.hash === undefined)) return block();
 		const removal = op.kind === "remove" || op.kind === "park";
 		const done = removal ? !dest : op.kind === "write" ? dest?.hash === op.data.bytes.h : !source && dest?.hash === op.hash;
 		if (!done) {
@@ -168,8 +206,16 @@ export async function executeIntent(device: TableDevice, disk: DiskPort, i: Disk
 			if (s.latest.get(op.authority ?? op.file)?.seq === op.seq && !reserved(s, op.file)) {
 				if (op.kind === "write" && (dest?.hash ?? null) === op.before) {
 					const saved = s.parked.get(op.file);
-					const bytes = await i.fetch(saved?.h === op.data.bytes.h ? saved : op.data.bytes);
-					if (bytes.length !== op.data.bytes.n || await i.hash(bytes) !== op.data.bytes.h) throw new Error("Attachment download did not verify");
+					const ref = op.data.bytes;
+					let bytes: Uint8Array | undefined;
+					if (saved?.h === ref.h) {
+						try { bytes = await i.readStage(saved); } catch { /* Try the published version. */ }
+						if (bytes && (bytes.length !== ref.n || await i.hash(bytes) !== ref.h)) bytes = undefined;
+					}
+					if (!bytes) {
+						try { bytes = await i.fetch(ref); } catch { return block(); }
+						if (bytes.length !== ref.n || await i.hash(bytes) !== ref.h) return block();
+					}
 					await disk.writeTemp(bytes);
 					applied = await disk.installTemp(op.path, op.before);
 					await disk.discardTemp();
@@ -186,7 +232,9 @@ export async function executeIntent(device: TableDevice, disk: DiskPort, i: Disk
 			}
 			dest = removal ? undefined : await read(op.path);
 		}
+		if (op.kind === "rename") s.observed.delete(op.from);
 		if (removal) {
+			s.observed.delete(op.path);
 			s.local.delete(op.file);
 			if (op.kind === "park") s.parked.set(op.file, op.saved);
 		} else {
@@ -194,9 +242,9 @@ export async function executeIntent(device: TableDevice, disk: DiskPort, i: Disk
 			const prior = s.local.get(op.file);
 			// An edit just after install must be compared to what was installed, even if its event is delayed.
 			const base = { path: op.path, bytes: op.kind === "write" ? op.data.bytes : prior?.base.bytes };
-			const hash = op.kind === "write" ? op.data.bytes.h : op.hash;
-			const stat = dest?.hash === hash ? { size: dest.size, mtime: dest.mtime, hash } : undefined;
-			s.local.set(op.file, { path: op.path, base, stat });
+			if (dest?.hash !== undefined) s.observed.set(op.path, dest);
+			else s.observed.delete(op.path);
+			s.local.set(op.file, { path: op.path, base });
 		}
 		s.intent = undefined;
 		return true;
