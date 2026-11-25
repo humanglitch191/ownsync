@@ -84,3 +84,37 @@ test("a replacement for several words stays intact across a concurrent insertion
 	assert.equal(b.getText("t").toString(), merged);
 	a.destroy(); b.destroy();
 });
+
+test("concurrent word replacements with shared edges stay intact instead of merging or shedding fragments", () => {
+	// Two replacements of one word sharing prefix/suffix keep both words whole.
+	{
+		const a = new Y.Doc(), b = new Y.Doc();
+		a.getText("t").insert(0, "<d2.16>");
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+		applyText(a.getText("t"), "<d0.40>");
+		applyText(b.getText("t"), "<d1.31>");
+		Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+		const merged = a.getText("t").toString();
+		assert.ok(merged.includes("<d0.40>") && merged.includes("<d1.31>"), merged);
+		assert.equal(b.getText("t").toString(), merged);
+		a.destroy(); b.destroy();
+	}
+	// A word replacement or mid-word insertion concurrent with a broader deletion keeps the whole word.
+	for (const [base, first, second, expect] of [
+		["<d1.2> <d0.1> <d2.3>", "<d1.2> <d0.37> <d2.3>", "<d2.36>", "<d0.37>"],
+		["<d0.1>", "<d0.10>", "<d1.2>", "<d0.10>"],
+	] as const) {
+		const a = new Y.Doc(), b = new Y.Doc();
+		a.getText("t").insert(0, base);
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+		applyText(a.getText("t"), first);
+		applyText(b.getText("t"), second);
+		Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+		const merged = a.getText("t").toString();
+		assert.ok(merged.includes(expect) && merged.includes(second), merged);
+		assert.equal(b.getText("t").toString(), merged);
+		a.destroy(); b.destroy();
+	}
+});

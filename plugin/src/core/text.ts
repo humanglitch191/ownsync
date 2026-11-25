@@ -46,9 +46,9 @@ function textEdits(prev: string, next: string, refine = true): [at: number, remo
 				while (right < old.length - left && right < insert.length - left &&
 					old.charCodeAt(old.length - right - 1) === insert.charCodeAt(insert.length - right - 1)) right++;
 				if (right && /[\uDC00-\uDFFF]/.test(old.charAt(old.length - right))) right--;
-				// A pure insertion retains all the old text. For a multiword replacement,
-				// retaining edges can anchor a new word across an old inter-word insertion.
-				if (left + right < old.length && (x - i > 1 || y - j > 1)) {
+				// Only pure prefix or suffix extensions retain the old text. Replacing or editing
+				// inside a word can interleave concurrent edits or orphan fragments across deletions.
+				if (left < old.length && right < old.length) {
 					left = 0;
 					right = 0;
 				}
