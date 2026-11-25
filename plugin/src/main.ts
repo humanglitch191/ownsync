@@ -429,7 +429,7 @@ export default class OwnsyncPlugin extends Plugin {
 		const report = debounce(() => transport.report(), 5000);
 		const changed = (path: string, deleted = false) => {
 			if (engine.tableActive && allowed(path)) void table.event({kind:deleted ? "deleted" : "changed",path});
-			else engine.diskChanged(path);
+			else engine.diskChanged(path, deleted);
 		};
 		const refs: [{ offref(ref: EventRef): void }, EventRef][] = [
 			[vault, vault.on("create", (f) => { if (disk.synced(f)) { changed(f.path); refresh(); } })],

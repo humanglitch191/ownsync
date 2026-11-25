@@ -18,6 +18,10 @@ export type GenesisRow = Row & { dateAtCommit?: true };
 
 export class IncompleteIndex extends Error { constructor(readonly partial: Uint8Array) { super("Waiting for the missing stored index update or a complete snapshot"); } }
 
+export class MissingNoteText extends Error {
+	constructor(readonly doc: string) { super("Waiting for the first stored text of note " + doc); }
+}
+
 export class LegacyProjection {
 	readonly index = new Y.Doc();
 	readonly notes = this.index.getMap<IndexValue>("notes");
@@ -29,6 +33,10 @@ export class LegacyProjection {
 		let d = this.docs.get(entry.doc);
 		if (!d) this.docs.set(entry.doc, d = new Y.Doc());
 		Y.applyUpdate(d, entry.data);
+	}
+	requireStoredNotes(stored: ReadonlySet<string>) {
+		for (const [id, value] of this.notes)
+			if (value.p.endsWith(".md") && !stored.has(id)) throw new MissingNoteText(id);
 	}
 	// Text remains in its existing Yjs stream. In particular the deletion vector
 	// is the one the deleter saw, not the current vector of the text document.
@@ -135,9 +143,10 @@ async function deletedBase(store: Store, id: string, seen: string) {
 export async function legacyBases(store: Store, key: Uint8Array) {
 	const locals = new Map<string, Local>();
 	const puts = new Map<string, unknown>();
-	const out = (await store.list<StoredEntry>("out:"))
-		.sort(([a], [b]) => Number(a.slice(4)) - Number(b.slice(4)))
-		.map(([, e]) => e);
+	const queued = (await store.list<StoredEntry>("out:")).sort(([a], [b]) => Number(a.slice(4)) - Number(b.slice(4)));
+	const firstText = new Map<string, number>();
+	for (const [key, e] of queued) if (!firstText.has(e.doc)) firstText.set(e.doc,Number(key.slice(4)));
+	const out = queued.map(([,e]) => e);
 	const pending = new Set(out.map(e => e.doc));
 	const restores = new Set(out.filter(e => e.kind === "snapshot").map(e => e.doc));
 	const index = new Y.Doc();
@@ -158,7 +167,7 @@ export async function legacyBases(store: Store, key: Uint8Array) {
 			const removed = !m.diskPath && changed.has(id) && entry?.d !== undefined;
 			const path = m.diskPath ?? (removed ? entry?.p : undefined);
 			if (entry?.p.endsWith(".md")) {
-				puts.set(k, { ...m, tableNote: true, basePath: changed.has(id) ? changed.get(id) : path });
+				puts.set(k, { ...m, tableNote: true, firstText: firstText.get(id), basePath: changed.has(id) ? changed.get(id) : path });
 				if (m.writing && !m.baseHash) {
 					const intended = await store.get("base:" + id);
 					if (intended) puts.set("table/note-write/" + id, intended);

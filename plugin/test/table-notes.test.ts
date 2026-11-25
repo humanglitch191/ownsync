@@ -400,6 +400,16 @@ test("a lost note-create answer replays its request and preserves a later offlin
 	};
 	await t.connect(ask, d.engine!); await t.ready(1); await t.notesCaughtUp();
 	disk.edit("one.md", "draft"); d.engine!.diskChanged("one.md"); await d.idle(); await t.idle();
+	assert.equal(sent.length, 0, "a file row must wait for its first stored text ack");
+	// Lose the text ack as well. After reconnect its durable outbox must replay
+	// before a create can acquire the path.
+	d.connect(); await d.idle();
+	while (d.pumpUp()) {}
+	while (d.pumpDown()) {} await d.idle();
+	while (d.pumpUp()) {}
+	assert.ok(d.server.rows.some(r => r.entry.doc === d.engine!.noteAt("one.md")));
+	d.disconnect(); await d.idle(); assert.equal(sent.length,0);
+	d.connect(); await quiesce([d]); await t.idle();
 	assert.ok(stored); const doc = d.engine!.noteAt("one.md")!;
 	t.disconnect(); disk.files.set("two.md", disk.files.get("one.md")!); disk.files.delete("one.md");
 	d.engine!.diskRenamed("one.md", "two.md"); await d.idle();
@@ -448,4 +458,36 @@ test("a deleted row can be listed before its text arrives, but its preview and r
 	assert.equal(await d.engine!.deletedText(note.id), "still stored");
 	assert.equal(await d.engine!.restoreDeleted(note.id, undefined, 2), note.path);
 	assert.equal(change(note.id)?.t, "restore");
+});
+
+test("a transient missing path during save or rename cannot delete a note on a remote settle", async () => {
+	const { d, disk, change } = await planner(), initial = version("base");
+	d.data.set("state:" + note.id,initial); await d.engine!.startTableNoteFiles(false);
+	disk.files.delete(note.path);
+	d.engine!.diskChanged(note.path,false); await d.idle(); // modify while the editor replaces its file
+	assert.equal(change(note.id),undefined);
+	d.engine!.diskChanged(note.path,true); // delete and create announced before the queue drains
+	disk.edit(note.path,"base saved"); d.engine!.diskChanged(note.path,false); await d.idle();
+	const placed = disk.files.get(note.path)!; disk.files.delete(note.path); disk.files.set("new.md",placed);
+	await d.engine!.receive({t:"live",entry:{doc:note.id,kind:"update",data:version(" peer", initial)}});
+	assert.equal(change(note.id),undefined);
+	d.engine!.diskRenamed(note.path,"new.md"); await d.idle();
+	assert.equal(d.engine!.noteAt("new.md"),note.id); assert.equal(change(note.id)?.t,"set");
+	assert.match(disk.text("new.md")!,/peer/); assert.match(disk.text("new.md")!,/saved/);
+});
+
+test("closing after a disk delete uses the open editor's full deletion snapshot", async () => {
+	const { d, disk, t, change } = await planner();
+	d.data.set("state:" + note.id,version("keep this")); await d.engine!.startTableNoteFiles(false);
+	const doc = await d.engine!.open(note.id); assert.ok(doc);
+	doc.getText("t").delete(4,5); await d.idle();
+	disk.files.delete(note.path);
+	d.engine!.diskChanged(note.path); await d.idle();
+	assert.equal(change(note.id),undefined);
+	const expected = Buffer.from(Y.encodeSnapshot(Y.snapshot(doc))).toString("base64");
+	await d.engine!.close(note.id);
+	assert.deepEqual(change(note.id),{t:"del", path:note.path,snapshot:expected});
+	await t.notes.receive({...note,seq:2,deleted:1,snapshot:expected}); await d.engine!.tableNoteChanged(note.id);
+	assert.equal(change(note.id),undefined); assert.equal(disk.text(note.path),undefined);
+	assert.equal(await d.engine!.deletedText(note.id),"keep");
 });

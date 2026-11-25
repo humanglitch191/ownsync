@@ -365,7 +365,7 @@ export class Engine {
 	 * it looks, later events may already have changed what is there. So a path with events still waiting is
 	 * not trusted (`dirty`), and anything that needs it waits for those events.
 	 */
-	diskChanged(path: string): void {
+	diskChanged(path: string, mayDelete = true): void {
 		if (this.notesOnly && !isNote(path)) return;
 		this.mark(path, 1);
 		this.later(() => void this.run(`disk ${path}`, async () => {
@@ -374,7 +374,16 @@ export class Engine {
 			if (this.noteAuthority && isNote(path)) {
 				if (this.dirty.has(path)) return;
 				const id = this.byPath.get(path);
-				if (id) await this.settleTableNote(id, true);
+				if (id) {
+					const m = this.metaOf(id), open = this.opened.get(id);
+					if (await this.opts.noteDisk!.stat(path)) {
+						if (m.missing) { delete m.missing; this.put("note:" + id, m); }
+					} else if (mayDelete && !this.dirty.has(path)) {
+						m.missing = { path, snapshot: open && b64(Y.encodeSnapshot(Y.snapshot(open))) };
+						this.put("note:" + id, m);
+					}
+					await this.settleTableNote(id, true);
+				}
 				else if (await this.opts.noteDisk!.stat(path)) {
 					await this.takeTableFile(path);
 					const placed = this.byPath.get(path);
@@ -756,6 +765,13 @@ export class Engine {
 				// One publish carries every edit to its document that was waiting, up to `id`.
 				const doc = this.outbox.find((o) => o.id === msg.id)?.entry.doc;
 				if (doc === undefined) return;
+				const meta = this.metas.get(doc);
+				if (meta?.firstText !== undefined && msg.id >= meta.firstText) {
+					delete meta.firstText;
+					this.put("note:" + doc, meta);
+					const change = await this.read<NoteStructure>("table/note-change/" + doc);
+					if (change) this.structure(doc, change); // wakes the table sender after this commit
+				}
 				for (const o of this.outbox) if (o.entry.doc === doc && o.id <= msg.id) this.del(`out:${o.id}`);
 				this.outbox = this.outbox.filter((o) => !(o.entry.doc === doc && o.id <= msg.id));
 				// The link is ordered, so everything before our own entry has already arrived.
@@ -915,7 +931,7 @@ export class Engine {
 		this.committedCursor = this.meta.cursor;
 	}
 
-	private send(doc: DocId, data: Uint8Array, kind: Entry["kind"] = "update"): void {
+	private send(doc: DocId, data: Uint8Array, kind: Entry["kind"] = "update"): number {
 		const item = { id: this.meta.nextOut++, entry: { doc, kind, data } };
 		this.outbox.push(item);
 		this.liveOut.push(item.entry);
@@ -924,6 +940,7 @@ export class Engine {
 			this.put(`out:${item.id}`, { ...item.entry, renameSources: [...this.renameSources] });
 			this.renameSources.clear();
 		} else this.put(`out:${item.id}`, item.entry);
+		return item.id;
 	}
 
 	/**
@@ -1041,7 +1058,7 @@ export class Engine {
 		if (changed && !fromDisk && before && (m.baseHash !== undefined || (m.writing && isNote(m.diskPath ?? ""))) &&
 			!(await this.read(`base:${id}`))) this.put(`base:${id}`, before);
 		this.put(`state:${id}`, after);
-		if (local) return this.send(id, update);
+		if (local) return void this.send(id, update);
 		const open = this.opened.get(id);
 		if (!open) return;
 		// On record before the editor shows it: whatever an editor saves to disk is then always already known.
@@ -1083,6 +1100,7 @@ export class Engine {
 	private place(id: string, path: string | undefined, file?: DiskFile): void {
 		const m = this.metaOf(id);
 		if (m.diskPath && this.byPath.get(m.diskPath) === id) this.byPath.delete(m.diskPath);
+		if (m.diskPath !== path) delete m.missing;
 		m.diskPath = path;
 		// One path, one note. Whoever was recorded there no longer is; its file will be settled afresh.
 		const before = path === undefined ? undefined : this.byPath.get(path);
@@ -1225,7 +1243,7 @@ export class Engine {
 			this.noteAuthority = true;
 		}
 		for (const [path, id] of view.missing) {
-			if (this.metaOf(id).diskPath === path && !await this.read("table/note-write/" + id)) await this.missingTableFile(id);
+			if (this.metaOf(id).diskPath === path && !await this.read("table/note-write/" + id) && !await disk.stat(path) && !this.dirty.has(path)) await this.missingTableFile(id);
 		}
 		for (const path of view.unknown) await attempt(path, () => this.takeTableFile(path));
 		for (const id of new Set([...this.byPath.values(), ...rows.ids()]))
@@ -1280,7 +1298,7 @@ export class Engine {
 		const state = Y.encodeStateAsUpdate(doc);
 		doc.destroy();
 		this.put("state:" + id, state);
-		this.send(id, state);
+		this.metaOf(id).firstText = this.send(id, state);
 		this.metaOf(id).tableNote = true;
 		this.structure(id, { t: "set", path: want });
 		this.place(id, path);
@@ -1291,11 +1309,14 @@ export class Engine {
 	private async missingTableFile(id: string) {
 		const m = this.metaOf(id), row = this.opts.tableNotes!.get(id);
 		if (!m.diskPath) return;
-		const base = await this.read<Uint8Array>("base:" + id) ?? await this.state(id);
-		if (completeText(base) === undefined) return;
-		const doc = this.load(base);
-		const snapshot = b64(Y.encodeSnapshot(Y.snapshot(doc)));
-		doc.destroy();
+		let snapshot = m.missing?.path === m.diskPath ? m.missing.snapshot : undefined;
+		if (snapshot === undefined) {
+			const state = (!m.open ? await this.read<Uint8Array>("base:" + id) : undefined) ?? await this.state(id);
+			if (completeText(state) === undefined) return;
+			const doc = this.load(state);
+			snapshot = b64(Y.encodeSnapshot(Y.snapshot(doc)));
+			doc.destroy();
+		}
 		this.structure(id, { t: "del", path: m.diskPath, snapshot });
 		this.place(id, undefined);
 		if (row?.deleted != null) this.del("table/note-change/" + id);
@@ -1443,7 +1464,7 @@ export class Engine {
 			}
 		}
 		if (m.diskPath && !seen && !intended) {
-			await this.missingTableFile(id);
+			if (m.missing?.path === at && !this.dirty.has(at)) await this.missingTableFile(id);
 			return;
 		}
 		const agreed = m.baseHash === undefined ? undefined : savedBase ?? state;

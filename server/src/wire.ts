@@ -92,6 +92,7 @@ export type ServerFrame =
 	| AttachmentAnswer
 	| { t: "format"; table: boolean }
 	| { t: "migrationWriteFailed" }
+	| { t: "migrationFailed"; reason: string }
 	| { t: "row"; row: AttachmentRow }
 	| { t: "tableMore" | "tableSynced" | "stagedPart"; seq: number }
 	| { t: "entry"; seq: number; doc: Uint8Array; snapshot: boolean; envelope: Uint8Array }
@@ -127,7 +128,7 @@ export const MAX_MARK = 1024;
 export const MARK = { retired: 1, current: 2, last: 4, deleted: 8, start: 16 } as const;
 
 const CLIENT = { hello: 1, subscribe: 2, publish: 3, snapshot: 4, live: 5, fetch: 6, append: 7, rotate: 8, put: 9, get: 10, status: 11, vput: 12, mark: 13, table: 14, since: 15, set: 16, del: 17, restore: 18, stageRow: 19, genesis: 20, forget: 21, migrationCheck: 22, stagePart: 23 } as const;
-const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedPart: 34, forgotten: 35, migrationEligible: 36, migrationWriteFailed: 37 } as const;
+const SERVER = { entry: 16, more: 17, synced: 18, ack: 19, live: 20, record: 21, records: 22, stored: 24, chunk: 25, missing: 26, marked: 27, format: 28, row: 29, tableMore: 30, tableSynced: 31, ok: 32, refused: 33, stagedPart: 34, forgotten: 35, migrationEligible: 36, migrationWriteFailed: 37, migrationFailed: 38 } as const;
 
 /** Legacy messages retain their original limit. A table record has additional fixed fields
  * and at most two fixed-width IDs; the decoder checks the record itself. */
@@ -305,6 +306,7 @@ function tags(rest: Uint8Array): Uint8Array[] {
 
 export function encodeServer(f: ServerFrame): Uint8Array {
 	switch (f.t) {
+		case "migrationFailed": return build(SERVER.migrationFailed, new TextEncoder().encode(f.reason));
 		case "migrationWriteFailed": return build(SERVER.migrationWriteFailed);
 		case "migrationEligible": return build(SERVER.migrationEligible, [1, Number(f.ready)]);
 		case "forgotten": return build(SERVER.forgotten, id(f.req));
@@ -333,6 +335,7 @@ export function encodeServer(f: ServerFrame): Uint8Array {
 export function decodeServer(bytes: Uint8Array): ServerFrame {
 	const r = new Reader(bytes);
 	switch (bytes[0]) {
+		case SERVER.migrationFailed: return { t: "migrationFailed", reason: new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(r.rest()) };
 		case SERVER.migrationWriteFailed: return r.end({ t: "migrationWriteFailed" });
 		case SERVER.migrationEligible: return r.end({ t: "migrationEligible", ready: r.bool() });
 		case SERVER.forgotten: return r.end({ t: "forgotten", req: r.take(DOC_TAG_BYTES) });

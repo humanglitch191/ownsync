@@ -5,7 +5,7 @@ import { decodeClient, encodeClient, MAX_CHUNK, MAX_MARK, type AttachmentRow, ty
 import * as Y from "yjs";
 import { NoteRows, type NoteRow } from "./core/table/notes";
 import type { VaultKeys } from "./keys";
-import type { Ref, Store } from "./core/ports";
+import type { NoteMeta, Ref, Store } from "./core/ports";
 import { TableDevice, catchUp, conflictSuffix, packRequest, restore, type Answer, type RecordData, type Row } from "./core/table/device";
 import { executeIntent, planDisk, type DiskInputs, type DiskPort, type Event } from "./core/table/disk";
 import type { Engine } from "./core/engine";
@@ -213,6 +213,7 @@ export class TableSync {
 		const engine = this.engine!, key = "table/note-request/" + doc;
 		let proposal = await this.store.get<NoteRequest>(key);
 		const row = this.notes.get(doc);
+		if (!row && (await this.store.get<NoteMeta>("note:" + doc))?.firstText !== undefined) return;
 		if (!proposal) {
 			const change = await this.store.get<NoteStructure>("table/note-change/" + doc);
 			if (!change) return;

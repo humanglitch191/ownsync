@@ -36,6 +36,10 @@ type Row = { seq: number; doc: ArrayBuffer; snapshot: number; envelope: ArrayBuf
 // NULL in versions means upload started, count unknown. Only genesis may install this legacy marker.
 const LEGACY_CHUNKS = -1;
 class IncompleteGenesis extends Error {}
+function dailyWriteLimit(error: unknown) {
+	const text = String(error);
+	return /\b(?:daily|today)\b|per[- ]day|for (?:the |this )?day/i.test(text) && /writes?|rows written/i.test(text) && /limit|quota|exceed/i.test(text);
+}
 
 // One catch-up page. Small enough to stay well inside a Worker's time and memory for one event.
 const PAGE_ROWS = 400;
@@ -454,6 +458,7 @@ export class Vault extends DurableObject<Env> {
 				// Held while it awaits the owner object, or the device's next frames would arrive before it is let in.
 				const refused = await this.ctx.blockConcurrencyWhile(() => this.admit(f.token, f.owner));
 				if (refused) return ws.close(refused, refused === CLOSE.notOwner ? "owner code needed" : "unauthorized");
+				this.cleanGenesisParts();
 				// History copies expire after 30 days even in a vault where nobody opens history.
 				this.dropHistory("WHERE at < ?", Date.now() - HISTORY_RETENTION_MS);
 				this.expireSnapshots(Date.now());
@@ -473,11 +478,12 @@ export class Vault extends DurableObject<Env> {
 			if (f.t === "stageRow") return ws.close(CLOSE.badMessage, "genesis rows belong inside parts");
 			if (f.t === "stagePart" || f.t === "genesis") {
 				if (!session.table) return ws.close(CLOSE.badMessage, "table handshake required");
+				if (f.t === "genesis" || f.part === 1) this.cleanGenesisParts();
 				if (f.t === "genesis") return this.genesis(ws, session.table, f.base, f.rows);
 				if (this.migrated) return ws.send(encodeServer({ t: "format", table: true }));
 				try {
 					this.write("INSERT INTO genesis_parts(session, part, data) VALUES (?, ?, ?)", session.table, f.part, f.data);
-				} catch { return this.migrationWriteFailed(ws); }
+				} catch (e) { return this.migrationFailed(ws, e); }
 				return ws.send(encodeServer({ t: "stagedPart", seq: f.part }));
 			}
 			if (f.t === "forget" || f.t === "since" || f.t === "set" || f.t === "del" || f.t === "restore") {
@@ -561,9 +567,33 @@ export class Vault extends DurableObject<Env> {
 		return { ok: true };
 	}
 
-	private migrationWriteFailed(ws: WebSocket) {
-		this.migrationFailureDay = today();
-		ws.send(encodeServer({ t: "migrationWriteFailed" }));
+	private migrationFailed(ws: WebSocket, error: unknown) {
+		// Abandon only this attempt. The next attempt can start at part 1 even if
+		// there is no write budget left to delete its predecessor today.
+		ws.serializeAttachment({ ...ws.deserializeAttachment(), table: crypto.randomUUID() });
+		this.cleanGenesisParts();
+		if (dailyWriteLimit(error)) {
+			this.migrationFailureDay = today();
+			return ws.send(encodeServer({ t: "migrationWriteFailed" }));
+		}
+		const reason = error instanceof IncompleteGenesis ? error.message :
+			error instanceof RangeError ? "invalid staged migration data" :
+			/constraint/i.test(String(error)) ? "conflicting staged rows or parts" : "Worker storage error";
+		ws.send(encodeServer({ t: "migrationFailed", reason }));
+	}
+
+	private cleanGenesisParts() {
+		if (this.migrated) return;
+		const active = new Set(this.ctx.getWebSockets().filter(ws => ws.readyState === WebSocket.OPEN)
+			.map(ws => (ws.deserializeAttachment() as Session).table));
+		for (const { session } of this.sql.exec<{ session: string }>("SELECT DISTINCT session FROM genesis_parts").toArray()) {
+			if (!active.has(session)) this.discardGenesisParts(session);
+		}
+	}
+
+	private discardGenesisParts(session: string) {
+		try { this.write("DELETE FROM genesis_parts WHERE session = ?", session); }
+		catch (e) { if (!dailyWriteLimit(e)) throw e; } // retry orphan cleanup on the next connection or attempt
 	}
 
 	private *genesisParts(session: string) {
@@ -582,7 +612,7 @@ export class Vault extends DurableObject<Env> {
 				this.ctx.storage.transactionSync(() => this.installGenesis(session, rows));
 				this.migrated = true;
 			} catch (e) {
-				if (!(e instanceof IncompleteGenesis)) return this.migrationWriteFailed(ws);
+				return this.migrationFailed(ws, e);
 			}
 			if (this.migrated) {
 				for (const peer of this.ctx.getWebSockets()) {
@@ -596,7 +626,7 @@ export class Vault extends DurableObject<Env> {
 		}
 		if (!this.migrated) {
 			try { this.write("DELETE FROM genesis_parts WHERE session = ?", session); }
-			catch { return this.migrationWriteFailed(ws); }
+			catch (e) { return this.migrationFailed(ws, e); }
 		}
 		ws.send(encodeServer({ t: "format", table: this.migrated }));
 	}
@@ -725,7 +755,7 @@ export class Vault extends DurableObject<Env> {
 		// Last online is the Worker's own record of the connection, never the device's word.
 		const { device, table, token } = ws.deserializeAttachment() as Session;
 		if (!this.deleted && !this.migrated && token && !device && !table) this.write("INSERT OR REPLACE INTO settings(key,value) VALUES ('unidentifiedLegacy',?)", Date.now());
-		if (table && !this.deleted && !this.migrated) this.write("DELETE FROM genesis_parts WHERE session = ?", table);
+		if (table && !this.deleted && !this.migrated) this.discardGenesisParts(table);
 		if (device && !this.deleted) this.write("UPDATE devices SET last_online = ? WHERE id = ?", Date.now(), device);
 		// The last device going: write the counts now, as the object may sleep before the next minute is up.
 		if (!this.deleted && this.ctx.getWebSockets().length <= 1) this.flush();

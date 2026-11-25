@@ -376,7 +376,7 @@ test("the device reports a failed migration and its legacy connection keeps sync
 	assert.ok(file);
 	const db = new DatabaseSync(join(dir, file));
 	try {
-		db.exec("CREATE TRIGGER refuse_format BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'write quota'); END");
+		db.exec("CREATE TRIGGER refuse_format BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
 		const a = await device("capable","write-limit",key,{},undefined,undefined,true);
 		await a.link.connect(); await until([a.d], () => a.link.status === "synced");
 		await migrateNow(host, hex(a.keys.vaultId));

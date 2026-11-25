@@ -135,6 +135,10 @@ export interface Upload {
 export interface NoteMeta {
 	/** A table note created on this device can precede its confirmed row. */
 	tableNote?: boolean;
+	/** Outbox ID of the first text publish, until its durable ack permits row creation. */
+	firstText?: number;
+	/** A missing file observed by a disk event. Open editors remember what they saw. */
+	missing?: { path: string; snapshot?: string };
 	/** Last agreed row path, independent of the text agreement. */
 	basePath?: string;
 	/** Where the note is on this device's disk, if it is. */

@@ -1005,11 +1005,11 @@ test("a failed genesis write leaves legacy sync active and exposes no partial ta
 		} }));
 		const [data] = await Array.fromAsync(packGenesis(frames));
 		const part = { t: "stagePart" as const, part: 1, data: data! };
-		db.exec("CREATE TRIGGER no_stage BEFORE INSERT ON genesis_parts BEGIN SELECT RAISE(ABORT,'write limit'); END");
+		db.exec("CREATE TRIGGER no_stage BEFORE INSERT ON genesis_parts BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
 		a.send(part); assert.deepEqual(await a.next(), { t: "migrationWriteFailed" });
 		db.exec("DROP TRIGGER no_stage");
 		a.send(part); assert.deepEqual(await a.next(), { t: "stagedPart", seq: 1 });
-		db.exec("CREATE TRIGGER no_commit BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'write limit'); END");
+		db.exec("CREATE TRIGGER no_commit BEFORE INSERT ON settings WHEN NEW.key='attachmentTable' BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
 		a.send({ t: "genesis", base: 0, rows: 2 });
 		assert.deepEqual(await a.next(), { t: "migrationWriteFailed" });
 		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attachments").get()!.n, 0);
@@ -1024,6 +1024,30 @@ test("a failed genesis write leaves legacy sync active and exposes no partial ta
 		assert.deepEqual(await a.next(), { t: "format", table: true });
 		assert.equal(await legacy.closed, CLOSE.updateNeeded);
 	} finally { db.close(); a.ws.close(); legacy.ws.close(); }
+});
+
+test("a returning connection reclaims abandoned genesis parts and preserves a live contender", async () => {
+	const { v, tok, a: legacy, db } = await snapshotVaultWithDb();
+	const a = await tablePeer(v,tok,false), b = await tablePeer(v,tok,false);
+	try {
+		await migrateNow(`http://localhost:${PORT}`,v);
+		const frame = { t: "stagePart" as const, part: 1, data: Uint8Array.of(0) };
+		for (const peer of [a,b]) { peer.send(frame); assert.equal((await peer.next()).t,"stagedPart"); }
+		db.exec("CREATE TRIGGER no_delete BEFORE DELETE ON genesis_parts BEGIN SELECT RAISE(ABORT,'daily row write limit exceeded'); END");
+		a.send({ t: "genesis", base: 0, rows: 1 });
+		assert.deepEqual(await a.next(),{ t: "migrationFailed", reason: "invalid staged migration data" });
+		a.ws.close(); await a.closed;
+		const count = () => db.prepare("SELECT COUNT(*) AS n FROM genesis_parts").get()!.n;
+		assert.equal(count(),2);
+		db.exec("DROP TRIGGER no_delete");
+		const c = await tablePeer(v,tok,false);
+		try {
+			assert.equal(count(),1);
+			assert.notEqual((await (await fetch(`http://localhost:${PORT}/test-stats/${v}`)).json()).migration,"failedToday");
+			b.send(frame);
+			assert.deepEqual(await b.next(),{ t: "migrationFailed", reason: "conflicting staged rows or parts" });
+		} finally { c.ws.close(); }
+	} finally { db.close(); a.ws.close(); b.ws.close(); legacy.ws.close(); }
 });
 
 test("genesis checks the legacy head and complete row count, switches once and closes old devices", async () => {
@@ -1047,7 +1071,7 @@ test("genesis checks the legacy head and complete row count, switches once and c
 		a.send({ t: "genesis", base: 0, rows: 1 });
 		assert.deepEqual(await a.next(), { t: "format", table: false });
 		a.send({ t: "genesis", base, rows: 1 });
-		assert.deepEqual(await a.next(), { t: "format", table: false });
+		assert.deepEqual(await a.next(), { t: "migrationFailed", reason: "incomplete genesis" });
 		await stage();
 		a.send({ t: "genesis", base, rows: 1 });
 		assert.deepEqual(await a.next(), { t: "format", table: true });
@@ -1253,7 +1277,7 @@ test("genesis checks scoped live versions, preserves cleaned tombstones, and gra
 		old.send({ t: "vput", tag: scoped.version, name: name(11), envelope: bytes("a") });
 		assert.equal((await old.next()).t, "stored");
 		await stage();
-		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 4 }), { t: "format", table: false });
+		assert.deepEqual(await send({ t: "genesis", base: 0, rows: 4 }), { t: "migrationFailed", reason: "incomplete genesis version" });
 		old.send({ t: "vput", tag: scoped.version, name: name(12), envelope: bytes("b") });
 		assert.equal((await old.next()).t, "stored");
 		await stage();

@@ -212,3 +212,13 @@ test("a failed download retries with unchanged disk and row, including after res
 		assert.equal(attempts, 3);
 	}
 });
+
+test("genesis waits for a stored text entry even when the legacy index already contains the note", () => {
+	const projection = new LegacyProjection();
+	try {
+		projection.notes.set(id(1), { p: "empty.md" });
+		projection.notes.set(id(2), { p: "photo.png" });
+		assert.throws(() => projection.requireStoredNotes(new Set([id(2)])), /first stored text/);
+		projection.requireStoredNotes(new Set([id(1)]));
+	} finally { projection.close(); }
+});

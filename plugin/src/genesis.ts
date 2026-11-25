@@ -51,6 +51,7 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 		queue = queue.then(async () => {
 			if (ended) return;
 			const f = decodeServer(new Uint8Array(e.data as ArrayBuffer));
+			if (f.t === "migrationFailed") throw new Error("Migration failed: " + f.reason + ". This vault still uses legacy sync.");
 			if (f.t === "migrationWriteFailed") throw new Error("Migration could not complete today. The Worker could not store the migration. This vault still uses legacy sync.");
 			if (f.t === "format") {
 				if (f.table) return finish();
@@ -93,14 +94,15 @@ export function importGenesis(url: string, keys: VaultKeys, sync: TableSync, fin
 			for (const id of oldOnly) if (!seen.has(id)) throw new Error("Waiting for legacy snapshots after key rotation");
 			if (pass === "index") {
 				base = f.seq; tags.clear(); older.clear(); seen.clear(); oldOnly.clear();
-				for (const [id, v] of projection.notes) if (!v.p.endsWith(".md")) await watch(id);
+				for (const id of projection.notes.keys()) await watch(id);
 				pass = "docs"; send({ t: "subscribe", after: 0 });
 			} else if (pass === "docs") {
 				if (base !== f.seq) return finish(true);
+				projection.requireStoredNotes(seen);
 				pass = "stage"; parts = packGenesis(stagedRows()); await next();
 			}
 		}).catch(err => finish(false, err));
 	};
-	ws.onclose = () => finish(false, new Error("Migration could not complete today. The migration connection closed before the Worker confirmed the result."));
+	ws.onclose = () => finish(false, new Error("The migration connection closed before the Worker confirmed the result."));
 	return () => finish();
 }
