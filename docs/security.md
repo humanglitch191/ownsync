@@ -17,7 +17,11 @@ Note text, attachment content, file names, folders, or the vault key. Your vault
 
 Names are stored on your Worker as they are: the vault's name and your device names as Obsidian has them (so the dashboard can show them), and any names you type on the dashboard. The dashboard has no key to encrypt them with. Everything else about your notes stays encrypted.
 
+- Since 0.2.6, each file keeps a permanent ID on your Worker, so it can tell one file's changes, renames and deletion apart from another's, and when a name is reused. Names themselves are keyed hashes, never readable.
+
 It can hold back or replay old edits, but it can't forge or change one: every edit is authenticated with the vault key.
+
+**One known limit.** After you remove a device, note edits sealed with the old key are refused, but file entries (a file's name, whether it's deleted, which version is current) still accept the old key. So the removed device, working together with someone who controls your Worker, could rename, delete or revive files, or add an attachment. It still can't read anything, and a deleted file stays in Recently deleted. A fix needs a signed snapshot of all files at every device removal, which is planned.
 
 ## The setup key and the dashboard
 

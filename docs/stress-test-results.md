@@ -1,5 +1,9 @@
 # Stress test results
 
+**Correctness, 0.2.6.** Before a release, the nightly fuzz runs 160,000 random histories on GitHub (128 jobs): three devices creating, editing, renaming, deleting and restoring notes and files through dropped messages, crashes in the middle of every disk step, Clean up, and migration from 0.2.x. It checks that no text or file content is lost, nothing is duplicated without reason, and every device ends up the same. 0.2.6 passed two full runs on its release commit, 320,000 histories in all. An exhaustive checker also tries every ordering of short two-device histories, with a crash at every step. How it works: [design, section 4](https://github.com/humanglitch191/ownsync/blob/main/docs/DESIGN.md#4-sync-engine).
+
+**Speed.** The numbers below were measured with the 0.2.x sync engine; 0.2.6 hasn't been re-measured yet.
+
 Measured on 14 November 2026, on a Linux laptop (14 cores, 16 GB), against the Worker running locally under `wrangler dev`, the same runtime Cloudflare uses.
 
 ## A real vault in real Obsidian

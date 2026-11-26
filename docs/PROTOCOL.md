@@ -1,13 +1,13 @@
 # Ownsync protocol v1
 
-Status: draft, 2026-11-14. Covers keys, envelopes, rotation, recovery, the membership log, pairing, history backup and whole-vault snapshots. WebSocket frames are specified in `server/src/wire.ts`.
+Status: draft, 2026-11-14; file table added 2026-11-26 (0.2.6). Covers keys, envelopes, the file table, rotation, recovery, the membership log, pairing, history backup and whole-vault snapshots. WebSocket frames are implemented in `server/src/wire.ts`, which is the source of truth for their layouts.
 
 The reference implementation is `protocol/ownsync.ts`, and `protocol/vectors.json` holds fixed test vectors. `cd protocol && npm test` checks the code against them; `npm run vectors` rewrites the outputs after a deliberate format change. Any other implementation (plugin, headless client) must reproduce every output in `vectors.json`. Design reasoning is in `DESIGN.md` section 1; this file states only the rules.
 
 ## Conventions
 
 - All integers are unsigned big-endian: `u8`, `u16`, `u32`, `u64`. `|` is byte concatenation.
-- `vaultId` and `deviceId` are 16 random bytes. `docId` is 16 random bytes, chosen once per document and stored inside the encrypted vault, so it stays the same across epochs.
+- `vaultId` and `deviceId` are 16 random bytes. `docId` is 16 random bytes, chosen once per document and stored inside the encrypted vault, so it stays the same across epochs. A table row's `file` ID and a request's `req` ID are 16 random bytes each.
 - P-256 public keys are 65-byte uncompressed points (WebCrypto `raw`). Private keys travel only as the 32-byte scalar `d` and are imported as JWK.
 - `HKDF(ikm, salt, info)` is HKDF-SHA256 with 32 bytes of output. `HMAC` is HMAC-SHA256. `SEAL(key, nonce, plaintext, ad)` is AES-256-GCM with a 16-byte tag appended.
 - `L(name)` is the ASCII string `ownsync/v1/<name>`.
@@ -21,8 +21,8 @@ Every key below comes from the VMK of one epoch, with `salt = vaultId`.
 
 | Key | Derivation | Use |
 |---|---|---|
-| seal key | `HKDF(VMK, vaultId, L("seal") \| deviceId)` | seals that device's updates, snapshots, presence, attachment chunks, history copies and whole-vault snapshot parts |
-| name key | `HKDF(VMK, vaultId, L("name"))` | with epoch 0's VMK: names attachment chunks; with the current one: document tags |
+| seal key | `HKDF(VMK, vaultId, L("seal") \| deviceId)` | seals that device's updates, snapshots, presence, attachment chunks, table records, history copies and whole-vault snapshot parts |
+| name key | `HKDF(VMK, vaultId, L("name"))` | with epoch 0's VMK: chunk names, version tags, path keys, migrated file IDs and conflict suffixes; with the current one: document tags |
 | auth token | `HKDF(VMK, vaultId, L("auth"))` | sent in `hello`; the server stores only `SHA-256(auth token)` |
 | member key | `HKDF(VMK, vaultId, L("member"))` | encrypts membership records |
 | keyring key | `HKDF(VMK, vaultId, L("keyring"))` | one-shot: seals the previous epoch's VMK |
@@ -38,20 +38,20 @@ AD       = header | vaultId | docId
 key      = seal key of (VMK of epoch, deviceId)
 ```
 
-- `kind`: 1 update, 2 snapshot, 3 presence, 4 attachment chunk, 5 update part, 6 history copy, 7 whole-vault snapshot part.
+- `kind`: 1 update, 2 snapshot, 3 presence, 4 attachment chunk, 5 update part, 6 history copy, 7 whole-vault snapshot part, 8 attachment record, 9 note record.
 - **Update parts.** A Worker WebSocket frame holds at most 1 MiB, so an update larger than `PART_SIZE` (512 KiB) is split. Each part is its own kind-5 envelope with plaintext `groupId(16) | u16 index | u16 count | bytes`. The server stores parts as ordinary log entries. A receiver applies the update only when every part of the group has arrived. A group that never completes is resent whole by its sender's next catch-up. A snapshot can't be split yet, so a device sends no snapshot larger than `PART_SIZE`.
-- For chunks, `docId` in the AD is the chunk name.
+- For chunks, `docId` in the AD is the chunk name. For table records (kinds 8 and 9), it is the row's `file` ID.
 - `nonce` is 12 random bytes.
 - The header is in clear so a receiver can pick the key. The Worker can read it without opening the envelope.
 - `deviceId` is self-asserted. It picks the key and identifies the sender; it doesn't authenticate anyone, since every member holds every seal key.
 - Rules for receivers:
   - Reject an unknown version or suite.
-  - Apply the epoch rules for the envelope kind (see "After a rotation", "History backup" and "Whole-vault snapshots").
+  - Apply the epoch rules for the envelope kind (see "After a rotation", "File table", "History backup" and "Whole-vault snapshots").
   - Find the VMK for the epoch in the key ring.
 
-Plaintexts: an update is a Yjs update (`Y.mergeUpdates` of about 250 ms of edits). A snapshot is `Y.encodeStateAsUpdate`. Presence is a y-protocols awareness update. A chunk (kind 4) is up to 1 MiB (`MAX_CHUNK`) of an attachment's content, with no framing.
+Plaintexts: an update is a Yjs update (`Y.mergeUpdates` of about 250 ms of edits). A snapshot is `Y.encodeStateAsUpdate`. Presence is a y-protocols awareness update. A chunk (kind 4) is up to 1 MiB (`MAX_CHUNK`) of an attachment's content, with no framing. A table record (kinds 8 and 9) is UTF-8 JSON (see "File table").
 
-**Documents.** The vault syncs as separate documents: one index (the map from note or attachment ID to path) and one per note or attachment. An update or snapshot envelope's plaintext is `u8 length | document ID | Yjs update`, where the ID is `index` or a note's or attachment's ID. Its AD uses the document's tag in place of `docId`:
+**Documents.** Text syncs as separate Yjs documents: one per note, holding its text in the Yjs text `t`, and one named `index`. Paths, deletions and attachments are not in any document; they are rows of the file table. The `index` document now holds only the whole-vault snapshot ledger, in its map `snapshots` (see "Whole-vault snapshots"). An update or snapshot envelope's plaintext is `u8 length | document ID | Yjs update`, where the ID is the ASCII string `index` or a note's ID in lowercase hex. Its AD uses the document's tag in place of `docId`:
 
 `tag = HMAC(name key, "doc:" | document ID)[0..16]`
 
@@ -59,20 +59,85 @@ The Worker files entries under the tag. That lets it drop the entries a snapshot
 
 **Chunk name** = `HMAC(name key of epoch 0, SHA-256(chunk plaintext))`, all 32 bytes, hex. The name key is always the first epoch's, for the vault's whole life: names are how devices recognise content (an attachment's version is named the same way over the whole file), so they mustn't change when the key rotates. Duplicate chunks are stored once. A chunk envelope is sealed under the epoch current when it was uploaded and keeps it; any device opens it with that epoch's key from its key ring. A device that joined after a rotation fills in the older keys from the rotation records' `prevVmkSealed` before it starts syncing.
 
-**Index values.** `{ p: path }` for a live note or attachment, `{ p, d: base64 state vector }` for a deleted one. A path ending in `.md` is a note (text `t` in its document); any other path is an attachment. A device never moves an ID from one kind to the other.
+**Version tags and scoped chunks.** Every attachment version has an ID `u`, a string of at most 64 bytes, unique to that version. Since 0.2.0 a version's chunks are its own. Both formulas use epoch 0's name key, as the chunk name does:
 
-**Attachments.** An attachment's document holds a Yjs array `v` of versions, each `{ h, n, c, u }`:
+```
+version tag       = HMAC(name key, "version" | u)                                              32 bytes
+scoped chunk name = HMAC(name key, u8 len(u) | u | u32 index | SHA-256(chunk plaintext))       32 bytes
+```
 
-- `h`: the chunk name formula applied to the whole content (`hex`), which identifies the version;
+`index` counts the version's chunks from 0. The tag is what the Worker files a version's chunks under (`vput`) and what a table row carries as `version`. In `vectors.json`, `versionTag` and `scopedChunkName` use `u = "3f9a1c0e5b7d2a46"`, index 2 and the vector plaintext.
+
+## File table
+
+Every file, note or attachment, is one row at the Worker. The Worker compares the fields in clear; only a device can open `record`.
+
+```
+row = file(16) | u8 hasVersion | version(32, only if hasVersion = 1) | pathkey(32) | u64 seq
+    | u8 isDeleted | u64 deleted (only if isDeleted = 1) | record
+```
+
+- `file`: the file's ID, chosen by the device that creates it and fixed from then on, across renames, edits, deletion and restore.
+- `version`: an attachment's version tag. A note has none: `hasVersion = 0` is what makes a row a note.
+- `pathkey`: the path key below. No two rows that aren't deleted may share one.
+- `seq`: the table's own counter, separate from the log's. The Worker sets it to a new highest value each time the row changes. It is the `base` the next change must name.
+- `deleted`: the Worker's clock at deletion, in Unix milliseconds.
+- `record`: the rest of the frame, 1 byte to 4 MiB: an envelope of kind 8 (attachment) or 9 (note), with `file` as `docId` in the AD.
+
+**Derived values.** All three use epoch 0's name key for the vault's whole life. `\0` is one zero byte.
+
+```
+path key         = HMAC(name key, "ownsync/table-path\0" | path as UTF-8)                      32 bytes
+migrated file ID = HMAC(name key, "ownsync/table-file\0" | 0.2.x ID)[0..16]                    16 bytes
+conflict suffix  = hex(HMAC(name key, "ownsync/conflict-suffix\0" | h(32) | u32 counter))[0..6]
+```
+
+- The path key takes the exact path, with no normalisation. `vectors.json` `tablePathKey` is the key of `Images/Café.png`.
+- The migrated file ID is used only at migration, so every device derives the same `file` for a 0.2.x note or attachment. The input is that ID's bytes (its hex decoded). `vectors.json` `tableFileId` uses `3f9a1c0e5b7d2a46`. A file created later has a random `file`.
+- The conflict suffix names an attachment's conflict copy: `<name> (conflict <suffix>)<.ext>`, where `h` is the copy's content hash (below) as 32 bytes. `counter` is left out entirely when it is 0. A device tries 0, then 1, 2 … while the name is taken, so two devices holding the same bytes pick the same name. There is no test vector for it yet.
+- A note's conflict copy is named from the note it was copied from: `<name> (conflict <first 6 hex of that note's ID>).md`, applied again while the name is taken. A copy made after a crash with an open editor is `<name> (recovered <first 6 hex>).md`, then `(recovered <first 6 hex> 2)` and so on.
+
+**Attachment record (kind 8).** JSON `{ path, bytes, mtime }`. `mtime` is the file's modification time in milliseconds, or `null`. `bytes` is the version, `{ h, n, c, u, s }`:
+
+- `h`: the chunk name formula applied to the whole content (`hex`), which identifies the content;
 - `n`: the size in bytes;
 - `c`: the names (`hex`) of its chunks in order: the content split every 1 MiB, the last one shorter (none for an empty file);
-- `u`: a random ID unique to this version.
+- `u`: the version's ID;
+- `s`: `1` when the chunks are named as scoped chunks of `u`. Absent on a version carried over from before 0.2.0, whose chunks use the plain chunk name.
 
-Rules:
+**Note record (kind 9).** JSON `{ kind: "note", path, id }`. `id` is the note's document ID in hex: the document tag derives from it, so the text is found whatever the path. The note's text is never in the row, and editing text doesn't change the row.
 
-- A device publishes a version only after the server has acknowledged (`stored`) every chunk in `c`.
-- Publishing deletes every element whose `h` is the version the new one was made from, then appends the new one. More than one distinct `h` left means concurrent versions: any device that sees this keeps the first element and turns each other distinct `h` into an attachment of its own, with ID `u` and path `<name> (conflict <first 6 of u>).<ext>`, unless an index entry `u` exists already; then deletes those elements. An attachment left with no element (two devices split at once) is deleted; the copies hold every version.
+**Note tombstones.** The record of a deleted note also carries what its deleter had seen, as exactly one of:
+
+- `snapshot`: base64 of `Y.encodeSnapshot(Y.snapshot(doc))`, the state vector and delete set of the note's document as the deleting device knew it;
+- `vector`: base64 of a Yjs state vector. Only on tombstones migrated from 0.2.x, which recorded no delete set.
+
+A device whose copy of the document holds anything outside that (an update `Y.snapshotContainsUpdate` rejects; for `vector`, any client clock beyond it) sends `restore` naming the deleted row's `seq`. A note comes back only through `restore`.
+
+**What a record is bound to.** The seal binds the vault, the kind, the epoch, the sealing device and the `file` ID. The rest a receiver checks itself, and rejects the row if any check fails:
+
+- the kind matches the row: 8 with a `version`, 9 without;
+- the path key of the record's `path` equals the row's `pathkey`;
+- for an attachment, the version tag of `bytes.u` equals the row's `version`; `h` and every name in `c` are 64 hex characters, `n` is a non-negative integer, `u` is a non-empty string, `s` is absent or `1`, and the path doesn't end in `.md`;
+- for a note, the path ends in `.md` and has no `\` and no empty, `.` or `..` segment; `id` is hex; a live row carries neither `snapshot` nor `vector`, a deleted one exactly one, which must decode.
+
+`seq` and `deleted` are the Worker's and are not sealed. Nothing in a record names its `seq`, so a Worker could serve an earlier record of the same file with the path key and version it had then; it can't alter one or move it to another file. A record is sealed under the epoch current when it was made, and one not yet accepted is sealed again after a rotation. Records already stored are not re-sealed: a device opens them with that epoch's key from its key ring, as it does chunks. `vectors.json` `tableEnvelope` is a kind-8 envelope of the vector plaintext with the vector `docId` standing for `file`.
+
+**Attachment rules.**
+
+- A device proposes a version only after the Worker has acknowledged (`stored`) every chunk in `c`.
 - A device writes the file only when it holds every chunk, each matching its name, and the whole is `n` bytes and matches `h`. Otherwise it writes nothing and tries again later.
+
+### The 0.2.x format, read once at migration
+
+Before 0.2.6 the `index` document's map `notes` held one value per note or attachment ID: `{ p: path }` if live, `{ p, d: base64 state vector, t: deletion time in ms (may be absent) }` if deleted. A path ending in `.md` was a note; any other was an attachment, whose own Yjs document held an array `v` of versions `{ h, n, c, u, s }`. The first element was the current version; any other distinct `h` was a concurrent version not yet split off.
+
+Nothing writes this format any more. The device that migrates a vault reads it from the Worker's log and turns it into rows:
+
+- each note becomes a note row with its `id` kept, and `d` becomes the tombstone's `vector`;
+- each attachment becomes a row for its first version; each other distinct `h` becomes a row of its own, at the conflict-copy name for that `h`;
+- `file` is the migrated file ID of the 0.2.x ID, or of the version's `u` for a split-off version. If an attachment with ID `u` already exists and has moved on to other content, the input is `u` twice and the row is installed as deleted;
+- a deletion with no `t` is dated by the Worker when migration commits.
 
 ## Membership log
 
@@ -168,15 +233,63 @@ wrap = ePub(65) | SEAL(key, 0, VMK_new, info)                      113 bytes
 - **Old epochs are rejected.** Once a device accepts epoch e+1, it rejects every update, snapshot and presence envelope with epoch ≤ e. That includes a device that was just paired or is catching up: it loads the e+1 snapshot, then the e+1 log.
 - **Why the snapshot, not the server's `seq`.** A cut-off based on the server's sequence number (accept old-epoch entries stored before the rotation) would rely on the server. A removed device still holds `VMK_e`, so with the server's help it could write an epoch-e update and have it stored under an old `seq`. The snapshot is sealed under the new key, so the server can't fake it.
 - **No edits lost.** Edits other devices made under epoch e that the rotating device hadn't seen are not in the snapshot. As built, each device, on accepting the new epoch and catching up, sends a snapshot of every document under e+1 (a superset of the difference), and seals any unacknowledged pending updates under e+1 when it resends them. Envelopes are always sealed under the epoch current at sealing time.
-- **Chunks are the exception.** Attachment chunks keep their epoch and stay readable through the key ring. That is safe because the vault document references each chunk by name and epoch, and a device checks that a downloaded chunk's plaintext hashes to its name.
+- **Chunks and table records are the exception.** Attachment chunks keep their epoch and stay readable through the key ring. That is safe because an attachment record names each chunk, and a device checks that a downloaded chunk's plaintext hashes to its name. Table records keep their epoch too (see "File table"): the Worker holds one record per file and nothing re-seals them, so a device accepts a record under any epoch in its key ring. Unlike updates, old-epoch records are therefore not rejected: a removed device working with the Worker could seal a new record under an epoch it still holds and have devices accept it. This is not defended against.
 - Compaction may delete epoch-e log entries and snapshots once the e+1 snapshot is stored.
 - A device that learns of a newer epoch than it can decrypt (a record exists, but no wrap for it arrives) stops publishing and alerts the user. This is a partial defence against a server holding back a rotation.
 
 ## Messages to the Worker
 
-Binary WebSocket frames, `u8 type | fields`, specified in the header of `server/src/wire.ts` and implemented there for both sides: `hello`, `subscribe`, `publish`, `snapshot`, `live`, `put` (9), `get` (10) from a device; `entry`, `more`, `synced`, `ack`, `live`, `stored` (24), `chunk` (25), `missing` (26) from the Worker. `put` carries a chunk name (32 bytes) and a kind-4 envelope of at most `MAX_CHUNK` + 64 bytes; the Worker keeps the first envelope stored under a name and answers `stored`, or `missing` if it couldn't store it. `get` is answered with `chunk` or `missing`. Chunks are not log entries: catch-up never carries them. The Worker's rules are in `DESIGN.md` section 3.
+Binary WebSocket frames, `u8 type | fields`, implemented for both sides in `server/src/wire.ts`. The log frames are listed in that file's header: `hello`, `subscribe`, `publish`, `snapshot`, `live`, `fetch`, `append`, `rotate`, `status` from a device; `entry`, `more`, `synced`, `ack`, `live`, `record`, `records` from the Worker. The Worker's rules are in `DESIGN.md` section 3.
 
-A connection starts with `fetch` (from the head's number, so the device sees whether the server still holds its head), takes in the records, then sends `hello` with the token of the epoch it is now in, and `append` or `rotate` if it has a record to add. A rotation is sent only once the device is caught up.
+A connection starts with `fetch` (from the head's number, so the device sees whether the server still holds its head), takes in the records, then sends `hello` with the token of the epoch it is now in, and `append` or `rotate` if it has a record to add. A rotation is sent only once the device is caught up. `table` follows `hello` (below).
+
+**Chunks.** `vput` (12) is `tag(32) | name(32) | envelope`: a version tag, a scoped chunk name and a kind-4 envelope of at most `MAX_CHUNK` + 64 bytes. The Worker records the name under the tag only if this `vput` stored the chunk or the name is already under that tag, and answers `stored` (24) `name(32)`; otherwise `missing` (26) `name(32)`. A version has at most 1,024 chunks. `get` (10) `name(32)` is answered with `chunk` (25) `name(32) | envelope` or `missing`. Chunks are not log entries: catch-up never carries them. `put` (9) and `mark` (13) belong to 0.2.x devices; a migrated vault refuses `mark`.
+
+**Table handshake.** Right after `hello`, and before any `subscribe`, a device sends `table` (14, no fields). The Worker answers `format` (28) `u8 table`: 1 if the vault has its file table, 0 if it still holds only 0.2.x state and must be migrated first. Once a vault has its table, a connection that never sent `table` is closed with code 4005 ("update needed") on the next frame it sends after `hello`, and those open when migration commits are closed the same way. `since`, `set`, `del`, `restore` and `forget` are refused (close 4000) until the vault is migrated.
+
+**Catch-up.** `since` (15) `u64 after` asks for every row whose `seq` is above `after`. The Worker sends `row` (29) frames, each one `row` as laid out in "File table", in `seq` order, at most 400 rows or 4 MiB a page. A page ends with `tableMore` (30) `u64 seq` (ask again from there) or `tableSynced` (31) `u64 seq` (the table's head; rows that change from now on arrive as `row` frames, the device's own included). This cursor is separate from the log's `subscribe` cursor. A row frame is a file's current state, not a history: a device that was away sees only the latest row of each file.
+
+**Changes.** One frame per request, each with a fresh `req`. `chunks` is `u8 0`, or `u8 1 | u16 n` with n at most 1,024.
+
+```
+set      (16)  chunks | req(16) | file(16) | u64 base | u8 hasVersion | version(32, if 1) | pathkey(32) | record
+del      (17)  req(16) | file(16) | u64 base | record (notes only)
+restore  (18)  chunks | req(16) | file(16) | u64 base | pathkey(32) | record
+ok       (32)  req(16) | u64 seq
+refused  (33)  req(16) | u8 missing | row (may be absent)
+forget   (21)  req(16)
+forgotten(35)  req(16)
+```
+
+- `set` creates a file (`base` 0), or changes a live row's path, version or both. `del` deletes a live row. `restore` makes a deleted row live again at `pathkey`, with the version it had.
+- `base` must equal the row's current `seq` (0: no such row yet). Otherwise the answer is `refused` with the row as it now is.
+- `set` and `restore` are refused with the other row if another live row holds `pathkey`.
+- A row never changes between note and attachment. A note's `set` and `restore` carry no `version` and `chunks = 0`; its `del` carries the tombstone record, which replaces the row's record. An attachment's `del` carries no record and the row keeps the one it had.
+- For an attachment, `chunks` declares how many chunks `version` has, and every one must be stored under its tag, or the answer is `refused` with `missing = 1`: after a `set` the device uploads them again, after a `restore` it reports that the file is no longer stored. A change the Worker couldn't store is answered the same way. `chunks = 0` on an attachment means a version from before 0.2.0 that the row already holds, as in a rename.
+- A `set` on a deleted row is accepted only for an attachment with a new version, which brings it back with that content. A deleted note is refused: it returns only by `restore`.
+- `ok` carries the row's new `seq`. The Worker keeps each `ok` and sends it again if the same `req` arrives again, so a lost answer is never taken for a refusal. A refusal is not kept: the request is judged again on a retry. Once a device has recorded an `ok`, it sends `forget`, and the Worker drops the answer and replies `forgotten`.
+- A `refused` whose row is another file's means the path is taken; one with no row means the file doesn't exist.
+
+These frames may be as large as 4 MiB plus 117 bytes; every other frame at most 4 MiB plus 64.
+
+**Migration.** A vault whose `format` says 0 is migrated by the first device that connects with this release. All of it happens on one connection that has sent `table`:
+
+```
+migrationEstimate   (24)  u64 writes
+migrationBudget     (39)  u8 allowed
+stagePart           (23)  u64 part | data (1 byte to 1 MiB)
+stagedPart          (34)  u64 part
+genesis             (20)  u64 base | u64 rows
+migrationFailed     (38)  reason as UTF-8
+migrationWriteFailed(37)  no fields
+```
+
+1. The device builds the rows from the 0.2.x state at log head `base`, numbering their `seq` from 1. Each becomes a `stageRow` frame: `u8 19 | u8 dateAtCommit | chunks | row`. `dateAtCommit = 1` makes the row a deletion dated by the Worker at commit.
+2. The stream is every `stageRow` frame prefixed by its `u32` length, one after another, cut into parts of 1 MiB (the last one shorter). A frame may cross a part boundary. `stageRow` is never sent as a frame of its own.
+3. `writes = 3 × live rows + 2 × deleted rows + 2 × parts + 2`. The device sends `migrationEstimate`; the Worker answers `migrationBudget` with 1 if that fits what is left of the day's write allowance, shared by all its vaults (or `format` 1 if the vault has been migrated meanwhile). With 0 nothing is staged and the device tries again later.
+4. The device sends each part as `stagePart`, numbered from 1, and waits for its `stagedPart`. Parts are refused without a granted estimate. A failed attempt is discarded whole: the next needs a new estimate and starts again at part 1.
+5. `genesis` commits. The Worker installs the rows only if the log head still equals `base`, there are exactly `rows` rows numbered 1 to `rows`, the writes equal the granted estimate, no version is declared with two chunk counts, and every live attachment's chunks are stored. All of it happens in one transaction, or none of it does.
+6. The answer is `format`: 1 means migrated, by this device or another; 0 means the head had moved, and the device starts again. A commit that fails answers `migrationFailed` with a reason, or `migrationWriteFailed` when the Worker's daily write allowance ran out part-way.
 
 ## History backup
 
@@ -198,7 +311,7 @@ A `404` leaves only local history available. A `401` or `410` disables backup re
 
 Kind 7 is used only by the snapshot HTTP endpoints. WebSocket entries, live frames and chunk downloads refuse it. The envelope's associated data uses the 16-byte snapshot ID as `docId`. New snapshots use the current epoch's VMK.
 
-The UTF-8 JSON body is `{ v: 1, id, day, takenAt, notesOnly, notes, attachments }`. `id` is a fresh random 16-byte ID encoded in lowercase hex. `day` is the number of UTC days since the Unix epoch and `takenAt` is the device's Unix timestamp in milliseconds. Notes are `{ id, path, text }`. Attachments are `{ id, path, ref }`, where `ref` holds `h`, `n`, `c` and optionally `u` as in the attachment document. A notes-only snapshot has an empty attachment list.
+The UTF-8 JSON body is `{ v: 1, id, day, takenAt, notesOnly, notes, attachments }`. `id` is a fresh random 16-byte ID encoded in lowercase hex. `day` is the number of UTC days since the Unix epoch and `takenAt` is the device's Unix timestamp in milliseconds. Notes are `{ id, path, text }`. Attachments are `{ id, path, ref }`, where `id` is the row's `file` ID in hex and `ref` holds `h`, `n`, `c`, `u` and `s` as `bytes` does in an attachment record (a snapshot taken by 0.2.x may lack `u`). A notes-only snapshot has an empty attachment list.
 
 Gzip the JSON and split the resulting stream into slices of up to 1 MiB. For a single slice, pad its payload with zeros to the smallest fitting power-of-two bucket from 64 KiB through 1 MiB. For multiple slices, every padded payload is 1 MiB. Seal each part independently with this plaintext, using big-endian integers and zero-based indices.
 
@@ -219,7 +332,7 @@ Every request is a binary `POST` under `/vault/{vaultId hex}` with the current 3
 
 The Worker reserves the day on the first upload. It returns `409` with `{ "error": "taken" }` when another snapshot holds that day and `413` when a size cap is exceeded. The sender seals using its local UTC day and accepts the first acknowledgement's day only if it agrees. A mismatch ends the attempt without resealing. A missing list endpoint (`404`) or rejected token (`401` or `410`) disables requests for the session. A `404` on a download can also mean the snapshot is absent.
 
-After the complete upload is acknowledged, the sender records `{ day, epoch, parts, notesOnly, takenAt }` under the ID in the synced vault index. `parts` holds the lowercase SHA-256 hex digests of the complete envelopes, in index order. To open a snapshot of any epoch, the receiver checks every envelope against its ledger digest and opens it with that epoch's key. It requires exactly one of each index, with the sealed ID, day, timestamp, index and part count matching the request and ledger. The decoded body must agree with the sealed metadata and ledger, and every note and attachment path must pass vault path validation. Worker list metadata alone cannot authorize opening any snapshot.
+After the complete upload is acknowledged, the sender records `{ day, epoch, parts, notesOnly, takenAt }` under the ID in the map `snapshots` of the `index` document. This ledger is all that document still holds. `parts` holds the lowercase SHA-256 hex digests of the complete envelopes, in index order. To open a snapshot of any epoch, the receiver checks every envelope against its ledger digest and opens it with that epoch's key. It requires exactly one of each index, with the sealed ID, day, timestamp, index and part count matching the request and ledger. The decoded body must agree with the sealed metadata and ledger, and every note and attachment path must pass vault path validation. Worker list metadata alone cannot authorize opening any snapshot.
 
 ## Key storage on the device
 
@@ -229,3 +342,5 @@ After the complete upload is acknowledged, the sender records `{ day, epoch, par
 ## Not yet specified
 
 - Fixed size padding for sync envelope kinds.
+- A test vector for the conflict suffix.
+- Rejecting table records sealed under an old epoch (see "After a rotation").

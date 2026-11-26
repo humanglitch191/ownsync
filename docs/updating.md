@@ -22,4 +22,6 @@ Then Cloudflare redeploys your Worker from it in a minute or two. Your vaults, d
 
 **Deployed before 0.2.0?** Your updater only runs when you press it, and doesn't check signatures. GitHub doesn't let a workflow change itself, so replace it once: in your repository, open `.github/workflows/update-ownsync.yml`, press the pencil, replace everything with [this file](https://raw.githubusercontent.com/humanglitch191/ownsync/main/server/.github/workflows/update-ownsync.yml), and commit. (No such file? Choose **Add file → Create new file**, with that name.) If GitHub asks you to enable workflows, do that.
 
-The plugin and your Worker don't have to be on the same version: each works with the other's earlier versions.
+**Updating to 0.2.6? Update your Worker first.** 0.2.6 replaces the sync engine, and the new plugin needs a 0.2.6 Worker: with an older one it shows "Update your Worker to start vault migration" and doesn't sync. So press **Run workflow** on your updater as soon as 0.2.6 is out, then update the plugin. A 0.2.6 Worker still works with 0.2.5 plugins, so the order is all that matters. The first 0.2.6 device to connect migrates the vault; after that, devices still on 0.2.x stop syncing until they update.
+
+Apart from that, the plugin and your Worker don't have to be on the same version: a Worker works with earlier plugins.

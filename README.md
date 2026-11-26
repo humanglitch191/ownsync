@@ -15,7 +15,7 @@ I wanted my notes on my laptop and my phone, in sync as I type, without handing 
 - **Yours.** Only your devices hold the key. No account with me, nothing collected.
 - **Offline first.** Edit anywhere. It merges when you're back.
 - **History.** Earlier versions of each note, Recently deleted notes, and if you turn them on, daily encrypted snapshots of the whole vault on your Worker.
-- **Tested hard.** 500,000 random crashes, renames and reconnects, and not one note lost. [Results](https://ownsync.dev/docs/stress-test-results/).
+- **Tested hard.** Every release runs 160,000 random histories of crashes, offline edits, renames, deletes and restores on notes and files, plus every ordering of two devices checked exhaustively. Nothing lost. [Results](https://ownsync.dev/docs/stress-test-results/).
 - **Free.** Runs on Cloudflare's free plan. Open source.
 
 <p align="center"><img src="https://raw.githubusercontent.com/humanglitch191/ownsync/main/docs/images/how-it-works.svg" width="720" alt="How Ownsync works: your devices encrypt and hold the key; your Cloudflare Worker only relays scrambled data"></p>
