@@ -1,4 +1,4 @@
-// The same disk and database can be driven by both generations of the engine.
+// The table adapters and simulated user share this vault and database.
 import type { Store } from "../src/core/ports";
 import type { TableDisk } from "../src/tableDisk";
 type Fs = ConstructorParameters<typeof TableDisk>[0];
@@ -14,7 +14,16 @@ export function attachmentFs(files = new Map<string, { content: string | Uint8Ar
 	const fs: Fs = {
 		async list(dir) {
 			const children = (paths: Iterable<string>) => [...paths].filter(p => p && p.split("/").slice(0, -1).join("/") === dir);
-			return { files: children(files.keys()), folders: children(folders) };
+			// User writes modify the shared file map directly, including paths in new folders.
+			const dirs = new Set(folders);
+			for (const path of files.keys()) {
+				const parts = path.split("/");
+				while (parts.length > 1) {
+					parts.pop();
+					dirs.add(parts.join("/"));
+				}
+			}
+			return { files: children(files.keys()), folders: children(dirs) };
 		},
 		async stat(p) {
 			const f = files.get(p);

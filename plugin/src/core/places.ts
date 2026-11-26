@@ -1,7 +1,7 @@
 export type IndexValue = { p: string; d?: string; t?: number };
 export const conflictName = (path: string, id: string) => path.replace(/(\.[^./]*)?$/, ` (conflict ${id.slice(0, 6)})$1`);
 
-// The legacy engine and genesis must assign exactly the same names to existing files.
+// Reconstruct the paths 0.2.x assigned so genesis and returning devices agree.
 export function places(notes: Iterable<[string, IndexValue]>) {
 	const groups = new Map<string, string[]>(); // index path → the notes claiming it
 	for (const [id, v] of notes) {
@@ -21,5 +21,5 @@ export function places(notes: Iterable<[string, IndexValue]>) {
 		}
 	}
 	for (const [path, id] of owners) paths.set(id, path);
-	return { paths, owners, groups };
+	return paths;
 }

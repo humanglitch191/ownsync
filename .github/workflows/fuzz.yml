@@ -1,6 +1,6 @@
 name: Fuzz
 
-# Engine and attachment-table fuzz tests, split by seed range. Every run covers new seeds.
+# All-files table fuzz tests, split by seed range. Every run covers new seeds.
 # A failure prints its seed; replay it locally with FUZZ_SEED=<seed> using the same test file.
 
 on:
@@ -32,27 +32,21 @@ jobs:
           import os
 
           # At 3.94 seconds per paired seed, a table shard takes about 82 of its 180 minutes.
-          suites = [("table", 128, 1250), ("engine", 8, 20000)]
-          total = sum(shards * width for _, shards, width in suites)
-          first = int(os.environ["GITHUB_RUN_NUMBER"]) * total + 1
-          limit = int(os.environ["RUN_LIMIT"]) if os.environ["RUN_LIMIT"] else None
-          if limit is not None and limit < 1:
+          shards, width = 128, 1250
+          # Preserve the historical run stride, including the retired engine suite's seed range.
+          first = int(os.environ["GITHUB_RUN_NUMBER"]) * 320000 + 1
+          limit = int(os.environ["RUN_LIMIT"]) if os.environ["RUN_LIMIT"] else width
+          if limit < 1:
               raise ValueError("runs must be positive")
-          jobs = []
-          for suite, shards, width in suites:
-              for shard in range(shards):
-                  jobs.append(dict(suite=suite, shard=shard, first=first, runs=min(limit or width, width)))
-                  first += width  # Reserve the full range even for a shortened manual run.
+          jobs = [dict(shard=i, first=first + i * width, runs=min(limit, width)) for i in range(shards)]
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               print("matrix=" + json.dumps({"include": jobs}), file=out)
 
   fuzz:
     needs: ranges
-    name: ${{ matrix.suite }} shard ${{ matrix.shard }}
+    name: table shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    # The legacy engine no longer ships as the sync path. Keep its fuzz results informational.
-    continue-on-error: ${{ matrix.suite == 'engine' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.ranges.outputs.matrix) }}
@@ -60,7 +54,6 @@ jobs:
       FUZZ_FIRST: ${{ matrix.first }}
       FUZZ_RUNS: ${{ matrix.runs }}
       FUZZ_STEPS: ${{ inputs.steps || '250' }}
-      SUITE: ${{ matrix.suite }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -75,4 +68,4 @@ jobs:
         working-directory: plugin
         run: |
           echo "seeds $FUZZ_FIRST to $(( FUZZ_FIRST + FUZZ_RUNS - 1 )), $FUZZ_STEPS steps each"
-          node --import jiti/register --test "test/${SUITE}.fuzz.test.ts"
+          node --import jiti/register --test test/table.fuzz.test.ts

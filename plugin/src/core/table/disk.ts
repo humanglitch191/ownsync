@@ -1,6 +1,6 @@
 // A plan is committed before executing any filesystem intent. The injected adapter owns the
 // private plugin-folder temp file and the conditional mutations at the visible endpoints.
-import type { Disk, DiskFile, Ref } from "../ports";
+import type { DiskFile, Ref } from "../ports";
 import { proposeLegacy, reconcile, reserved, type Blocked, type Inputs, type Observation, type State, type TableDevice } from "./device";
 
 export type Event = { kind: "startup" | "settle" } | { kind: "changed" | "deleted"; path: string }
@@ -14,7 +14,10 @@ export interface DiskInputs extends Inputs {
 	fetch(ref: Ref): Promise<Uint8Array>;
 	legacyVersion?(path: string, ref: Ref): Promise<Ref | undefined>;
 }
-export interface DiskPort extends Pick<Disk, "stat" | "list" | "readBinary"> {
+export interface DiskPort {
+	stat(path: string): Promise<DiskFile | undefined>;
+	list(): Promise<DiskFile[]>;
+	readBinary(path: string): Promise<Uint8Array>;
 	allowed?(path: string): boolean;
 	writeTemp(bytes: Uint8Array): Promise<void>;
 	discardTemp(): Promise<void>;

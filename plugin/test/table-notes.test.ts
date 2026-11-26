@@ -1,3 +1,4 @@
+import { legacyFixture } from "./legacy-fixture";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
@@ -27,7 +28,7 @@ test("table note editors use the placed ID and the durable Yjs stream regardless
 		d.data.set("table/note-state/" + note.id, {id:note.id, file:note.file, diskPath:note.path, editor:"closed"});
 		d.files.set(note.path, { content: "draft", mtime: 1 });
 		const disk = new Files(); disk.edit(note.path, "draft");
-		d.overrides = { tableNotes: t.notes, noteDisk: disk, hash: async text => hash(enc.encode(text)) };
+		d.overrides = { tableNotes: t.notes, noteDisk: disk };
 		d.boot(); await d.idle();
 		await t.connect(async () => assert.fail("typing sent a table request"));
 		d.connect(); await d.engine!.initializeNoteFiles(false);
@@ -98,11 +99,10 @@ function version(text: string, base?: Uint8Array) {
 
 async function planner(defer = (f: () => void) => f()) {
 	const d = new Device("planner", new Server(), rng(123)), disk = new Files();
-	const hashText = async (text: string) => hash(enc.encode(text));
 	d.data.set("table/migrated", true);
 	const boot = async () => {
 		const t = table(d);
-		d.overrides = { tableNotes: t.notes, noteDisk: disk, hash: hashText, defer, onNoteWork: () => t.noteWork() };
+		d.overrides = { tableNotes: t.notes, noteDisk: disk, defer, onNoteWork: () => t.noteWork() };
 		d.boot(); await d.idle();
 		return t;
 	};
@@ -537,11 +537,14 @@ test("closing an editor whose file still matches the agreement creates no recove
 
 test("an upgraded offline device leaves the legacy outbox, agreements and vault files untouched until adoption", async () => {
 	const d = new Device("upgrading", new Server(), rng(752));
-	d.boot(); d.connect(); await quiesce([d]);
-	d.write("local.md","original"); await quiesce([d]);
-	d.disconnect(); d.write("local.md","unsent"); d.drain(); await d.idle();
-	assert.ok([...d.data.keys()].some(k => k.startsWith("out:")));
-	d.crash(); d.rename("local.md","outside.md");
+	const fixture = legacyFixture([{id:note.id,path:"local.md",body:"original"}]);
+	d.data = fixture.data;
+	const base = d.data.get("state:"+note.id) as Uint8Array, edit = version(" unsent",base);
+	d.data.set("base:"+note.id,base);
+	d.data.set("state:"+note.id,edit);
+	d.data.set("out:1",{doc:note.id,kind:"update",data:edit});
+	d.data.set("meta",{synced:true,cursor:fixture.entries.length,nextOut:2});
+	d.write("outside.md","original unsent");
 	const files = structuredClone(d.files), data = structuredClone(d.data);
 	const t = table(d);
 	d.overrides = {tableNotes:t.notes, noteDisk:new Files()};

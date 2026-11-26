@@ -105,18 +105,10 @@ export class Editors {
 			}
 			// No awaits from here on: nothing can change between comparing the two texts and binding them.
 			const text = doc.getText("t"), shown = cm.state.doc.toString(), synced = text.toString();
-			if (shown !== synced && this.engine.isTableNote(id)) {
+			if (shown !== synced) {
 				// The disk planner must settle this save against its own base first.
 				await this.release(id);
 				return;
-			}
-			if (shown !== synced) {
-				// Typed since that save: go round again so it isn't thrown away. Otherwise the editor is just behind.
-				if (shown !== (view as unknown as { data: string }).data && attempt < 2) {
-					await this.release(id);
-					continue;
-				}
-				cm.dispatch({ changes: { from: 0, to: shown.length, insert: synced } });
 			}
 			const undo = localUndo(text), editor = view.editor;
 			cm.dispatch({ effects: editorBinding.reconfigure(collab(text, this.awareness(id, doc), undo)) });

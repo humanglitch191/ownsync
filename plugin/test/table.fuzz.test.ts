@@ -6,8 +6,9 @@ import { test } from "node:test";
 import { runNoteSeed, noteCoverage } from "./table-note-fuzz";
 import { decodeClient } from "../../server/src/wire";
 import { restore, type Answer } from "../src/core/table/device";
-import { LegacyProjection } from "../src/core/table/migration";
-import { Device, Server, quiesce, rng } from "./sim";
+import { legacyFixture, type LegacyFile } from "./legacy-fixture";
+import { LegacyProjection, legacyBases } from "../src/core/table/migration";
+import { rng } from "./sim";
 import { client, WorkerModel, Files, Memory, chunkName, hash, tag, nameKey } from "./table-sim";
 
 type Peer = Awaited<ReturnType<typeof client>> & {
@@ -135,45 +136,32 @@ async function run(seed: number, steps: number) {
 	};
 	try {
 		if (seed % 4 === 0) {
-			// Use the real 0.2.x engine and its stored Yjs stream. An offline save belongs
-			// exclusively to the returning device, so it must survive outside genesis.
-			const legacy = new Server(), old = [0,1,2].map(n => new Device("legacy"+n,legacy,random));
-			for (const d of old) {
-				d.overrides = { chunkName:async (b,scope) => scope ? chunkName(scope.u,scope.i,b) : hash(b),
-					reports:() => true,scoped:() => seed % 8 === 0,versionTag:async u => tag(u),now:() => w.time };
-				d.boot(); d.connect();
-			}
-			await quiesce(old);
-			for (let n = 0; n < 3 + Math.floor(random()*4); n++) {
-				const d = pick(old), path = pick(paths), b = newBytes();
-				recordWrite(d.files.get(path)?.content as Uint8Array | undefined,b);
-				d.write(path,b); await quiesce(old);
-			}
-			const path = pick([...old[0]!.files.keys()]);
-			old[0]!.disconnect();
-			for (const d of old.slice(0,2)) {
-				const b = newBytes(); recordWrite(d.files.get(path)!.content as Uint8Array,b);
-				d.write(path,b);
-			}
-			await quiesce(old);
-			const projection = new LegacyProjection();
+			// A stored legacy vault, plus two devices that changed the same file on opposite sides of disconnect.
+			const files = new Map<string, Uint8Array>(), refs = new Map<string,LegacyFile>();
+			const set = (path: string, b: Uint8Array) => {
+				const id = (paths.indexOf(path)+1).toString(16).padStart(16,"0"), u = w.id();
+				const h = hash(b), scoped = seed % 8 === 0, c = scoped ? chunkName(u,0,b) : h;
+				recordWrite(files.get(path),b);
+				w.put(c,b,scoped ? tag(u) : undefined);
+				refs.set(path,{id,path,body:{h,n:b.length,c:[c],u,...(scoped ? {s:1} : {})}});
+				files.set(path,b);
+			};
+			for (let n=0; n<3+Math.floor(random()*4); n++) set(pick(paths),newBytes());
+			const offline = legacyFixture([...refs.values()]), path = pick([...files.keys()]);
+			const local = newBytes();
+			recordWrite(files.get(path),local);
+			set(path,newBytes());
+			const current = legacyFixture([...refs.values()]), projection = new LegacyProjection();
 			try {
-				for (const r of legacy.rows) projection.applyIndex(r.entry);
-				for (const r of legacy.rows) projection.applyDocument(r.entry);
-				for (const [c,b] of legacy.chunks) w.put(c,b,legacy.versionChunks.get(c));
-				for await (const row of projection.rows(nameKey)) {
-					const deleted = row.dateAtCommit ? w.time : row.deleted;
-					w.genesis({ ...row, deleted });
-					const bytes = w.content(row.bytes);
-					if (deleted !== null && bytes) rememberDeletion(row.file,row.seq,value(bytes),deleted);
-				}
+				for (const e of current.entries) projection.applyIndex(e);
+				for (const e of current.entries) projection.applyDocument(e);
+				for await (const row of projection.rows(nameKey)) w.genesis(row);
 			} finally { projection.close(); }
-			for (const d of old) {
-				await d.engine!.useTable(nameKey);
+			for (let i=0; i<3; i++) {
 				const disk = new Files(), store = new Memory();
-				for (const [p,f] of d.files) disk.put(p,f.content as Uint8Array);
-				store.values = structuredClone(d.data); d.crash();
-				assert.deepEqual(d.problems,[]);
+				store.values = structuredClone((i === 0 ? offline : current).data);
+				for (const [p,b] of files) disk.put(p,i === 0 && p === path ? local : b);
+				await store.commit(await legacyBases(store,nameKey),[]);
 				const peer = await newPeer(disk,store); peers.push(peer);
 				await peer.pull(); await peer.plan({kind:"startup"});
 			}

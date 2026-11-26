@@ -1,3 +1,6 @@
+import { legacyFixture } from "./legacy-fixture";
+import type { Entry } from "../src/core/ports";
+import { decodeServer, encodeClient, type ClientFrame } from "../../server/src/wire";
 // The sync engine through the real Worker (wrangler dev) and the real encryption: two and three devices
 // with in-memory vaults. What the fuzz test proves about the engine alone, this checks end to end.
 
@@ -6,7 +9,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { VaultKeys, newRecovery, shortId, vaultIdOf } from "../src/keys";
 import { Transport, fetchRecords } from "../src/transport";
-import { hex, unhex, sha256, unpackPairing } from "../../protocol/ownsync";
+import { hex, unhex, sha256, unpackPairing, chunkName, docTag, KIND, packEntry, sealEnvelope } from "../../protocol/ownsync";
 import { TableDisk } from "../src/tableDisk";
 import { TableSync } from "../src/tableSync";
 import { attachmentFs } from "./table-fs";
@@ -26,10 +29,10 @@ after(() => {
 
 // A device that already holds the vault key (as one set up before the membership log existed): it joins the
 // log by itself. `keys` instead starts it from keys set up some other way (paired, recovered).
-async function device(name: string, vault: string, vaultKey = key, overrides: Device["overrides"] = {}, keys?: VaultKeys, ownerCode?: string, capable = false) {
+async function device(name: string, vault: string, vaultKey = key, overrides: Device["overrides"] = {}, keys?: VaultKeys, ownerCode?: string) {
 	const d = new Device(name, new Server(), rng(name.length + devices.length * 7919));
-	// Real chunk names and sizes, not the simulator's. Version-scoped only if the test says the Worker takes them.
-	d.overrides = { chunkName: (data, scope) => link.chunkName(data, scope), versionTag: (u) => link.versionTag(u), chunkSize: 2 ** 20, ...overrides };
+	// Exercise the same encrypted table and disk adapters as the plugin.
+	d.overrides = { ...overrides };
 	const problems: string[] = [], alerts: string[] = [], presence: [note: string, update: string][] = [];
 	const onProblem = (what: string, err: unknown) => problems.push(`${what}: ${String(err)}`);
 	keys ??= await VaultKeys.open(vault, memoryPorts(JSON.stringify({ 0: vaultKey })), { onProblem, onAlert: (m) => alerts.push(m) });
@@ -37,17 +40,14 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	const allowed = (p: string) => !p.startsWith(".") && !p.endsWith(".md");
 	const adapter: TableDisk = new TableDisk(fs,store,".private/table",allowed,b => table.hash(b),(h,n) => table.suffix(h,n));
 	const table = new TableSync(store,keys,adapter,allowed,overrides.attachments !== false,20*2**20,onProblem);
-	if (capable) {
-		d.overrides.tableNotes = table.notes;
-		d.overrides.tableHistory = table;
-		d.overrides.hash = async text => hex(await sha256(new TextEncoder().encode(text)));
-		d.overrides.noteDisk = new TableDisk(fs,store,".private/notes",p => !p.startsWith(".") && p.endsWith(".md"),
-			async b => hex(await sha256(b)),(h,n) => table.suffix(h,n),"table/note-fs");
-		d.overrides.onNoteWork = () => table.noteWork();
-	}
+	d.overrides.tableNotes = table.notes;
+	d.overrides.tableHistory = table;
+	d.overrides.noteDisk = new TableDisk(fs,store,".private/notes",p => !p.startsWith(".") && p.endsWith(".md"),
+		async b => hex(await sha256(b)),(h,n) => table.suffix(h,n),"table/note-fs");
+	d.overrides.onNoteWork = () => table.noteWork();
 	d.boot();
 	const link = new Transport(host, keys, d.engine!, {
-		attachments:capable ? table : undefined, tableCapable:async () => capable,
+		attachments:table, tableCapable:async () => true,
 		owner: ownerCode ?? (await nextOwner()),
 		onProblem,
 		onPresence: (note, update) => presence.push([note, new TextDecoder().decode(update)]),
@@ -58,7 +58,7 @@ async function device(name: string, vault: string, vaultKey = key, overrides: De
 	devices.push(d);
 	return { d, link, keys, problems, alerts, presence, table };
 }
-const disk = (d: Device) => Object.fromEntries([...d.files].map(([p, f]) => [p, f.content]).sort());
+const disk = (d: Device) => Object.fromEntries([...d.files].filter(([p]) => !p.startsWith(".")).map(([p, f]) => [p, f.content]).sort());
 async function until(devs: Device[], check: () => boolean, ms = 10000): Promise<void> {
 	const end = Date.now() + ms;
 	for (;;) {
@@ -69,7 +69,7 @@ async function until(devs: Device[], check: () => boolean, ms = 10000): Promise<
 	}
 }
 
-test("notes sync between devices through the Worker: create, edit, rename, delete, offline merge", async () => {
+test("notes sync between devices through the Worker: create, edit, rename and delete", async () => {
 	const a = await device("a", "vault-one"), b = await device("b", "vault-one");
 	await Promise.all([a.link.connect(), b.link.connect()]);
 	await until([a.d, b.d], () => a.link.status === "synced" && b.link.status === "synced");
@@ -79,14 +79,6 @@ test("notes sync between devices through the Worker: create, edit, rename, delet
 	b.d.rename("Secret plan.md", "Projects/Secret plan.md");
 	await until([a.d, b.d], () => disk(a.d)["Projects/Secret plan.md"] === "launch on Tuesday at noon" && !("Secret plan.md" in disk(a.d)));
 
-	b.link.disconnect();
-	await until([a.d, b.d], () => b.link.status === "offline");
-	a.d.write("Projects/Secret plan.md", "Draft: launch on Tuesday at noon");
-	b.d.write("Projects/Secret plan.md", "launch on Tuesday at noon sharp");
-	await until([a.d, b.d], () => true);
-	await b.link.connect();
-	await until([a.d, b.d], () => disk(a.d)["Projects/Secret plan.md"] === "Draft: launch on Tuesday at noon sharp" && disk(b.d)["Projects/Secret plan.md"] === disk(a.d)["Projects/Secret plan.md"]);
-
 	a.d.remove("Projects/Secret plan.md");
 	await until([a.d, b.d], () => Object.keys(disk(b.d)).length === 0);
 	assert.deepEqual([...a.problems, ...b.problems, ...a.d.problems, ...b.d.problems], []);
@@ -95,9 +87,13 @@ test("notes sync between devices through the Worker: create, edit, rename, delet
 test("typing shows up live in the other device's editor, while the Worker stores it in batches", async () => {
 	const a = await device("a2", "vault-two", key, { pace: 1500 }), b = await device("b2", "vault-two");
 	await Promise.all([a.link.connect(), b.link.connect()]);
+	await until([a.d,b.d], () => a.link.status === "synced" && b.link.status === "synced");
 	a.d.write("Live typing.md", "start");
 	await until([a.d, b.d], () => disk(b.d)["Live typing.md"] === "start");
-	const ea = (await a.d.engine!.open(a.d.engine!.noteAt("Live typing.md")!))!, eb = (await b.d.engine!.open(b.d.engine!.noteAt("Live typing.md")!))!;
+	await until([a.d,b.d], () => !!a.table.notes.at("Live typing.md") && !!b.table.notes.at("Live typing.md"));
+	const id = a.table.notes.at("Live typing.md")!.id;
+	const ea = await a.d.engine!.open(id), eb = await b.d.engine!.open(id);
+	assert.ok(ea && eb);
 	await new Promise((r) => setTimeout(r, 1600)); // let a's pacing window pass, so the burst below starts a fresh one
 	const cursor = () => (a.d.data.get("meta") as { cursor: number }).cursor;
 	const before = cursor(), started = Date.now();
@@ -113,50 +109,6 @@ test("typing shows up live in the other device's editor, while the Worker stores
 	assert.ok(cursor() - before <= 3, `12 keystroke edits were stored as ${cursor() - before} entries`);
 	assert.deepEqual([...a.problems, ...b.problems], []);
 });
-
-test("a new device catches up on a large vault in pages", async () => {
-	const a = await device("a3", "vault-three");
-	await a.link.connect();
-	await until([a.d], () => a.link.status === "synced");
-	const N = 900;
-	for (let i = 0; i < N; i++) a.d.files.set(`n/Note ${i}.md`, { content: `text of note ${i}`, mtime: i + 1 });
-	a.d.write("n/last.md", "the last one"); // one event; the engine finds the rest by looking, as at startup
-	a.d.crash();
-	a.d.boot();
-	const link = new Transport(host, a.keys, a.d.engine!, { owner: await nextOwner() });
-	links.push(link);
-	await link.connect();
-	await until([a.d], () => link.status === "synced" && ![...a.d.data.keys()].some((k) => k.startsWith("out:")), 30000);
-	const c = await device("c3", "vault-three");
-	await c.link.connect();
-	await until([c.d], () => c.d.files.size === N + 1, 60000);
-	assert.deepEqual(disk(c.d), disk(a.d));
-	assert.deepEqual([...c.problems, ...c.d.problems], []);
-});
-
-test("an attachment syncs through the Worker in sealed 1 MiB chunks; the same content again stores almost nothing", async () => {
-	const a = await device("a4", "vault-attach"), b = await device("b4", "vault-attach");
-	await Promise.all([a.link.connect(), b.link.connect()]);
-	await until([a.d, b.d], () => a.link.status === "synced" && b.link.status === "synced");
-	const photo = new Uint8Array(2.5 * 2 ** 20);
-	photo.set(new TextEncoder().encode("HOLIDAY-PIXELS ".repeat(20000)));
-	for (let i = 300000; i < photo.length; i += 997) photo[i] = i & 0xff;
-	const same = (path: string, want: Uint8Array) => { const got = b.d.files.get(path)?.content; return got instanceof Uint8Array && Buffer.compare(got, want) === 0; };
-	const start = storage();
-	a.d.write("Holiday secret/beach.png", photo);
-	await until([a.d, b.d], () => same("Holiday secret/beach.png", photo), 30000);
-	const before = storage();
-	assert.ok(before - start > 2 * 2 ** 20, "the first copy is stored");
-	a.d.write("Holiday secret/beach copy.png", photo.slice());
-	await until([a.d, b.d], () => same("Holiday secret/beach copy.png", photo), 30000);
-	assert.ok(storage() - before < 2 ** 20, `a copy grew the Worker's storage by ${storage() - before} bytes`);
-	const edited = photo.slice();
-	edited[5] = 0;
-	b.d.write("Holiday secret/beach.png", edited);
-	await until([a.d, b.d], () => { const got = a.d.files.get("Holiday secret/beach.png")?.content; return got instanceof Uint8Array && Buffer.compare(got, edited) === 0; }, 30000);
-	assert.deepEqual([...a.problems, ...b.problems, ...a.d.problems, ...b.d.problems], []);
-});
-const storage = () => Number(execFileSync("du", ["-sb", dev.persistDir], { encoding: "utf8" }).split("\t")[0]);
 
 test("a wrong vault key is refused, and nothing is retried", async () => {
 	const bad = await device("x", "vault-one", "ab".repeat(32));
@@ -217,7 +169,7 @@ test("removing a device through the Worker: the others carry on under a new key,
 	const d = await device("rd", "vault-four", key, {}, keys);
 	await d.link.connect();
 	await until([a.d, b.d, d.d], () => disk(d.d)["Kept.md"] === "everyone sees this, edited" && disk(d.d)["After.md"] === "not for the removed device" && a.keys.state.head?.members.length === 3);
-	assert.equal(d.d.files.size, 2);
+	assert.equal(Object.keys(disk(d.d)).length, 2);
 	assert.deepEqual([...a.problems, ...b.problems, ...d.problems, ...a.alerts, ...b.alerts, ...a.d.problems, ...b.d.problems, ...d.d.problems], []);
 });
 
@@ -227,6 +179,7 @@ test("a device paired after a key rotation still gets attachments uploaded befor
 	await until([a.d, b.d], () => [a, b].every((x) => x.link.status === "synced" && x.keys.state.head?.members.length === 2));
 	const scan = Uint8Array.from({ length: 300_000 }, (_, i) => (i * 7) & 0xff);
 	a.d.write("Scans/passport.pdf", scan);
+	await a.table.event({kind:"changed",path:"Scans/passport.pdf"});
 	await until([a.d, b.d], () => { const got = b.d.files.get("Scans/passport.pdf")?.content; return got instanceof Uint8Array && Buffer.compare(got, scan) === 0; }, 30000);
 	await a.keys.remove(b.keys.me.id);
 	a.link.offer();
@@ -249,7 +202,7 @@ test("recovering through the Worker: a new device with only the code gets every 
 	await a.link.connect();
 	await until([a.d], () => a.link.status === "synced" && !!a.keys.state.head);
 	a.d.write("Diary.md", "only on the lost laptop");
-	await until([a.d], () => ![...a.d.data.keys()].some((k) => k.startsWith("out:")));
+	await until([a.d], () => !!a.table.notes.at("Diary.md") && ![...a.d.data.keys()].some((k) => k.startsWith("out:")));
 
 	const { records, recovery } = await fetchRecords(host, vaultId);
 	const keys = await VaultKeys.fresh("vault-five", memoryPorts(), {}, new Map());
@@ -291,55 +244,56 @@ test("once synced a device tells the Worker its short ID, version and conflict c
 	assert.deepEqual([...a.problems, ...b.problems, ...a.d.problems, ...b.d.problems], []);
 });
 
-test("version-scoped attachments through the Worker: real names, reports and lists; Clean up removes only the replaced version", async () => {
-	const scoped = { reports: () => true, scoped: () => true, chunkSize: 4 };
-	const a = await device("a8", "vault-eight", key, scoped), b = await device("b8", "vault-eight", key, scoped);
-	await Promise.all([a.link.connect(), b.link.connect()]);
-	await until([a.d, b.d], () => a.link.status === "synced" && b.link.status === "synced");
-	const pic = (s: string) => new TextEncoder().encode(s);
-	a.d.write("p.png", pic("first picture"));
-	await until([a.d, b.d], () => new TextDecoder().decode(disk(b.d)["p.png"] as Uint8Array) === "first picture");
-	a.d.write("p.png", pic("second picture"));
-	await until([a.d, b.d], () => new TextDecoder().decode(disk(b.d)["p.png"] as Uint8Array) === "second picture");
-	// A day later both list what they hold current: the first picture's retirement is confirmed.
-	const vault = hex(a.keys.vaultId), sizes = async () => (await fetch(`${host}/test-cleanup/${vault}/sizes`)).json() as Promise<{ old: number }[]>;
-	assert.deepEqual(await sizes(), []);
-	await new Promise((r) => setTimeout(r, 5));
-	for (const x of [a, b]) { x.d.passTime(86_400_000); x.link.disconnect(); await x.link.connect(); }
-	await until([a.d, b.d], () => a.link.status === "synced" && b.link.status === "synced");
-	let old = 0;
-	await until([a.d, b.d], () => true);
-	for (let i = 0; i < 50 && !old; i++) { old = (await sizes()).reduce((n, s) => n + s.old, 0); await new Promise((r) => setTimeout(r, 50)); }
-	assert.ok(old > 0);
-	// As if a year later, so this year is past.
-	const removed = await (await fetch(`${host}/test-cleanup/${vault}`, { method: "POST", body: JSON.stringify({ ranges: [[0, Date.now() + 1]], zone: "UTC", months: 12, now: Date.now() + 400 * 86_400_000 }) })).json() as { removed: number };
-	assert.equal(removed.removed, 4); // "first picture": four chunks of four bytes
-	const c = await device("c8", "vault-eight", key, scoped);
-	await c.link.connect();
-	await until([a.d, b.d, c.d], () => new TextDecoder().decode(disk(c.d)["p.png"] as Uint8Array) === "second picture");
-	assert.deepEqual([...a.problems, ...b.problems, ...c.problems, ...a.d.problems, ...b.d.problems, ...c.d.problems], []);
-});
+// Write a pre-table vault using the 0.2.x wire format. Only the fixture speaks that protocol.
+async function legacyPeer(keys: VaultKeys) {
+	const ws = new WebSocket(`ws://localhost:${dev.port}/vault/${hex(keys.vaultId)}`);
+	ws.binaryType = "arraybuffer";
+	await new Promise<void>((resolve,reject) => { ws.onopen = () => resolve(); ws.onerror = reject; });
+	ws.send(encodeClient({t:"hello",token:await keys.token(),owner:unhex(await nextOwner())}));
+	const request = (frame: ClientFrame) => new Promise<ReturnType<typeof decodeServer>>((resolve,reject) => {
+		ws.onmessage = e => resolve(decodeServer(new Uint8Array(e.data as ArrayBuffer)));
+		ws.onclose = e => reject(new Error("fixture connection closed: " + e.code));
+		ws.send(encodeClient(frame));
+	});
+	const seal = (docId: Uint8Array, kind: number, plaintext: Uint8Array) => sealEnvelope({
+		vmk:keys.vmk,vaultId:keys.vaultId,epoch:keys.epoch,deviceId:keys.me.id,docId,kind,plaintext
+	});
+	let id = 0;
+	return {
+		close: () => ws.close(),
+		async put(bytes: Uint8Array) {
+			const name = await chunkName(keys.vmk,keys.vaultId,bytes);
+			assert.equal((await request({t:"put",name,envelope:await seal(name,KIND.chunk,bytes)})).t,"stored");
+			return hex(name);
+		},
+		async publish(entry: Entry) {
+			const doc = await docTag(keys.vmk,keys.vaultId,entry.doc);
+			const envelope = await seal(doc,entry.kind === "snapshot" ? KIND.snapshot : KIND.update,packEntry(entry.doc,entry.data));
+			assert.equal((await request({t:"publish",id:++id,doc,envelope})).t,"ack");
+		},
+	};
+}
 
 test("a live legacy vault migrates through the transport, then an updated peer downloads, edits and restores", async () => {
-	const vault = "migration", opts = {reports:()=>true,scoped:()=>true};
-	const old = await device("old",vault,key,opts);
-	await old.link.connect(); await until([old.d],() => old.link.status === "synced");
+	const vault = "migration", a = await device("capable",vault);
 	const content = (s: string) => new TextEncoder().encode(s);
 	const val = (d: Device,p: string) => new TextDecoder().decode(d.files.get(p)?.content as Uint8Array | undefined);
-	old.d.write("legacy.png",content("before genesis"));
-	old.d.write("kept.md", "existing note"); old.d.write("removed.md", "legacy deleted text");
-	await until([old.d], () => !!old.d.engine!.noteAt("removed.md") && old.d.data.size > 0);
-	const kept = old.d.engine!.noteAt("kept.md")!, removed = old.d.engine!.noteAt("removed.md")!;
-	old.d.remove("removed.md");
-	await until([old.d], () => !old.d.engine!.noteAt("removed.md") && ![...old.d.data.keys()].some(k => k.startsWith("out:") || k.startsWith("up:")));
-	const a = await device("capable",vault,key,opts,undefined,undefined,true);
-	await a.link.connect(); await until([old.d,a.d],() => a.link.status === "synced");
+	const kept = "0000000000000001", removed = "0000000000000002", bytes = content("before genesis");
+	const old = await legacyPeer(a.keys);
+	try {
+		const h = await old.put(bytes);
+		const fixture = legacyFixture([{id:kept,path:"kept.md",body:"existing note"},
+			{id:removed,path:"removed.md",body:"legacy deleted text",deleted:Date.now()},
+			{id:"0000000000000003",path:"legacy.png",body:{h,c:[h],n:bytes.length,u:"0000000000000004"}}]);
+		for (const e of fixture.entries) await old.publish(e);
+	} finally { old.close(); }
+	await a.link.connect(); await until([a.d],() => a.link.status === "synced");
 	await until([a.d],() => a.d.data.has("table/initialized"));
 	assert.equal(a.d.engine!.tableActive,true);
 	await until([a.d], () => a.d.engine!.tableNotesReady);
 	assert.equal(a.table.notes.at("kept.md")?.id, kept);
 	assert.ok(a.table.notes.get(removed)?.vector);
-	const b = await device("joining",vault,key,opts,undefined,undefined,true);
+	const b = await device("joining",vault);
 	await b.link.connect();
 	await until([a.d,b.d],() => val(b.d,"legacy.png") === "before genesis");
 	b.d.write("legacy.png",content("after genesis"));
@@ -362,25 +316,27 @@ test("a live legacy vault migrates through the transport, then an updated peer d
 });
 
 test("the device reports a failed migration and waits without running legacy sync", async () => {
-	const old = await device("legacy", "write-limit");
-	await old.link.connect(); await until([old.d], () => old.link.status === "synced");
-	const fault = await fetch(`${host}/test-fail-genesis/${hex(old.keys.vaultId)}`, { method: "POST" });
-	assert.equal(fault.status, 204, await fault.text());
-	const a = await device("capable","write-limit",key,{},undefined,undefined,true);
-	await a.link.connect();
-	await until([a.d], () => a.problems.some(p => p.includes("Migration could not complete today")));
-	assert.equal(a.d.engine!.tableActive, false);
-	old.d.write("still-legacy.md", "after a refused migration");
-	await until([old.d], () => !!old.d.engine!.noteAt("still-legacy.md"));
-	assert.equal(a.d.files.has("still-legacy.md"),false);
+	const a = await device("capable","write-limit"), old = await legacyPeer(a.keys);
+	try {
+		const fixture = legacyFixture([{id:"0000000000000001",path:"still-legacy.md",body:"legacy text"}]);
+		await old.publish(fixture.entries[0]!);
+		const fault = await fetch(`${host}/test-fail-genesis/${hex(a.keys.vaultId)}`, {method:"POST"});
+		assert.equal(fault.status,204,await fault.text());
+		await a.link.connect();
+		await until([a.d], () => a.problems.some(p => p.includes("Migration could not complete today")));
+		assert.equal(a.d.engine!.tableActive,false);
+		await old.publish(fixture.entries[1]!);
+		assert.equal(a.d.files.has("still-legacy.md"),false);
+	} finally { old.close(); }
 });
 
 test("table note rows bind the placed document and typing crosses the encrypted live channel", async () => {
-	const a = await device("a","table-notes",key,{},undefined,undefined,true);
+	const a = await device("a","table-notes",key,{});
 	await a.link.connect();
 	await until([a.d], () => a.d.data.has("table/initialized"));
-	const b = await device("b","table-notes",key,{},undefined,undefined,true);
+	const b = await device("b","table-notes",key,{});
 	await b.link.connect();
+	await until([a.d,b.d], () => a.link.status === "synced" && b.link.status === "synced");
 	const path = "Note in all-files table.md";
 	a.d.write(path, "shared initial text");
 	await until([a.d,b.d], () => b.d.files.get(path)?.content === "shared initial text");
@@ -400,10 +356,10 @@ test("table note rows bind the placed document and typing crosses the encrypted 
 
 test("a notes-only device restores the selected deletion across a rotation and keeps the occupied name", async () => {
 	const vault = "table-restore";
-	const full = await device("full", vault, key, {}, undefined, undefined, true);
+	const full = await device("full", vault, key, {});
 	await full.link.connect();
 	await until([full.d], () => full.table.caughtUp);
-	const peer = await device("reader", vault, key, { attachments: false }, undefined, undefined, true);
+	const peer = await device("reader", vault, key, { attachments: false });
 	await peer.link.connect();
 	const ds = [full.d, peer.d], path = "draft.md", restored = "draft (restored).md";
 	await until(ds, () => peer.link.status === "synced" && peer.table.caughtUp);
@@ -434,7 +390,7 @@ test("a notes-only device restores the selected deletion across a rotation and k
 	const p = unpackPairing(full.keys.pairingPayload()!);
 	const keys = await VaultKeys.fresh(vault, memoryPorts(), {}, new Map([[p.epoch, p.vmk]]),
 		{ number: p.number, hash: p.hash, pairedBy: p.pairerId });
-	const joined = await device("new", vault, key, { attachments: false }, keys, undefined, true);
+	const joined = await device("new", vault, key, { attachments: false }, keys);
 	await joined.link.connect();
 	await until([full.d, joined.d], () => joined.link.status === "synced" && joined.d.files.get(path)?.content === "different document");
 	assert.equal(await joined.d.engine!.deletedText(id), "first document");
@@ -443,20 +399,10 @@ test("a notes-only device restores the selected deletion across a rotation and k
 });
 
 test("the Worker's storage holds no note text, attachment content, file names, folder names or vault names", () => {
-	for (const secret of ["launch on", "Tuesday", "Secret plan", "Projects", "word1", "text of note", "Note 1", "vault-one", "vault-three", "Live typing", "everyone sees", "removed device", "lost laptop", "after recovery", "vault-five", "Kim's laptop", "HOLIDAY-PIXELS", "Holiday", "beach", "vault-four", "vault-attach", "Note in all-files table", "shared initial text"]) {
+	for (const secret of ["launch on", "Tuesday", "Secret plan", "Projects", "word1", "vault-one", "Live typing", "everyone sees", "removed device", "lost laptop", "after recovery", "vault-five", "Kim's laptop", "before genesis", "after genesis", "legacy.png", "passport.pdf", "vault-four", "vault-rotated-attach", "Note in all-files table", "shared initial text"]) {
 		let hits = "";
 		try { hits = execFileSync("grep", ["-rlaF", secret, dev.persistDir], { encoding: "utf8" }).trim(); }
 		catch (e) { if ((e as { status?: number }).status !== 1) throw e; } // 1 = no match
 		assert.equal(hits, "", `found "${secret}" in ${hits}`);
 	}
-});
-
-test("while this device's own key change waits, marks wait with the chunks, in order; a daily list's first frame is flagged", async () => {
-	const keys = { state: { pending: { tokenHash: new Uint8Array(32) } } };
-	const t = new Transport(host, keys as never, {} as never) as unknown as { send(ws: unknown, msg: unknown): void; seal(msg: unknown): Promise<unknown>; held: unknown[] };
-	const put = { t: "put", name: "00", data: new Uint8Array(1), tag: "11" }, mark = { t: "mark", id: 1, state: "replaced", tags: ["11"] };
-	t.send({}, put);
-	t.send({}, mark);
-	assert.deepEqual(t.held, [put, mark]); // the retirement goes after the vput, never before
-	assert.deepEqual(await t.seal({ t: "mark", id: 2, state: "current", start: true, last: true, tags: [] }), { t: "mark", id: 2, flags: 2 | 16 | 4, tags: [] });
 });

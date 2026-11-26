@@ -19,7 +19,6 @@ import { installSnapshots } from "./snapshotsView";
 import { TableDisk } from "./tableDisk";
 import { TableSync } from "./tableSync";
 import { type Status, Transport } from "./transport";
-import { VaultDisk } from "./vaultDisk";
 
 type State = Status | "not set up" | "starting";
 const STATUS_ICON: Record<State, string> = {
@@ -199,11 +198,7 @@ export default class OwnsyncPlugin extends Plugin {
 	private sentNames = "";
 	private namesAt = 0;
 	readonly namesChanged = debounce(() => void this.reportNames(), 1500, true);
-	/**
-	 * From the Worker's last names reply: undefined, it takes no reports about attachment versions (older than 0.2.0,
-	 * or not asked yet); false, it does, but a device seen lately can't read version-scoped chunks; true, both.
-	 */
-	private workerScoped: boolean | undefined;
+
 	/** The vault's settings, from the Worker's last names reply; undefined from an older Worker (or before it answers). */
 	private vaultSettings: VaultSettings | undefined;
 
@@ -224,8 +219,7 @@ export default class OwnsyncPlugin extends Plugin {
 		if (res?.status !== 200) return;
 		this.sentNames = json;
 		this.namesAt = Date.now();
-		const reply = res.json as { latest?: unknown; worker?: unknown; names?: unknown; scoped?: unknown; settings?: unknown };
-		this.workerScoped = typeof reply.scoped === "boolean" ? reply.scoped : undefined;
+		const reply = res.json as { latest?: unknown; worker?: unknown; names?: unknown; settings?: unknown };
 		this.vaultSettings = vaultSettings(reply.settings);
 		if (!this.historyBackupOn()) this.session?.historyBackup.discardUploads();
 		this.snapshotSyncEvents.trigger("change"); // a snapshot may be due now
@@ -333,7 +327,7 @@ export default class OwnsyncPlugin extends Plugin {
 			await store.close();
 			throw err;
 		});
-		const disk = new VaultDisk(this.app);
+		const synced = (f: unknown): f is TFile => f instanceof TFile && !f.path.startsWith(vault.configDir + "/");
 		const visible = (p: string) => !!p && normalizePath(p) === p
 			&& !p.includes("\\") && !p.split("/").some(part => !part || part.startsWith("."))
 			&& p !== vault.configDir && !p.startsWith(vault.configDir+"/");
@@ -344,7 +338,7 @@ export default class OwnsyncPlugin extends Plugin {
 		const table = new TableSync(store,keys,tableDisk,allowed,this.settings.attachments,this.settings.maxFileMB * 2 ** 20,problem);
 		const noteDisk = new TableDisk(vault.adapter, store, scratch + "/notes", p => visible(p) && p.endsWith(".md"),
 			b => sha256(b).then(hex), (h, n) => table.suffix(h, n), "table/note-fs");
-		const engine = new Engine(store, disk, {
+		const engine = new Engine(store, {
 			noteDisk,
 			tableHistory: table,
 			onLegacyNotePlacements: this.bindHistory,
@@ -361,13 +355,7 @@ export default class OwnsyncPlugin extends Plugin {
 				modal.open();
 			},
 			onNoteReady: () => refresh(),
-			hash: async (text) => hex(await sha256(new TextEncoder().encode(text))),
-			chunkName: (data, scope): Promise<string> => transport.chunkName(data, scope),
-			versionTag: (u): Promise<string> => transport.versionTag(u),
-			reports: () => this.workerScoped !== undefined,
-			scoped: () => this.workerScoped === true,
 			newId: () => hex(randomBytes(8)),
-			maxFileSize: this.settings.maxFileMB * 2 ** 20,
 			attachments: this.settings.attachments,
 			pace: 3000,
 			onProblem: problem,
@@ -394,7 +382,7 @@ export default class OwnsyncPlugin extends Plugin {
 			onPresence: (note, update) => editors.receivePresence(note, update),
 			// The dashboard shows a phone as a phone, and a notes-only device as one. Older servers show it as part of the version.
 			version: `${this.manifest.version}${Platform.isMobile ? " mobile" : ""}${this.settings.attachments ? "" : " notes-only"}`,
-			conflicts: () => vault.getFiles().filter((f) => disk.synced(f) && (f.path.includes(" (conflict ") || f.path.includes(" (recovered "))).length,
+			conflicts: () => vault.getFiles().filter((f) => synced(f) && (f.path.includes(" (conflict ") || f.path.includes(" (recovered "))).length,
 		});
 		const connected = () => this.session?.transport === transport && transport.status === "synced";
 		const backupConnection = {
@@ -431,9 +419,9 @@ export default class OwnsyncPlugin extends Plugin {
 			else engine.diskChanged(path, deleted);
 		};
 		const refs: [{ offref(ref: EventRef): void }, EventRef][] = [
-			[vault, vault.on("create", (f) => { if (disk.synced(f)) { changed(f.path); refresh(); } })],
-			[vault, vault.on("modify", (f) => { if (disk.synced(f)) changed(f.path); })],
-			[vault, vault.on("delete", (f) => { if (disk.synced(f)) { changed(f.path,true); refresh(); } })],
+			[vault, vault.on("create", (f) => { if (synced(f)) { changed(f.path); refresh(); } })],
+			[vault, vault.on("modify", (f) => { if (synced(f)) changed(f.path); })],
+			[vault, vault.on("delete", (f) => { if (synced(f)) { changed(f.path,true); refresh(); } })],
 			[vault, vault.on("rename", (f, from) => {
 				if (engine.tableActive && (f instanceof TFile || f instanceof TFolder)) {
 					if (f instanceof TFolder && visible(from) && visible(f.path)) engine.tableFolderRenamed(from, f.path);
@@ -443,7 +431,7 @@ export default class OwnsyncPlugin extends Plugin {
 				if (!(f instanceof TFile)) return;
 				// A file moved into or out of the settings folder appears or disappears. (The engine takes a note
 				// renamed to an attachment, or back, for one file gone and another new.)
-				const was = !from.startsWith(`${vault.configDir}/`), is = disk.synced(f);
+				const was = !from.startsWith(`${vault.configDir}/`), is = synced(f);
 				if (was && is) engine.diskRenamed(from, f.path);
 				else if (was) engine.diskChanged(from);
 				else if (is) changed(f.path);

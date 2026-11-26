@@ -2,7 +2,7 @@
 // the returning device's base, never to genesis.
 import * as Y from "yjs";
 import { hex, tableFileId, unhex } from "../../../../protocol/ownsync";
-import type { Entry, NoteMeta, Ref, Store, Upload } from "../ports";
+import type { Entry, NoteMeta, Ref, Store } from "../ports";
 import { checkLocalPaths, conflictSuffix, type Local, type Row } from "./device";
 import type { NoteRow } from "./notes";
 import type { NoteEntry, NoteStructure } from "./notePlanner";
@@ -105,7 +105,7 @@ export class LegacyProjection {
 	// Text remains in its existing Yjs stream. In particular the deletion vector
 	// is the one the deleter saw, not the current vector of the text document.
 	async *noteRows(key: Uint8Array, after: number) {
-		const { paths } = places(this.notes);
+		const paths = places(this.notes);
 		for (const id of [...this.notes.keys()].sort()) {
 			if (this.omitted.has(id)) continue;
 			const v = this.notes.get(id)!;
@@ -117,7 +117,7 @@ export class LegacyProjection {
 		}
 	}
 	async *rows(key: Uint8Array): AsyncGenerator<GenesisRow> {
-		const { paths } = places(this.notes), occupied = new Set(paths.values());
+		const paths = places(this.notes), occupied = new Set(paths.values());
 		const emitted = new Set<string>();
 		let seq = 0;
 		for (const id of [...this.notes.keys()].sort()) {
@@ -213,7 +213,7 @@ export async function legacyBases(store: Store, key: Uint8Array) {
 		const data = await store.get<Uint8Array>("index");
 		if (data) Y.applyUpdate(index, data);
 		const notes = index.getMap<IndexValue>("notes"), changed = unsentPaths(index, out);
-		const paths = places(notes).paths;
+		const paths = places(notes);
 		// A tombstone or a never-downloaded file can survive solely as a local
 		// version reference. Keep those references until table catch-up proves
 		// which IDs made it into genesis, including legacy split versions.
@@ -262,7 +262,7 @@ export async function legacyBases(store: Store, key: Uint8Array) {
 			if (!pending.has(id)) {
 				if (removed) bytes = await deletedBase(store, id, entry!.d!);
 				else {
-					const upload = await store.get<Upload>("up:" + id);
+					const upload = await store.get<{ base?: string }>("up:" + id);
 					const h = upload ? upload.base : m.baseHash;
 					if (h) bytes = { h }; // never substitute a staged hash for its agreement
 				}

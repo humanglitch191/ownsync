@@ -150,20 +150,22 @@ test("the sync driver reports a repeated settlement state and retries on new inp
 });
 
 test("two unsent legacy renames carry the first source path through restart and handoff", async () => {
-	const { Device, Server, quiesce, rng } = await import("./sim");
-	const device = new Device("migrating", new Server(), rng(42));
-	device.boot(); device.connect(); await quiesce([device]);
-	device.write("original.bin", new Uint8Array([1])); await quiesce([device]);
-	device.disconnect();
-	device.rename("original.bin", "middle.bin"); await quiesce([device]);
-	device.rename("middle.bin", "final.bin"); await quiesce([device]);
-	device.crash(); device.boot(); await quiesce([device]);
-	await device.engine!.useTable(key);
-	const [local] = [...device.data].filter(([k]) => k.startsWith("table/local/")).map(([,v]) => v as Local);
-	assert.equal(local?.path, "final.bin");
-	assert.equal(local.base.path, "original.bin");
-	assert.deepEqual(device.problems, []);
-	device.crash();
+	const { Memory } = await import("./table-sim");
+	const store = new Memory(), index = new Y.Doc(), notes = index.getMap("notes"), file = id(1);
+	notes.set(file,{p:"original.bin"});
+	let from = "original.bin", seq = 0;
+	index.on("update", data => store.values.set("out:" + ++seq,{...entry("index",data),renameSources:[[file,from]]}));
+	for (const path of ["middle.bin","final.bin"]) {
+		notes.set(file,{p:path});
+		from = path;
+	}
+	store.values.set("index",Y.encodeStateAsUpdate(index));
+	store.values.set("note:"+file,{diskPath:from,baseHash:ref(2).h});
+	index.destroy();
+	const puts = await legacyBases(store,key);
+	const local = puts.get("table/local/"+hex(await tableFileId(key,unhex(file)))) as Local;
+	assert.equal(local.path,"final.bin");
+	assert.equal(local.base.path,"original.bin");
 });
 
 test("genesis rejects a version without its identity, even when the bytes repeat", async () => {

@@ -1,3 +1,4 @@
+import { legacyFixture } from "./legacy-fixture";
 // Exercise the production note planner, table client and disk journal. The two
 // subscriptions are independent: pumping the text stream needn't deliver a row.
 import assert from "node:assert/strict";
@@ -93,7 +94,7 @@ export async function runNoteSeed(seed: number, steps: number | "held conflict" 
 	let serial = 0;
 	function device() {
 		const d = new Device("d" + peers.length, server, rng(seed * 4 + peers.length));
-		d.overrides = { now: () => now, hash: async text => hash(enc.encode(text)), chunkName: async b => hex(await chunkName(vmk, vaultId, b)) };
+		d.overrides = { now: () => now };
 		return d;
 	}
 	function configure(p: Peer) {
@@ -313,10 +314,19 @@ export async function runNoteSeed(seed: number, steps: number | "held conflict" 
 	try {
 		const a = add(), b = add(), mixed = seed % 4 === 0;
 		if (mixed) {
-			for (const p of peers) { delete p.d.overrides.tableNotes; p.d.boot(); p.d.connect(); }
-			await quiesce(peers.map(p => p.d));
-			for (let i=0; i<3; i++) { await write(pick(peers),"draft.md"); await quiesce(peers.map(p => p.d)); }
-			a.d.write("legacy.bin", Uint8Array.of(1,2,3)); await quiesce(peers.map(p => p.d));
+			const text = token() + token() + token(), bytes = Uint8Array.of(1,2,3);
+			const h = hex(await chunkName(vmk,vaultId,bytes));
+			const fixture = legacyFixture([
+				{id:"0000000000000001",path:"draft.md",body:text},
+				{id:"0000000000000002",path:"legacy.bin",body:{h,n:bytes.length,c:[h],u:"0000000000000003"}}
+			]);
+			for (const entry of fixture.entries) server.rows.push({seq:++server.head,entry});
+			server.chunks.set(h,bytes);
+			for (const p of peers) {
+				p.d.data = structuredClone(fixture.data);
+				p.d.write("draft.md",text);
+				p.d.write("legacy.bin",bytes.slice());
+			}
 			const projection = new LegacyProjection(), key = await a.sync.nameKey();
 			try {
 				for (const {entry} of server.rows) projection.applyIndex(entry);
@@ -324,7 +334,6 @@ export async function runNoteSeed(seed: number, steps: number | "held conflict" 
 				for await (const r of projection.rows(key)) worker.store(await a.sync.wireRow(r));
 				for await (const {row} of projection.noteRows(key,worker.entries.length)) worker.store(await a.sync.wireNote(row));
 			} finally { projection.close(); }
-			for (const p of peers) { disconnect(p); p.d.crash(); }
 			noteCoverage.migrated++;
 		}
 		await wire(a); await wire(b);

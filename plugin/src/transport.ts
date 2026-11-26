@@ -9,8 +9,8 @@ import type { TableSync } from "./tableSync";
 import type { Engine } from "./core/engine";
 import type { ClientMsg, Entry } from "./core/ports";
 import type { Stored, VaultKeys } from "./keys";
-import { KIND, chunkName, docTag, hex, openEnvelope, packEntry, parseHeader, scopedChunkName, sealEnvelope, unhex, unpackEntry, versionTag } from "../../protocol/ownsync";
-import { CLOSE, MARK, MAX_ENVELOPE, MAX_VERSION, SHORT_ID_BYTES, type ClientFrame, type ServerFrame, decodeServer, encodeClient } from "../../server/src/wire";
+import { KIND, docTag, hex, openEnvelope, packEntry, parseHeader, sealEnvelope, unhex, unpackEntry } from "../../protocol/ownsync";
+import { CLOSE, MAX_ENVELOPE, MAX_VERSION, SHORT_ID_BYTES, type ClientFrame, type ServerFrame, decodeServer, encodeClient } from "../../server/src/wire";
 
 export type Status = "connecting" | "catching up" | "synced" | "offline" | "unauthorized" | "needs owner code" | "removed" | "frozen" | "deleted";
 
@@ -40,7 +40,7 @@ export function fetchRecords(host: string, vaultId: Uint8Array): Promise<{ recor
 }
 
 export interface TransportOptions {
-	attachments?: TableSync;
+	attachments: TableSync;
 	tableCapable?(): Promise<boolean>;
 	/** The Worker's owner code (64 hex characters): needed only to create the vault on the Worker. */
 	owner?: string;
@@ -70,13 +70,12 @@ export class Transport {
 	private presenceTimer: number | null = null;
 	private reported = -1; // the conflict count last reported on this socket
 
-	private negotiated = false;
 	private engineConnected = false;
 	private textCaughtUp = false;
 	private switched = false;
 	private stopGenesis?: () => void;
 	private waiting?: { matches: (f: ServerFrame) => boolean; resolve: (f: ServerFrame) => void; reject: (err: Error) => void };
-	constructor(private readonly host: string, private readonly keys: VaultKeys, private readonly engine: Engine, private readonly opts: TransportOptions = {}) {}
+	constructor(private readonly host: string, private readonly keys: VaultKeys, private readonly engine: Engine, private readonly opts: TransportOptions) {}
 
 	async connect(): Promise<void> {
 		this.wanted = true;
@@ -84,7 +83,7 @@ export class Transport {
 		const ws = new WebSocket(vaultUrl(this.host, this.keys.vaultId));
 		ws.binaryType = "arraybuffer";
 		this.ws = ws;
-		this.authed = false; this.negotiated = false; this.engineConnected = false; this.switched = false;
+		this.authed = false; this.engineConnected = false; this.switched = false;
 		this.batch = []; this.textCaughtUp = false;
 		this.held = []; // the engine sends what it still needs again on the new connection
 		this.offered = -1;
@@ -112,7 +111,7 @@ export class Transport {
 
 	/** Relay this device's presence in a note to the others. At most one batch per PRESENCE_MS; only the newest per note goes. */
 	presence(note: string, update: Uint8Array): void {
-		if (this.opts.attachments && !this.switched) return;
+		if (!this.switched) return;
 		this.presenceOut.set(note, update);
 		this.presenceTimer ??= window.setTimeout(() => {
 			this.presenceTimer = null;
@@ -151,7 +150,7 @@ export class Transport {
 	private closed(ws: WebSocket, code: number): void {
 		if (this.ws !== ws) return;
 		this.ws = null;
-		this.opts.attachments?.disconnect();
+		this.opts.attachments.disconnect();
 		this.waiting?.reject(new Error("Attachment connection closed")); this.waiting = undefined;
 		this.stopGenesis?.(); this.stopGenesis = undefined;
 		void this.engine.disconnected();
@@ -164,28 +163,6 @@ export class Transport {
 		if (this.wanted) this.retry = window.setTimeout(() => void this.connect().catch(() => {}), Math.min(100 * 2 ** this.attempts++, MAX_BACKOFF_MS));
 	}
 
-	/**
-	 * HMAC(name key, SHA-256(data)), as hex: names a chunk, and an attachment's version, for the engine. The name
-	 * key is the first epoch's, for the vault's whole life: names are how the engine recognises content, so they
-	 * mustn't change when the key rotates. (A removed device keeps it, and could test, with the server's help,
-	 * whether a file it already has is in the vault; it can't read anything.)
-	 */
-	async chunkName(data: Uint8Array, scope?: { u: string; i: number }): Promise<string> {
-		const first = this.firstKey();
-		return hex(await (scope ? scopedChunkName(first, this.keys.vaultId, scope.u, scope.i, data) : chunkName(first, this.keys.vaultId, data)));
-	}
-
-	/** A version's tag, which the Worker files its version-scoped chunks under: with the first epoch's key too. */
-	async versionTag(u: string): Promise<string> {
-		return hex(await versionTag(this.firstKey(), this.keys.vaultId, u));
-	}
-
-	private firstKey(): Uint8Array {
-		const first = this.keys.keyFor(0);
-		if (!first) throw new Error("this device doesn't have the vault's first key yet");
-		return first;
-	}
-
 	private tag(epoch: number, vmk: Uint8Array, doc: string): Promise<Uint8Array> {
 		const key = `${epoch}:${doc}`;
 		let tag = this.tags.get(key);
@@ -196,17 +173,13 @@ export class Transport {
 	private send(ws: WebSocket, msg: ClientMsg | Presence): void {
 		// While this device's own key change is waiting, nothing new is sealed under the old key, which a device
 		// being removed (or, when recovering, every other device) can still read. Stored messages wait for the new
-		// key; live ones go, since what they carry follows in the stored ones anyway. Marks wait with the chunks: a
-		// retirement must not reach the Worker before the vput it follows, which would make the version current again.
-		if (this.keys.state.pending?.tokenHash && msg.t !== "subscribe" && msg.t !== "get") {
-			if (msg.t === "publish" || msg.t === "snapshot" || msg.t === "put" || msg.t === "mark") this.held.push(msg);
+		// key; live ones go, since what they carry follows in the stored ones anyway.
+		if (this.keys.state.pending?.tokenHash && msg.t !== "subscribe") {
+			if (msg.t === "publish" || msg.t === "snapshot") this.held.push(msg);
 			return;
 		}
 		this.sending = this.sending.then(async () => {
 			const frame = await this.seal(msg);
-			if (this.switched && (msg.t === "put" || msg.t === "mark" || msg.t === "get" ||
-				((msg.t === "live" || msg.t === "publish") && this.engine.legacyAttachment(msg.entry.doc)) ||
-				(msg.t === "snapshot" && this.engine.legacyAttachment(msg.doc)))) return;
 			if (frame && ws === this.ws && ws.readyState === WebSocket.OPEN) ws.send(encodeClient(frame));
 		}).catch((err) => this.opts.onProblem?.("sending to the Worker", err));
 	}
@@ -214,16 +187,6 @@ export class Transport {
 	private async seal(msg: ClientMsg | Presence): Promise<ClientFrame | null> {
 		if (msg.t === "subscribe") return msg;
 		const { vaultId, epoch, vmk } = this.keys; // whatever epoch is current when it's sealed
-		// A chunk is sealed with its name as the document: the server can't file it under another one.
-		if (msg.t === "get") return { t: "get", name: unhex(msg.name) };
-		if (msg.t === "mark") {
-			const flags = msg.state === "ask" ? 0 : msg.state === "current" ? MARK.current | (msg.start ? MARK.start : 0) | (msg.last ? MARK.last : 0) : MARK.retired | (msg.state === "deleted" ? MARK.deleted : 0);
-			return { t: "mark", id: msg.id, flags, tags: msg.tags.map(unhex) };
-		}
-		if (msg.t === "put") {
-			const name = unhex(msg.name), envelope = await sealEnvelope({ vmk, vaultId, docId: name, epoch, deviceId: this.keys.me.id, kind: KIND.chunk, plaintext: msg.data });
-			return msg.tag ? { t: "vput", tag: unhex(msg.tag), name, envelope } : { t: "put", name, envelope };
-		}
 		const entry: Entry = msg.t === "snapshot" ? { doc: msg.doc, kind: "snapshot", data: msg.data } : msg.t === "presence" ? { doc: msg.note, kind: "update", data: msg.data } : msg.entry;
 		const doc = await this.tag(epoch, vmk, entry.doc);
 		const envelope = await sealEnvelope({
@@ -263,14 +226,13 @@ export class Transport {
 			const waiter = this.waiting; this.waiting = undefined; waiter.resolve(f); return;
 		}
 		const sync = this.opts.attachments;
-		if (sync && f.t === "format") {
+		if (f.t === "format") {
 			try {
 				if (f.table && !this.switched) {
 					this.switched = true; this.stopGenesis?.();
 					this.set("catching up");
 					await this.engine.useTable(await sync.nameKey());
 					const after = await sync.connect((p,match) => this.ask(ws,p,match), this.engine);
-					if (this.textCaughtUp) void sync.notesCaughtUp().then(() => this.finishCatchUp(ws)).catch(() => ws.close());
 					if (ws !== this.ws) return;
 					ws.send(encodeClient({t:"since",after}));
 				} else if (!f.table && this.engine.tableActive) throw new Error("Worker no longer holds the migrated attachment table");
@@ -279,7 +241,7 @@ export class Transport {
 			} catch (e) { ws.close(); throw e; }
 			return;
 		}
-		if (sync && this.switched) {
+		if (this.switched) {
 			if (f.t === "row" || f.t === "tableSynced") {
 				const apply = f.t === "row" ? sync.row(f.row) : sync.ready(f.seq);
 				void apply.then(() => this.finishCatchUp(ws)).catch(() => ws.close()); return;
@@ -289,27 +251,17 @@ export class Transport {
 		}
 		if (f.t === "record") return void this.batch.push(f);
 		if (f.t === "records") return this.records(ws);
-		if (sync && !this.switched) return;
-		if (f.t === "stored" || f.t === "missing") return this.engine.receive({ t: f.t, name: hex(f.name) });
-		if (f.t === "marked") return this.engine.receive({ t: "marked", id: f.id, tags: f.tags.map(hex) });
-		if (f.t === "chunk") {
-			// The engine checks the content against its name; an envelope that doesn't open counts as missing.
-			// Chunks keep the epoch they were uploaded in (the vault document names them), so any epoch in the key ring opens one.
-			const name = hex(f.name);
-			const opened = await openEnvelope(f.envelope, this.keys.vaultId, f.name, this.keys.keyFor).catch(() => undefined);
-			return this.engine.receive(opened?.kind === KIND.chunk ? { t: "chunk", name, data: opened.plaintext } : { t: "missing", name });
-		}
+		if (!this.switched) return;
 		if (f.t !== "entry" && f.t !== "live") {
-			if (f.t !== "more" && f.t !== "synced" && f.t !== "ack") return; // this connection uses the legacy handshake
-			// Who this is goes before anything the engine sends once caught up: the Worker files its list of current versions under it.
+			if (f.t !== "more" && f.t !== "synced" && f.t !== "ack") return;
+			// Report device status as soon as the text subscription catches up.
 			if (f.t === "synced") {
 				this.report(true);
 			}
 			await this.engine.receive(f);
 			if (f.t === "synced") {
 				this.textCaughtUp = true;
-				if (sync && this.switched) void sync.notesCaughtUp().then(() => this.finishCatchUp(ws)).catch(() => ws.close());
-				else await this.finishCatchUp(ws);
+				void sync.notesCaughtUp().then(() => this.finishCatchUp(ws)).catch(() => ws.close());
 			}
 			return;
 		}
@@ -330,7 +282,7 @@ export class Transport {
 	// enumerate the confirmed note rows before it declares the new epoch backed up.
 	private async finishCatchUp(ws: WebSocket) {
 		if (ws !== this.ws || !this.textCaughtUp || this.status !== "catching up" ||
-			(this.switched && !this.opts.attachments?.caughtUp)) return;
+			!this.opts.attachments.caughtUp) return;
 		this.set("synced");
 		this.report();
 		this.offer();
@@ -367,17 +319,17 @@ export class Transport {
 			if (ws !== this.ws) return;
 			const token = await this.keys.token();
 			if (ws !== this.ws) return;
+			let capable: boolean;
 			try {
-				this.negotiated = !!this.opts.attachments && (this.engine.tableActive || !!await this.opts.tableCapable?.());
+				capable = this.engine.tableActive || !!await this.opts.tableCapable?.();
 			} catch (e) { ws.close(); throw e; }
 			if (ws !== this.ws) return;
 			this.authed = true;
 			// The owner code goes along only when this device is creating the vault (see main.ts).
 			ws.send(encodeClient(this.opts.owner ? { t: "hello", token, owner: unhex(this.opts.owner) } : { t: "hello", token }));
 			this.set("catching up");
-			if (this.negotiated) ws.send(encodeClient({t:"table"}));
-			else if (this.opts.attachments) this.opts.onProblem?.("migration",new Error("Update your Worker to start vault migration"));
-			else await this.connectNotes(ws);
+			if (capable) ws.send(encodeClient({t:"table"}));
+			else this.opts.onProblem?.("migration",new Error("Update your Worker to start vault migration"));
 		}
 		this.offer();
 		if (k.resnapshot && this.status === "synced") await this.resnapshot();

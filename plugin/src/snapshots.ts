@@ -95,7 +95,7 @@ function workerRow(value: unknown): value is WorkerSnapshot {
 }
 
 function safePath(path: unknown, note: boolean, { configDir, normalizePath }: Pick<SnapshotDeps, "configDir" | "normalizePath">): path is string {
-	// Mirror VaultDisk.check with the vault's Obsidian normalizer. Reject drive paths and NUL explicitly.
+	// Validate snapshot paths with the vault's Obsidian normalizer. Reject drive paths and NUL explicitly.
 	return typeof path === "string" && !/^[a-z]:|[\\\0]/i.test(path)
 		&& path === normalizePath(path) && path.endsWith(".md") === note
 		&& !path.split("/").some((segment) => !segment || segment.startsWith("."))
